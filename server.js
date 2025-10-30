@@ -2,26 +2,40 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const USERS_FILE = 'C:/Users/israe/Desktop/MonserveurGodot/users.json';
-const TRUSTED_DEVICES_FILE = 'C:/Users/israe/Desktop/MonserveurGodot/trusted_devices.json';
-const PORT = 8000;
+// 🚀 CHEMINS CORRIGÉS POUR RENDER
+const USERS_FILE = path.join(__dirname, 'users.json');
+const TRUSTED_DEVICES_FILE = path.join(__dirname, 'trusted_devices.json');
+const PORT = process.env.PORT || 8000; // 🚀 IMPORTANT pour Render
 
 // Structures optimisées
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
 
 // Utilitaires optimisés
-const loadUsers = () => fs.existsSync(USERS_FILE) ? JSON.parse(fs.readFileSync(USERS_FILE)) : [];
+const loadUsers = () => {
+    if (!fs.existsSync(USERS_FILE)) {
+        fs.writeFileSync(USERS_FILE, JSON.stringify([]));
+        return [];
+    }
+    return JSON.parse(fs.readFileSync(USERS_FILE));
+};
+
 const saveUsers = (u) => fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2));
+
 const loadTrustedDevices = () => {
-    if (!fs.existsSync(TRUSTED_DEVICES_FILE)) return new Map();
+    if (!fs.existsSync(TRUSTED_DEVICES_FILE)) {
+        fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify({}));
+        return new Map();
+    }
     return new Map(Object.entries(JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE))));
 };
+
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
 const generateId = () => Math.random().toString(36).substring(2, 10);
 
