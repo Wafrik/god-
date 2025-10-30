@@ -1,0 +1,11 @@
+{
+  "players": {},
+  "currentGame": null,
+  "gamePhase": "waiting",
+  "timer": 20,
+  "currentManche": 1,
+  "scores": {
+    "player1": 0,
+    "player2": 0
+  }
+}
