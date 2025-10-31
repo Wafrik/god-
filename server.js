@@ -2,51 +2,31 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 🚀 CHEMINS CORRIGÉS POUR RENDER
-const USERS_FILE = path.join(__dirname, 'users.json');
-const TRUSTED_DEVICES_FILE = path.join(__dirname, 'trusted_devices.json');
-const PORT = process.env.PORT || 8000;
+const USERS_FILE = 'C:/Users/israe/Desktop/MonserveurGodot/users.json';
+const TRUSTED_DEVICES_FILE = 'C:/Users/israe/Desktop/MonserveurGodot/trusted_devices.json';
+const PORT = 8000;
 
 // Structures optimisées
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
 
 // Utilitaires optimisés
-const loadUsers = () => {
-    if (!fs.existsSync(USERS_FILE)) {
-        fs.writeFileSync(USERS_FILE, JSON.stringify([]));
-        return [];
-    }
-    return JSON.parse(fs.readFileSync(USERS_FILE));
-};
-
+const loadUsers = () => fs.existsSync(USERS_FILE) ? JSON.parse(fs.readFileSync(USERS_FILE)) : [];
 const saveUsers = (u) => fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2));
-
 const loadTrustedDevices = () => {
-    if (!fs.existsSync(TRUSTED_DEVICES_FILE)) {
-        fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify({}));
-        return new Map();
-    }
+    if (!fs.existsSync(TRUSTED_DEVICES_FILE)) return new Map();
     return new Map(Object.entries(JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE))));
 };
-
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
 const generateId = () => Math.random().toString(36).substring(2, 10);
 
-// 🚨 CORRECTION : Identification unique pour WebGL (itch.io)
-const generateDeviceKey = (ip, deviceId, sessionId = null) => {
-    // Sur itch.io, tous ont la même IP, donc on utilise deviceId + session aléatoire
-    if (sessionId) {
-        return `webgl_${deviceId}_${sessionId}`;
-    }
-    return `${ip}_${deviceId}`;
-};
+// Clé unique pour identifier les appareils : IP + Device ID
+const generateDeviceKey = (ip, deviceId) => `${ip}_${deviceId}`;
 
 // Chargement devices
 const trustedDevicesData = loadTrustedDevices();
@@ -305,22 +285,13 @@ class Game {
     getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// 🚨 CORRECTION : WebSocket avec identification améliorée pour WebGL
+// WebSocket avec identification Device ID
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
     let deviceId = "unknown";
-    let sessionId = generateId(); // 🚨 NOUVEAU : Session unique par connexion WebSocket
     
-    // Envoyer la sessionId au client
-    try {
-        ws.send(JSON.stringify({ 
-            type: 'connected', 
-            message: 'Serveur connecté',
-            sessionId: sessionId // 🚨 ENVOYER LA SESSION AU CLIENT
-        }));
-    } catch(e) {
-        console.error("❌ Erreur message bienvenue:", e);
-    }
+    // Envoyer un message de bienvenue
+    ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
     
     ws.on('message', (data) => {
         try { 
@@ -331,8 +302,7 @@ wss.on('connection', (ws, req) => {
                 deviceId = message.deviceId;
             }
             
-            // 🚨 UTILISER LA SESSION ID POUR WEBGL
-            handleClientMessage(ws, message, ip, deviceId, sessionId); 
+            handleClientMessage(ws, message, ip, deviceId); 
         } catch(e) {
             console.error("❌ Erreur parsing message:", e);
         }
@@ -340,8 +310,8 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         setTimeout(() => {
-            // 🚨 UTILISER LA SESSION ID POUR IDENTIFIER
-            const deviceKey = generateDeviceKey(ip, deviceId, sessionId);
+            // Trouver la connexion à fermer basée sur IP + Device ID
+            const deviceKey = generateDeviceKey(ip, deviceId);
             const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
             
             if (disconnectedNumber) {
@@ -369,21 +339,17 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// 🚨 CORRECTION : Gestion messages avec Session ID et compatibilité auto-login
-function handleClientMessage(ws, message, ip, deviceId, sessionId) {
-    // 🚨 UTILISER SESSION ID POUR WEBGL (itch.io)
-    const deviceKey = generateDeviceKey(ip, deviceId, sessionId);
-    const legacyDeviceKey = generateDeviceKey(ip, deviceId); // 🚨 CONSERVER l'ancien format pour compatibilité
+// Gestion messages avec Device ID
+function handleClientMessage(ws, message, ip, deviceId) {
+    const deviceKey = generateDeviceKey(ip, deviceId);
     
     const handlers = {
         authenticate: () => {
             const users = loadUsers();
             const user = users.find(u => u.number === message.number && u.password === message.password);
             if (user) {
-                // Sauvegarder l'association device → user (NOUVELLE CLÉ)
+                // Sauvegarder l'association device → user
                 TRUSTED_DEVICES.set(deviceKey, message.number);
-                // 🚨 SAUVEGARDER AUSSI L'ANCIENNE CLÉ POUR COMPATIBILITÉ
-                TRUSTED_DEVICES.set(legacyDeviceKey, message.number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
                 PLAYER_CONNECTIONS.set(message.number, ws);
@@ -423,9 +389,8 @@ function handleClientMessage(ws, message, ip, deviceId, sessionId) {
                 users.push(newUser);
                 saveUsers(users);
                 
-                // Sauvegarder l'association device → user (NOUVELLE + ANCIENNE CLÉ)
+                // Sauvegarder l'association device → user
                 TRUSTED_DEVICES.set(deviceKey, number);
-                TRUSTED_DEVICES.set(legacyDeviceKey, number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
                 PLAYER_CONNECTIONS.set(number, ws);
@@ -450,9 +415,8 @@ function handleClientMessage(ws, message, ip, deviceId, sessionId) {
         logout: () => {
             const playerNumber = TRUSTED_DEVICES.get(deviceKey);
             if (playerNumber) {
-                // Supprimer l'appareil des devices trusted (LES DEUX CLÉS)
+                // Supprimer l'appareil des devices trusted
                 TRUSTED_DEVICES.delete(deviceKey);
-                TRUSTED_DEVICES.delete(legacyDeviceKey);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
                 // Supprimer la connexion
@@ -484,24 +448,7 @@ function handleClientMessage(ws, message, ip, deviceId, sessionId) {
         },
         
         auto_login: () => {
-            // 🚨 CORRECTION: Chercher d'abord avec la nouvelle clé, puis l'ancienne
-            let trustedNumber = TRUSTED_DEVICES.get(deviceKey);
-            
-            // Si pas trouvé avec la nouvelle clé, essayer l'ancienne (pour la compatibilité)
-            if (!trustedNumber) {
-                trustedNumber = TRUSTED_DEVICES.get(legacyDeviceKey);
-                console.log(`🔄 Auto-login: Ancienne clé utilisée: ${legacyDeviceKey}`);
-                
-                // 🚨 MIGRER vers la nouvelle clé si trouvé avec l'ancienne
-                if (trustedNumber) {
-                    TRUSTED_DEVICES.set(deviceKey, trustedNumber);
-                    saveTrustedDevices(TRUSTED_DEVICES);
-                    console.log(`🔄 Auto-login: Migration vers nouvelle clé: ${deviceKey}`);
-                }
-            } else {
-                console.log(`🔄 Auto-login: Nouvelle clé utilisée: ${deviceKey}`);
-            }
-            
+            const trustedNumber = TRUSTED_DEVICES.get(deviceKey);
             if (trustedNumber) {
                 const users = loadUsers();
                 const user = users.find(u => u.number === trustedNumber);
@@ -535,7 +482,6 @@ function handleClientMessage(ws, message, ip, deviceId, sessionId) {
                     ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Utilisateur non trouvé' }));
                 }
             } else {
-                console.log(`❌ Auto-login échoué: Aucune clé trouvée (nouvelle: ${deviceKey}, ancienne: ${legacyDeviceKey})`);
                 ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Appareil non reconnu' }));
             }
         },
@@ -569,9 +515,9 @@ function handleClientMessage(ws, message, ip, deviceId, sessionId) {
             }
         },
         
-        player_move: () => handleGameAction(ws, message, deviceKey, sessionId),
-        dice_swap: () => handleGameAction(ws, message, deviceKey, sessionId),
-        emoji_used: () => handleGameAction(ws, message, deviceKey, sessionId)
+        player_move: () => handleGameAction(ws, message, deviceKey),
+        dice_swap: () => handleGameAction(ws, message, deviceKey),
+        emoji_used: () => handleGameAction(ws, message, deviceKey)
     };
     
     handlers[message.type]?.();
@@ -597,8 +543,7 @@ function createGameLobby(playerNumbers) {
     });
 }
 
-// 🚨 CORRECTION : handleGameAction avec sessionId
-function handleGameAction(ws, message, deviceKey, sessionId) {
+function handleGameAction(ws, message, deviceKey) {
     const playerNumber = TRUSTED_DEVICES.get(deviceKey);
     if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non identifié' }));
     
@@ -617,47 +562,10 @@ function handleGameAction(ws, message, deviceKey, sessionId) {
     actions[message.type]?.();
 }
 
-// === 🚨 CORRECTION - AJOUTER CES ROUTES EXPRESS ===
-
-// Route racine pour les health checks
-app.get('/', (req, res) => {
-    res.json({ 
-        status: 'online', 
-        message: 'Serveur jeu Godot actif',
-        timestamp: new Date().toISOString(),
-        players_online: PLAYER_CONNECTIONS.size,
-        games_active: ACTIVE_GAMES.size,
-        queue_size: PLAYER_QUEUE.size
-    });
-});
-
-// Route health pour Render
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'healthy',
-        websocket_connections: PLAYER_CONNECTIONS.size,
-        active_games: ACTIVE_GAMES.size,
-        queue_size: PLAYER_QUEUE.size
-    });
-});
-
-// 🚀 DÉMARRAGE CORRIGÉ
+// Démarrage
+app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur AVEC SESSION ID actif sur le port ${PORT}`);
-    console.log('✅ Identification unique: IP + Device ID + Session ID');
-    console.log('✅ Support WebGL itch.io amélioré');
-    console.log('✅ Compatibilité auto-login rétablie');
-    console.log(`✅ Health check: http://0.0.0.0:${PORT}/health`);
-});
-
-// Gestion propre de l'arrêt
-process.on('SIGTERM', () => {
-    console.log('🔄 Arrêt du serveur - Marquage joueurs hors ligne...');
-    
-    const users = loadUsers();
-    users.forEach(user => user.online = false);
-    saveUsers(users);
-    
-    console.log('✅ Tous les joueurs marqués hors ligne');
-    process.exit(0);
+    console.log(`🎮 Serveur AVEC DEVICE ID actif sur le port ${PORT}`);
+    console.log('✅ Identification unique: IP + Device ID');
+    console.log('✅ Déconnexion manuelle implémentée');
 });
