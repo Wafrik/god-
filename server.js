@@ -8,10 +8,9 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 🚀 CHEMINS CORRIGÉS POUR RENDER
 const USERS_FILE = path.join(__dirname, 'users.json');
 const TRUSTED_DEVICES_FILE = path.join(__dirname, 'trusted_devices.json');
-const PORT = process.env.PORT || 8000; // 🚀 IMPORTANT pour Render
+const PORT = process.env.PORT || 8000;
 
 // Structures optimisées
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
@@ -39,14 +38,20 @@ const loadTrustedDevices = () => {
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
 const generateId = () => Math.random().toString(36).substring(2, 10);
 
-// Clé unique pour identifier les appareils : IP + Device ID
-const generateDeviceKey = (ip, deviceId) => `${ip}_${deviceId}`;
+// 🚨 CORRECTION : Identification unique pour WebGL (itch.io)
+const generateDeviceKey = (ip, deviceId, sessionId = null) => {
+    // Sur itch.io, tous ont la même IP, donc on utilise deviceId + session aléatoire
+    if (sessionId) {
+        return `webgl_${deviceId}_${sessionId}`;
+    }
+    return `${ip}_${deviceId}`;
+};
 
 // Chargement devices
 const trustedDevicesData = loadTrustedDevices();
 trustedDevicesData.forEach((v, k) => TRUSTED_DEVICES.set(k, v));
 
-// Classe Game ultra-optimisée
+// Classe Game (identique à ta version)
 class Game {
     constructor(id, p1, p2) {
         Object.assign(this, {
@@ -299,13 +304,22 @@ class Game {
     getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec identification Device ID
+// 🚨 CORRECTION : WebSocket avec identification améliorée pour WebGL
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
     let deviceId = "unknown";
+    let sessionId = generateId(); // 🚨 NOUVEAU : Session unique par connexion WebSocket
     
-    // Envoyer un message de bienvenue
-    ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
+    // Envoyer la sessionId au client
+    try {
+        ws.send(JSON.stringify({ 
+            type: 'connected', 
+            message: 'Serveur connecté',
+            sessionId: sessionId // 🚨 ENVOYER LA SESSION AU CLIENT
+        }));
+    } catch(e) {
+        console.error("❌ Erreur message bienvenue:", e);
+    }
     
     ws.on('message', (data) => {
         try { 
@@ -316,7 +330,8 @@ wss.on('connection', (ws, req) => {
                 deviceId = message.deviceId;
             }
             
-            handleClientMessage(ws, message, ip, deviceId); 
+            // 🚨 UTILISER LA SESSION ID POUR WEBGL
+            handleClientMessage(ws, message, ip, deviceId, sessionId); 
         } catch(e) {
             console.error("❌ Erreur parsing message:", e);
         }
@@ -324,8 +339,8 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         setTimeout(() => {
-            // Trouver la connexion à fermer basée sur IP + Device ID
-            const deviceKey = generateDeviceKey(ip, deviceId);
+            // 🚨 UTILISER LA SESSION ID POUR IDENTIFIER
+            const deviceKey = generateDeviceKey(ip, deviceId, sessionId);
             const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
             
             if (disconnectedNumber) {
@@ -353,9 +368,10 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Gestion messages avec Device ID
-function handleClientMessage(ws, message, ip, deviceId) {
-    const deviceKey = generateDeviceKey(ip, deviceId);
+// 🚨 CORRECTION : Gestion messages avec Session ID
+function handleClientMessage(ws, message, ip, deviceId, sessionId) {
+    // 🚨 UTILISER SESSION ID POUR WEBGL (itch.io)
+    const deviceKey = generateDeviceKey(ip, deviceId, sessionId);
     
     const handlers = {
         authenticate: () => {
@@ -514,6 +530,8 @@ function handleClientMessage(ws, message, ip, deviceId) {
             PLAYER_QUEUE.add(playerNumber);
             ws.send(JSON.stringify({ type: 'queue_joined', message: 'En attente adversaire' }));
             
+            console.log(`🎯 File d'attente: ${Array.from(PLAYER_QUEUE)}`);
+            
             if (PLAYER_QUEUE.size >= 2) {
                 const players = Array.from(PLAYER_QUEUE).slice(0, 2);
                 players.forEach(p => PLAYER_QUEUE.delete(p));
@@ -529,9 +547,9 @@ function handleClientMessage(ws, message, ip, deviceId) {
             }
         },
         
-        player_move: () => handleGameAction(ws, message, deviceKey),
-        dice_swap: () => handleGameAction(ws, message, deviceKey),
-        emoji_used: () => handleGameAction(ws, message, deviceKey)
+        player_move: () => handleGameAction(ws, message, deviceKey, sessionId),
+        dice_swap: () => handleGameAction(ws, message, deviceKey, sessionId),
+        emoji_used: () => handleGameAction(ws, message, deviceKey, sessionId)
     };
     
     handlers[message.type]?.();
@@ -557,7 +575,8 @@ function createGameLobby(playerNumbers) {
     });
 }
 
-function handleGameAction(ws, message, deviceKey) {
+// 🚨 CORRECTION : handleGameAction avec sessionId
+function handleGameAction(ws, message, deviceKey, sessionId) {
     const playerNumber = TRUSTED_DEVICES.get(deviceKey);
     if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non identifié' }));
     
@@ -579,7 +598,7 @@ function handleGameAction(ws, message, deviceKey) {
 // Démarrage
 app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur AVEC DEVICE ID actif sur le port ${PORT}`);
-    console.log('✅ Identification unique: IP + Device ID');
-    console.log('✅ Déconnexion manuelle implémentée');
+    console.log(`🎮 Serveur AVEC SESSION ID actif sur le port ${PORT}`);
+    console.log('✅ Identification unique: IP + Device ID + Session ID');
+    console.log('✅ Support WebGL itch.io amélioré');
 });
