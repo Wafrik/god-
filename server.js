@@ -17,6 +17,9 @@ const PORT = process.env.PORT || 8000; // 🚀 IMPORTANT pour Render
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
 
+// NOUVEAU: Stockage des sessions WebGL par token unique
+const WEBGL_SESSIONS = new Map();
+
 // Utilitaires optimisés
 const loadUsers = () => {
     if (!fs.existsSync(USERS_FILE)) {
@@ -39,8 +42,21 @@ const loadTrustedDevices = () => {
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
 const generateId = () => Math.random().toString(36).substring(2, 10);
 
-// Clé unique pour identifier les appareils : IP + Device ID
-const generateDeviceKey = (ip, deviceId) => `${ip}_${deviceId}`;
+// CORRECTION: Clé unique pour WebGL - Utilise IP + User-Agent + Session ID
+const generateDeviceKey = (ip, deviceId, userAgent = 'unknown') => {
+    // Pour WebGL, on crée une clé plus unique avec plus de données
+    return `${ip}_${deviceId}_${userAgent}`;
+};
+
+// NOUVELLE FONCTION: Générer un ID de session unique pour WebGL
+const generateWebGLSessionId = (ws, req) => {
+    const ip = req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'] || 'unknown';
+    const timestamp = Date.now();
+    const random = Math.random().toString(36).substring(2, 15);
+    
+    return `webgl_${ip}_${userAgent}_${timestamp}_${random}`.replace(/[^a-zA-Z0-9_]/g, '_');
+};
 
 // Chargement devices
 const trustedDevicesData = loadTrustedDevices();
@@ -299,34 +315,73 @@ class Game {
     getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec identification Device ID
+// CORRECTION: WebSocket avec gestion améliorée pour WebGL
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
-    let deviceId = "unknown";
+    const userAgent = req.headers['user-agent'] || 'unknown';
     
-    // Envoyer un message de bienvenue
-    ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
+    // NOUVEAU: Générer un ID de session unique pour WebGL
+    const webglSessionId = generateWebGLSessionId(ws, req);
+    
+    console.log(`🌐 Nouvelle connexion WebGL: ${ip} - ${userAgent.substring(0, 50)}...`);
+    
+    // Stocker la session WebGL
+    WEBGL_SESSIONS.set(webglSessionId, {
+        ws: ws,
+        ip: ip,
+        userAgent: userAgent,
+        deviceId: "webgl_" + generateId(),
+        connectedAt: Date.now()
+    });
+    
+    // Envoyer l'ID de session au client WebGL
+    ws.send(JSON.stringify({ 
+        type: 'connected', 
+        message: 'Serveur connecté',
+        sessionId: webglSessionId,
+        isWebGL: true
+    }));
     
     ws.on('message', (data) => {
         try { 
             const message = JSON.parse(data);
             
-            // Récupérer le deviceId du message
-            if (message.deviceId) {
-                deviceId = message.deviceId;
+            // CORRECTION: Pour WebGL, utiliser la session ID comme deviceId principal
+            let deviceId = message.deviceId || "unknown";
+            
+            // Si c'est WebGL, prioriser la session ID
+            if (message.sessionId && WEBGL_SESSIONS.has(message.sessionId)) {
+                const session = WEBGL_SESSIONS.get(message.sessionId);
+                deviceId = session.deviceId;
             }
             
-            handleClientMessage(ws, message, ip, deviceId); 
+            handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionId); 
         } catch(e) {
             console.error("❌ Erreur parsing message:", e);
         }
     });
 
     ws.on('close', () => {
+        // Nettoyer la session WebGL
+        WEBGL_SESSIONS.delete(webglSessionId);
+        
         setTimeout(() => {
-            // Trouver la connexion à fermer basée sur IP + Device ID
-            const deviceKey = generateDeviceKey(ip, deviceId);
-            const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
+            // CORRECTION: Trouver la connexion basée sur la session WebGL
+            let disconnectedNumber = null;
+            
+            // Chercher dans les trusted devices avec la session
+            for (let [deviceKey, number] of TRUSTED_DEVICES) {
+                if (deviceKey.includes(webglSessionId)) {
+                    disconnectedNumber = number;
+                    break;
+                }
+            }
+            
+            // Si pas trouvé, chercher par IP + User-Agent
+            if (!disconnectedNumber) {
+                const deviceKey = generateDeviceKey(ip, "webgl", userAgent);
+                disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
+            }
             
             if (disconnectedNumber) {
                 PLAYER_CONNECTIONS.delete(disconnectedNumber);
@@ -347,22 +402,31 @@ wss.on('connection', (ws, req) => {
                 if (player) game.handlePlayerDisconnect(player);
                 PLAYER_TO_GAME.delete(disconnectedNumber);
                 
-                console.log(`🔴 Déconnexion: ${disconnectedNumber} (${deviceKey})`);
+                console.log(`🔴 Déconnexion WebGL: ${disconnectedNumber} (${webglSessionId.substring(0, 10)}...)`);
             }
         }, 10000);
     });
 });
 
-// Gestion messages avec Device ID
-function handleClientMessage(ws, message, ip, deviceId) {
-    const deviceKey = generateDeviceKey(ip, deviceId);
+// CORRECTION: Gestion messages avec support WebGL amélioré
+function handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionId) {
+    // CORRECTION: Pour WebGL, utiliser une clé plus spécifique
+    let deviceKey;
+    
+    if (webglSessionId) {
+        // WebGL: utiliser la session ID comme clé principale
+        deviceKey = `webgl_${webglSessionId}`;
+    } else {
+        // Appareil normal
+        deviceKey = generateDeviceKey(ip, deviceId, userAgent);
+    }
     
     const handlers = {
         authenticate: () => {
             const users = loadUsers();
             const user = users.find(u => u.number === message.number && u.password === message.password);
             if (user) {
-                // Sauvegarder l'association device → user
+                // CORRECTION: Sauvegarder avec la clé WebGL si applicable
                 TRUSTED_DEVICES.set(deviceKey, message.number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -378,10 +442,12 @@ function handleClientMessage(ws, message, ip, deviceId) {
                     username: user.username, 
                     score: user.score, 
                     number: user.number,
-                    token: token
+                    token: token,
+                    sessionId: webglSessionId, // Inclure la session ID pour WebGL
+                    isWebGL: !!webglSessionId
                 }));
                 
-                console.log(`✅ Connexion: ${user.username} (${deviceKey})`);
+                console.log(`✅ Connexion WebGL: ${user.username} (${deviceKey.substring(0, 20)}...)`);
             } else {
                 ws.send(JSON.stringify({ type: 'auth_failed', message: 'Numéro ou mot de passe incorrect' }));
             }
@@ -403,7 +469,7 @@ function handleClientMessage(ws, message, ip, deviceId) {
                 users.push(newUser);
                 saveUsers(users);
                 
-                // Sauvegarder l'association device → user
+                // CORRECTION: Sauvegarder avec la clé WebGL
                 TRUSTED_DEVICES.set(deviceKey, number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -418,14 +484,15 @@ function handleClientMessage(ws, message, ip, deviceId) {
                     username, 
                     score: 0, 
                     number,
-                    token: token
+                    token: token,
+                    sessionId: webglSessionId, // Inclure la session ID pour WebGL
+                    isWebGL: !!webglSessionId
                 }));
                 
-                console.log(`✅ Inscription: ${username} (${deviceKey})`);
+                console.log(`✅ Inscription WebGL: ${username} (${deviceKey.substring(0, 20)}...)`);
             }
         },
 
-        // NOUVEAU: Handler pour la déconnexion manuelle
         logout: () => {
             const playerNumber = TRUSTED_DEVICES.get(deviceKey);
             if (playerNumber) {
@@ -452,7 +519,7 @@ function handleClientMessage(ws, message, ip, deviceId) {
                 if (player) game.handlePlayerDisconnect(player);
                 PLAYER_TO_GAME.delete(playerNumber);
                 
-                console.log(`🚪 Déconnexion manuelle: ${playerNumber} (${deviceKey})`);
+                console.log(`🚪 Déconnexion manuelle WebGL: ${playerNumber} (${deviceKey.substring(0, 20)}...)`);
                 
                 // Envoyer confirmation
                 ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie' }));
@@ -479,7 +546,9 @@ function handleClientMessage(ws, message, ip, deviceId) {
                         username: user.username, 
                         score: user.score, 
                         number: user.number,
-                        token: token
+                        token: token,
+                        sessionId: webglSessionId, // Inclure la session ID pour WebGL
+                        isWebGL: !!webglSessionId
                     }));
                     
                     // Reconnexion lobby
@@ -491,7 +560,7 @@ function handleClientMessage(ws, message, ip, deviceId) {
                         game.broadcastGameState(); 
                     }
                     
-                    console.log(`🔄 Auto-login: ${user.username} (${deviceKey})`);
+                    console.log(`🔄 Auto-login WebGL: ${user.username} (${deviceKey.substring(0, 20)}...)`);
                 } else {
                     ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Utilisateur non trouvé' }));
                 }
@@ -579,7 +648,8 @@ function handleGameAction(ws, message, deviceKey) {
 // Démarrage
 app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur AVEC DEVICE ID actif sur le port ${PORT}`);
-    console.log('✅ Identification unique: IP + Device ID');
-    console.log('✅ Déconnexion manuelle implémentée');
+    console.log(`🎮 Serveur WEBGL OPTIMISÉ actif sur le port ${PORT}`);
+    console.log('✅ Identification unique: Session ID + IP + User-Agent');
+    console.log('✅ Support WebGL/itch.io amélioré');
+    console.log('✅ Gestion des connexions multiples depuis même IP');
 });
