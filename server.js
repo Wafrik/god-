@@ -334,7 +334,51 @@ wss.on('connection', (ws, req) => {
         connectedAt: Date.now()
     });
     
-    // Envoyer l'ID de session au client WebGL
+    // CORRECTION: AUTO-CONNEXION IMMÉDIATE - Vérifier si l'appareil est déjà connu
+    const deviceKeyForAutoLogin = `webgl_${webglSessionId}`;
+    const trustedNumber = TRUSTED_DEVICES.get(deviceKeyForAutoLogin);
+    
+    if (trustedNumber) {
+        // AUTO-CONNEXION: L'appareil est déjà connu, connexion automatique
+        const users = loadUsers();
+        const user = users.find(u => u.number === trustedNumber);
+        
+        if (user) {
+            PLAYER_CONNECTIONS.set(trustedNumber, ws);
+            user.online = true;
+            saveUsers(users);
+            
+            // Générer un nouveau token
+            const token = generateId() + generateId();
+            
+            // Envoyer la confirmation d'auto-connexion IMMÉDIATE
+            ws.send(JSON.stringify({ 
+                type: 'auto_login_success', 
+                username: user.username, 
+                score: user.score, 
+                number: user.number,
+                token: token,
+                sessionId: webglSessionId,
+                isWebGL: true,
+                message: 'Connexion automatique réussie'
+            }));
+            
+            console.log(`🔄 Auto-connexion IMMÉDIATE: ${user.username} (${deviceKeyForAutoLogin.substring(0, 20)}...)`);
+            
+            // Reconnexion lobby si en jeu
+            const gameId = PLAYER_TO_GAME.get(trustedNumber);
+            const game = ACTIVE_GAMES.get(gameId);
+            const player = game?.getPlayerByNumber(trustedNumber);
+            if (player) { 
+                player.ws = ws; 
+                game.broadcastGameState(); 
+            }
+            
+            return; // Ne pas envoyer le message 'connected' normal
+        }
+    }
+    
+    // Si pas d'auto-connexion, envoyer le message normal
     ws.send(JSON.stringify({ 
         type: 'connected', 
         message: 'Serveur connecté',
@@ -444,10 +488,11 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionI
                     number: user.number,
                     token: token,
                     sessionId: webglSessionId, // Inclure la session ID pour WebGL
-                    isWebGL: !!webglSessionId
+                    isWebGL: !!webglSessionId,
+                    message: 'Connexion réussie - Auto-connexion activée'
                 }));
                 
-                console.log(`✅ Connexion WebGL: ${user.username} (${deviceKey.substring(0, 20)}...)`);
+                console.log(`✅ Connexion WebGL: ${user.username} (${deviceKey.substring(0, 20)}...) - Auto-connexion activée`);
             } else {
                 ws.send(JSON.stringify({ type: 'auth_failed', message: 'Numéro ou mot de passe incorrect' }));
             }
@@ -469,7 +514,7 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionI
                 users.push(newUser);
                 saveUsers(users);
                 
-                // CORRECTION: Sauvegarder avec la clé WebGL
+                // CORRECTION: Sauvegarder avec la clé WebGL - ACTIVATION AUTO-CONNEXION
                 TRUSTED_DEVICES.set(deviceKey, number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -480,7 +525,7 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionI
                 
                 ws.send(JSON.stringify({ 
                     type: 'register_success', 
-                    message: "Inscription réussie", 
+                    message: "Inscription réussie - Auto-connexion activée", 
                     username, 
                     score: 0, 
                     number,
@@ -489,14 +534,14 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionI
                     isWebGL: !!webglSessionId
                 }));
                 
-                console.log(`✅ Inscription WebGL: ${username} (${deviceKey.substring(0, 20)}...)`);
+                console.log(`✅ Inscription WebGL: ${username} (${deviceKey.substring(0, 20)}...) - Auto-connexion activée`);
             }
         },
 
         logout: () => {
             const playerNumber = TRUSTED_DEVICES.get(deviceKey);
             if (playerNumber) {
-                // Supprimer l'appareil des devices trusted
+                // Supprimer l'appareil des devices trusted - DÉSACTIVER AUTO-CONNEXION
                 TRUSTED_DEVICES.delete(deviceKey);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -519,10 +564,10 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionI
                 if (player) game.handlePlayerDisconnect(player);
                 PLAYER_TO_GAME.delete(playerNumber);
                 
-                console.log(`🚪 Déconnexion manuelle WebGL: ${playerNumber} (${deviceKey.substring(0, 20)}...)`);
+                console.log(`🚪 Déconnexion manuelle WebGL: ${playerNumber} (${deviceKey.substring(0, 20)}...) - Auto-connexion désactivée`);
                 
                 // Envoyer confirmation
-                ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie' }));
+                ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie - Auto-connexion désactivée' }));
             } else {
                 ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
             }
@@ -548,7 +593,8 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, webglSessionI
                         number: user.number,
                         token: token,
                         sessionId: webglSessionId, // Inclure la session ID pour WebGL
-                        isWebGL: !!webglSessionId
+                        isWebGL: !!webglSessionId,
+                        message: 'Auto-connexion réussie'
                     }));
                     
                     // Reconnexion lobby
@@ -648,8 +694,9 @@ function handleGameAction(ws, message, deviceKey) {
 // Démarrage
 app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur WEBGL OPTIMISÉ actif sur le port ${PORT}`);
+    console.log(`🎮 Serveur WEBGL AVEC AUTO-CONNEXION actif sur le port ${PORT}`);
     console.log('✅ Identification unique: Session ID + IP + User-Agent');
     console.log('✅ Support WebGL/itch.io amélioré');
+    console.log('✅ AUTO-CONNEXION IMMÉDIATE activée après première connexion');
     console.log('✅ Gestion des connexions multiples depuis même IP');
 });
