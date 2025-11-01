@@ -17,9 +17,6 @@ const PORT = process.env.PORT || 8000;
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
 
-// NOUVEAU: Stockage des sessions avec identifiants uniques
-const WEB_SESSIONS = new Map();
-
 // Utilitaires optimisés
 const loadUsers = () => {
     if (!fs.existsSync(USERS_FILE)) {
@@ -42,66 +39,19 @@ const loadTrustedDevices = () => {
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
-// NOUVELLE FONCTION: Générer une clé unique ULTRA précise
-const generateUniqueKey = (ip, deviceId, userAgent, sessionId = '') => {
-    // Pour les connexions Web (itch.io), on utilise une combinaison plus précise
-    const isWebConnection = ip.includes('127.0.0.1') || ip.includes('::1') || ip === '::ffff:127.0.0.1' || !ip;
-    
-    if (isWebConnection) {
-        // ULTRA PRÉCIS: User-Agent + DeviceID + SessionID + Timestamp
-        const timestamp = Date.now();
-        const userAgentHash = simpleHash(userAgent);
-        
-        if (sessionId) {
-            return `web_${userAgentHash}_${deviceId}_${sessionId}`;
-        } else {
-            return `web_${userAgentHash}_${deviceId}_${timestamp}`;
-        }
-    } else {
-        // Pour APK/PC, on garde l'ancien système
-        return `native_${ip}_${deviceId}`;
+// Clé unique améliorée
+const generateDeviceKey = (ip, deviceId) => {
+    if (ip.includes('127.0.0.1') || ip.includes('::1') || ip === '::ffff:127.0.0.1') {
+        return `web_${deviceId}`;
     }
-};
-
-// NOUVELLE FONCTION: Hash simple pour User-Agent
-const simpleHash = (str) => {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
-    }
-    return Math.abs(hash).toString(36);
-};
-
-// NOUVELLE FONCTION: Analyser le User-Agent pour plus d'infos
-const parseUserAgent = (userAgent) => {
-    const ua = userAgent.toLowerCase();
-    let platform = 'unknown';
-    let browser = 'unknown';
-    
-    // Détection plateforme
-    if (ua.includes('windows')) platform = 'windows';
-    else if (ua.includes('macintosh') || ua.includes('mac os')) platform = 'mac';
-    else if (ua.includes('linux')) platform = 'linux';
-    else if (ua.includes('android')) platform = 'android';
-    else if (ua.includes('iphone') || ua.includes('ipad')) platform = 'ios';
-    
-    // Détection navigateur
-    if (ua.includes('chrome') && !ua.includes('edg')) browser = 'chrome';
-    else if (ua.includes('firefox')) browser = 'firefox';
-    else if (ua.includes('safari') && !ua.includes('chrome')) browser = 'safari';
-    else if (ua.includes('edg')) browser = 'edge';
-    else if (ua.includes('opera')) browser = 'opera';
-    
-    return { platform, browser, full: userAgent.substring(0, 100) };
+    return `${ip}_${deviceId}`;
 };
 
 // Chargement devices
 const trustedDevicesData = loadTrustedDevices();
 trustedDevicesData.forEach((v, k) => TRUSTED_DEVICES.set(k, v));
 
-// Classe Game (inchangée)
+// Classe Game ultra-optimisée
 class Game {
     constructor(id, p1, p2) {
         Object.assign(this, {
@@ -354,36 +304,15 @@ class Game {
     getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec identification ULTRA PRÉCISE
+// WebSocket avec système de TOKEN
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
-    const userAgent = req.headers['user-agent'] || 'unknown';
     let deviceId = "unknown";
-    let sessionId = generateId(); // Session ID unique côté serveur
     
-    // Analyser le User-Agent pour plus d'informations
-    const uaInfo = parseUserAgent(userAgent);
+    console.log(`🌐 Nouvelle connexion depuis: ${ip}`);
     
-    console.log(`🌐 Nouvelle connexion: ${ip}`);
-    console.log(`📱 Platform: ${uaInfo.platform}, Browser: ${uaInfo.browser}`);
-    console.log(`🔧 User-Agent: ${uaInfo.full}`);
-    
-    // Stocker la session
-    WEB_SESSIONS.set(sessionId, {
-        ws: ws,
-        ip: ip,
-        userAgent: uaInfo,
-        deviceId: deviceId,
-        connectedAt: Date.now()
-    });
-    
-    // Envoyer un message de bienvenue AVEC le sessionId
-    ws.send(JSON.stringify({ 
-        type: 'connected', 
-        message: 'Serveur connecté',
-        sessionId: sessionId,
-        requiresDeviceId: true
-    }));
+    // Envoyer un message de bienvenue
+    ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
     
     ws.on('message', (data) => {
         try { 
@@ -392,33 +321,17 @@ wss.on('connection', (ws, req) => {
             // Récupérer le deviceId du message
             if (message.deviceId) {
                 deviceId = message.deviceId;
-                
-                // Mettre à jour la session avec le deviceId
-                if (WEB_SESSIONS.has(sessionId)) {
-                    const session = WEB_SESSIONS.get(sessionId);
-                    session.deviceId = deviceId;
-                    WEB_SESSIONS.set(sessionId, session);
-                }
             }
             
-            // Utiliser le sessionId du message si fourni
-            if (message.sessionId && WEB_SESSIONS.has(message.sessionId)) {
-                sessionId = message.sessionId;
-            }
-            
-            handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId); 
+            handleClientMessage(ws, message, ip, deviceId); 
         } catch(e) {
             console.error("❌ Erreur parsing message:", e);
         }
     });
 
     ws.on('close', () => {
-        // Nettoyer la session
-        WEB_SESSIONS.delete(sessionId);
-        
         setTimeout(() => {
-            // Générer la clé unique avec TOUTES les informations
-            const deviceKey = generateUniqueKey(ip, deviceId, userAgent, sessionId);
+            const deviceKey = generateDeviceKey(ip, deviceId);
             const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
             
             if (disconnectedNumber) {
@@ -446,20 +359,27 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Gestion messages avec identification ULTRA PRÉCISE
-function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
-    // GÉNÉRATION DE CLÉ ULTRA PRÉCISE
-    const deviceKey = generateUniqueKey(ip, deviceId, userAgent, sessionId);
+// Gestion messages avec TOKEN PRINCIPAL
+function handleClientMessage(ws, message, ip, deviceId) {
+    const deviceKey = generateDeviceKey(ip, deviceId);
     
-    console.log(`🔑 Message ${message.type} - Clé: ${deviceKey}`);
-    console.log(`📊 Détails: IP=${ip}, DeviceID=${deviceId}, SessionID=${sessionId.substring(0, 8)}...`);
+    console.log(`🔑 Message ${message.type} - Device: ${deviceId}`);
+    if (message.token) {
+        console.log(`🔑 Token fourni: ${message.token.substring(0, 10)}...`);
+    }
     
     const handlers = {
         authenticate: () => {
             const users = loadUsers();
             const user = users.find(u => u.number === message.number && u.password === message.password);
             if (user) {
-                // Sauvegarder l'association avec la clé ULTRA PRÉCISE
+                // GÉNÉRER OU METTRE À JOUR LE TOKEN
+                if (!user.token) {
+                    user.token = generateId() + generateId();
+                    console.log(`🔑 Nouveau token généré pour ${user.username}`);
+                }
+                
+                // Sauvegarder l'association device → user
                 TRUSTED_DEVICES.set(deviceKey, message.number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -467,20 +387,15 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
                 user.online = true;
                 saveUsers(users);
                 
-                // Générer un token
-                const token = generateId() + generateId();
-                
                 ws.send(JSON.stringify({ 
                     type: 'auth_success', 
                     username: user.username, 
                     score: user.score, 
                     number: user.number,
-                    token: token,
-                    sessionId: sessionId // Renvoyer le sessionId
+                    token: user.token // TOUJOURS ENVOYER LE TOKEN
                 }));
                 
-                console.log(`✅ Connexion: ${user.username}`);
-                console.log(`🔐 Clé enregistrée: ${deviceKey}`);
+                console.log(`✅ Connexion: ${user.username} (Token activé)`);
             } else {
                 ws.send(JSON.stringify({ type: 'auth_failed', message: 'Numéro ou mot de passe incorrect' }));
             }
@@ -498,18 +413,24 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
             } else if (users.find(u => u.number === number)) {
                 ws.send(JSON.stringify({ type: 'register_failed', message: "Numéro déjà utilisé" }));
             } else {
-                const newUser = { username, password, number, age: parseInt(age), score: 0, online: true };
+                // CRÉER UN TOKEN DÈS L'INSCRIPTION
+                const newUser = { 
+                    username, 
+                    password, 
+                    number, 
+                    age: parseInt(age), 
+                    score: 0, 
+                    online: true,
+                    token: generateId() + generateId() // TOKEN CRÉÉ ICI
+                };
                 users.push(newUser);
                 saveUsers(users);
                 
-                // Sauvegarder avec la clé ULTRA PRÉCISE
+                // Sauvegarder l'association device → user
                 TRUSTED_DEVICES.set(deviceKey, number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
                 PLAYER_CONNECTIONS.set(number, ws);
-                
-                // Générer un token
-                const token = generateId() + generateId();
                 
                 ws.send(JSON.stringify({ 
                     type: 'register_success', 
@@ -517,12 +438,10 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
                     username, 
                     score: 0, 
                     number,
-                    token: token,
-                    sessionId: sessionId // Renvoyer le sessionId
+                    token: newUser.token // ENVOYER LE TOKEN
                 }));
                 
-                console.log(`✅ Inscription: ${username}`);
-                console.log(`🔐 Clé enregistrée: ${deviceKey}`);
+                console.log(`✅ Inscription: ${username} (Token créé)`);
             }
         },
 
@@ -552,7 +471,7 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
                 if (player) game.handlePlayerDisconnect(player);
                 PLAYER_TO_GAME.delete(playerNumber);
                 
-                console.log(`🚪 Déconnexion manuelle: ${playerNumber} (${deviceKey})`);
+                console.log(`🚪 Déconnexion manuelle: ${playerNumber}`);
                 
                 // Envoyer confirmation
                 ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie' }));
@@ -562,6 +481,49 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
         },
         
         auto_login: () => {
+            // PRIORITÉ ABSOLUE AU TOKEN
+            if (message.token) {
+                const users = loadUsers();
+                const user = users.find(u => u.token === message.token);
+                
+                if (user) {
+                    PLAYER_CONNECTIONS.set(user.number, ws);
+                    user.online = true;
+                    saveUsers(users);
+                    
+                    // Sauvegarder aussi l'association device (pour compatibilité)
+                    if (deviceId && deviceId !== "unknown") {
+                        TRUSTED_DEVICES.set(deviceKey, user.number);
+                        saveTrustedDevices(TRUSTED_DEVICES);
+                    }
+                    
+                    ws.send(JSON.stringify({ 
+                        type: 'auto_login_success', 
+                        username: user.username, 
+                        score: user.score, 
+                        number: user.number,
+                        token: user.token // RENVOYER LE TOKEN
+                    }));
+                    
+                    // Reconnexion lobby si en jeu
+                    const gameId = PLAYER_TO_GAME.get(user.number);
+                    const game = ACTIVE_GAMES.get(gameId);
+                    const player = game?.getPlayerByNumber(user.number);
+                    if (player) { 
+                        player.ws = ws; 
+                        game.broadcastGameState(); 
+                    }
+                    
+                    console.log(`🔄 Auto-login PAR TOKEN: ${user.username}`);
+                    return;
+                } else {
+                    console.log(`❌ Token invalide: ${message.token.substring(0, 10)}...`);
+                    ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Token invalide' }));
+                    return;
+                }
+            }
+            
+            // FALLBACK: ancien système par device (pour compatibilité)
             const trustedNumber = TRUSTED_DEVICES.get(deviceKey);
             if (trustedNumber) {
                 const users = loadUsers();
@@ -571,34 +533,27 @@ function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
                     user.online = true;
                     saveUsers(users);
                     
-                    // Générer un nouveau token
-                    const token = generateId() + generateId();
+                    // S'assurer que l'utilisateur a un token
+                    if (!user.token) {
+                        user.token = generateId() + generateId();
+                        saveUsers(users);
+                        console.log(`🔑 Token généré pour ${user.username} (fallback device)`);
+                    }
                     
                     ws.send(JSON.stringify({ 
                         type: 'auto_login_success', 
                         username: user.username, 
                         score: user.score, 
                         number: user.number,
-                        token: token,
-                        sessionId: sessionId // Renvoyer le sessionId
+                        token: user.token // ENVOYER LE TOKEN
                     }));
                     
-                    // Reconnexion lobby
-                    const gameId = PLAYER_TO_GAME.get(trustedNumber);
-                    const game = ACTIVE_GAMES.get(gameId);
-                    const player = game?.getPlayerByNumber(trustedNumber);
-                    if (player) { 
-                        player.ws = ws; 
-                        game.broadcastGameState(); 
-                    }
-                    
-                    console.log(`🔄 Auto-login: ${user.username}`);
-                    console.log(`🔐 Clé utilisée: ${deviceKey}`);
+                    console.log(`🔄 Auto-login par device: ${user.username}`);
                 } else {
                     ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Utilisateur non trouvé' }));
                 }
             } else {
-                console.log(`❌ Auto-login échoué - Clé non trouvée: ${deviceKey}`);
+                console.log(`❌ Auto-login échoué - Pas de token ni device reconnu`);
                 ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Appareil non reconnu' }));
             }
         },
@@ -682,9 +637,9 @@ function handleGameAction(ws, message, deviceKey) {
 // Démarrage
 app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur ULTRA PRÉCIS actif sur le port ${PORT}`);
-    console.log('✅ Identification: User-Agent + DeviceID + SessionID + IP');
-    console.log('✅ Détection plateforme/navigateur');
-    console.log('✅ Sessions Web gérées individuellement');
-    console.log('✅ Compatible itch.io, APK, PC');
+    console.log(`🎮 Serveur TOKEN ACTIVÉ actif sur le port ${PORT}`);
+    console.log('✅ Système de token principal activé');
+    console.log('✅ Compatibilité device ID maintenue');
+    console.log('✅ Auto-connexion par token pour itch.io');
+    console.log('✅ Fallback device ID pour APK/PC');
 });
