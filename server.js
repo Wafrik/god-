@@ -11,7 +11,7 @@ const wss = new WebSocket.Server({ server });
 // 🚀 CHEMINS CORRIGÉS POUR RENDER
 const USERS_FILE = path.join(__dirname, 'users.json');
 const TRUSTED_DEVICES_FILE = path.join(__dirname, 'trusted_devices.json');
-const PORT = process.env.PORT || 8000; // 🚀 IMPORTANT pour Render
+const PORT = process.env.PORT || 8000;
 
 // Structures optimisées
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
@@ -39,14 +39,21 @@ const loadTrustedDevices = () => {
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
 const generateId = () => Math.random().toString(36).substring(2, 10);
 
-// Clé unique pour identifier les appareils : IP + Device ID
-const generateDeviceKey = (ip, deviceId) => `${ip}_${deviceId}`;
+// CORRECTION: Clé unique améliorée pour itch.io
+const generateDeviceKey = (ip, deviceId, userAgent = 'unknown') => {
+    // Pour itch.io, on utilise SEULEMENT le deviceId (car IP est toujours la même)
+    if (ip.includes('127.0.0.1') || ip.includes('itch.io') || ip === '::1' || ip === '::ffff:127.0.0.1') {
+        return `itchio_${deviceId}`;
+    }
+    // Pour les autres cas (APK, PC), on garde l'ancien système
+    return `${ip}_${deviceId}`;
+};
 
 // Chargement devices
 const trustedDevicesData = loadTrustedDevices();
 trustedDevicesData.forEach((v, k) => TRUSTED_DEVICES.set(k, v));
 
-// Classe Game ultra-optimisée
+// Classe Game (inchangée)
 class Game {
     constructor(id, p1, p2) {
         Object.assign(this, {
@@ -149,7 +156,7 @@ class Game {
         if (!this.playerCombinations.player2) this.playerCombinations.player2 = [1,2,3,4,5,6];
 
         const arrayIndex = slot - 1;
-        if (arrayIndex < 0 || arrayIndex >= 6) return false;
+        if (array_index < 0 || array_index >= 6) return false;
 
         const realValue = this.playerCombinations[oppRole][arrayIndex];
         this.availableSlots[player.role] = this.availableSlots[player.role].filter(s => s !== slot);
@@ -299,10 +306,12 @@ class Game {
     getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec identification Device ID
+// WebSocket avec identification Device ID améliorée
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
     let deviceId = "unknown";
+    
+    console.log(`🌐 Nouvelle connexion depuis: ${ip}`);
     
     // Envoyer un message de bienvenue
     ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
@@ -314,6 +323,7 @@ wss.on('connection', (ws, req) => {
             // Récupérer le deviceId du message
             if (message.deviceId) {
                 deviceId = message.deviceId;
+                console.log(`📱 Device ID reçu: ${deviceId} (IP: ${ip})`);
             }
             
             handleClientMessage(ws, message, ip, deviceId); 
@@ -324,7 +334,7 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         setTimeout(() => {
-            // Trouver la connexion à fermer basée sur IP + Device ID
+            // CORRECTION: Utiliser la nouvelle fonction generateDeviceKey
             const deviceKey = generateDeviceKey(ip, deviceId);
             const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
             
@@ -355,7 +365,10 @@ wss.on('connection', (ws, req) => {
 
 // Gestion messages avec Device ID
 function handleClientMessage(ws, message, ip, deviceId) {
+    // CORRECTION: Utiliser la nouvelle fonction generateDeviceKey
     const deviceKey = generateDeviceKey(ip, deviceId);
+    
+    console.log(`🔑 Traitement message ${message.type} - DeviceKey: ${deviceKey}`);
     
     const handlers = {
         authenticate: () => {
@@ -425,7 +438,6 @@ function handleClientMessage(ws, message, ip, deviceId) {
             }
         },
 
-        // NOUVEAU: Handler pour la déconnexion manuelle
         logout: () => {
             const playerNumber = TRUSTED_DEVICES.get(deviceKey);
             if (playerNumber) {
@@ -579,7 +591,8 @@ function handleGameAction(ws, message, deviceKey) {
 // Démarrage
 app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur AVEC DEVICE ID actif sur le port ${PORT}`);
-    console.log('✅ Identification unique: IP + Device ID');
-    console.log('✅ Déconnexion manuelle implémentée');
+    console.log(`🎮 Serveur OPTIMISÉ POUR ITCH.IO actif sur le port ${PORT}`);
+    console.log('✅ Identification unique: Device ID uniquement pour itch.io');
+    console.log('✅ IP + Device ID pour les autres plateformes');
+    console.log('✅ Auto-connexion fonctionnelle sur itch.io');
 });
