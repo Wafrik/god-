@@ -17,6 +17,9 @@ const PORT = process.env.PORT || 8000;
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
 
+// NOUVEAU: Stockage des sessions avec identifiants uniques
+const WEB_SESSIONS = new Map();
+
 // Utilitaires optimisés
 const loadUsers = () => {
     if (!fs.existsSync(USERS_FILE)) {
@@ -37,16 +40,61 @@ const loadTrustedDevices = () => {
 };
 
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
-const generateId = () => Math.random().toString(36).substring(2, 10);
+const generateId = () => Math.random().toString(36).substring(2, 15);
 
-// CORRECTION: Clé unique améliorée pour itch.io
-const generateDeviceKey = (ip, deviceId, userAgent = 'unknown') => {
-    // Pour itch.io, on utilise SEULEMENT le deviceId (car IP est toujours la même)
-    if (ip.includes('127.0.0.1') || ip.includes('itch.io') || ip === '::1' || ip === '::ffff:127.0.0.1') {
-        return `itchio_${deviceId}`;
+// NOUVELLE FONCTION: Générer une clé unique ULTRA précise
+const generateUniqueKey = (ip, deviceId, userAgent, sessionId = '') => {
+    // Pour les connexions Web (itch.io), on utilise une combinaison plus précise
+    const isWebConnection = ip.includes('127.0.0.1') || ip.includes('::1') || ip === '::ffff:127.0.0.1' || !ip;
+    
+    if (isWebConnection) {
+        // ULTRA PRÉCIS: User-Agent + DeviceID + SessionID + Timestamp
+        const timestamp = Date.now();
+        const userAgentHash = simpleHash(userAgent);
+        
+        if (sessionId) {
+            return `web_${userAgentHash}_${deviceId}_${sessionId}`;
+        } else {
+            return `web_${userAgentHash}_${deviceId}_${timestamp}`;
+        }
+    } else {
+        // Pour APK/PC, on garde l'ancien système
+        return `native_${ip}_${deviceId}`;
     }
-    // Pour les autres cas (APK, PC), on garde l'ancien système
-    return `${ip}_${deviceId}`;
+};
+
+// NOUVELLE FONCTION: Hash simple pour User-Agent
+const simpleHash = (str) => {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        const char = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash).toString(36);
+};
+
+// NOUVELLE FONCTION: Analyser le User-Agent pour plus d'infos
+const parseUserAgent = (userAgent) => {
+    const ua = userAgent.toLowerCase();
+    let platform = 'unknown';
+    let browser = 'unknown';
+    
+    // Détection plateforme
+    if (ua.includes('windows')) platform = 'windows';
+    else if (ua.includes('macintosh') || ua.includes('mac os')) platform = 'mac';
+    else if (ua.includes('linux')) platform = 'linux';
+    else if (ua.includes('android')) platform = 'android';
+    else if (ua.includes('iphone') || ua.includes('ipad')) platform = 'ios';
+    
+    // Détection navigateur
+    if (ua.includes('chrome') && !ua.includes('edg')) browser = 'chrome';
+    else if (ua.includes('firefox')) browser = 'firefox';
+    else if (ua.includes('safari') && !ua.includes('chrome')) browser = 'safari';
+    else if (ua.includes('edg')) browser = 'edge';
+    else if (ua.includes('opera')) browser = 'opera';
+    
+    return { platform, browser, full: userAgent.substring(0, 100) };
 };
 
 // Chargement devices
@@ -156,7 +204,7 @@ class Game {
         if (!this.playerCombinations.player2) this.playerCombinations.player2 = [1,2,3,4,5,6];
 
         const arrayIndex = slot - 1;
-        if (array_index < 0 || array_index >= 6) return false;
+        if (arrayIndex < 0 || arrayIndex >= 6) return false;
 
         const realValue = this.playerCombinations[oppRole][arrayIndex];
         this.availableSlots[player.role] = this.availableSlots[player.role].filter(s => s !== slot);
@@ -306,15 +354,36 @@ class Game {
     getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec identification Device ID améliorée
+// WebSocket avec identification ULTRA PRÉCISE
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'] || 'unknown';
     let deviceId = "unknown";
+    let sessionId = generateId(); // Session ID unique côté serveur
     
-    console.log(`🌐 Nouvelle connexion depuis: ${ip}`);
+    // Analyser le User-Agent pour plus d'informations
+    const uaInfo = parseUserAgent(userAgent);
     
-    // Envoyer un message de bienvenue
-    ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
+    console.log(`🌐 Nouvelle connexion: ${ip}`);
+    console.log(`📱 Platform: ${uaInfo.platform}, Browser: ${uaInfo.browser}`);
+    console.log(`🔧 User-Agent: ${uaInfo.full}`);
+    
+    // Stocker la session
+    WEB_SESSIONS.set(sessionId, {
+        ws: ws,
+        ip: ip,
+        userAgent: uaInfo,
+        deviceId: deviceId,
+        connectedAt: Date.now()
+    });
+    
+    // Envoyer un message de bienvenue AVEC le sessionId
+    ws.send(JSON.stringify({ 
+        type: 'connected', 
+        message: 'Serveur connecté',
+        sessionId: sessionId,
+        requiresDeviceId: true
+    }));
     
     ws.on('message', (data) => {
         try { 
@@ -323,19 +392,33 @@ wss.on('connection', (ws, req) => {
             // Récupérer le deviceId du message
             if (message.deviceId) {
                 deviceId = message.deviceId;
-                console.log(`📱 Device ID reçu: ${deviceId} (IP: ${ip})`);
+                
+                // Mettre à jour la session avec le deviceId
+                if (WEB_SESSIONS.has(sessionId)) {
+                    const session = WEB_SESSIONS.get(sessionId);
+                    session.deviceId = deviceId;
+                    WEB_SESSIONS.set(sessionId, session);
+                }
             }
             
-            handleClientMessage(ws, message, ip, deviceId); 
+            // Utiliser le sessionId du message si fourni
+            if (message.sessionId && WEB_SESSIONS.has(message.sessionId)) {
+                sessionId = message.sessionId;
+            }
+            
+            handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId); 
         } catch(e) {
             console.error("❌ Erreur parsing message:", e);
         }
     });
 
     ws.on('close', () => {
+        // Nettoyer la session
+        WEB_SESSIONS.delete(sessionId);
+        
         setTimeout(() => {
-            // CORRECTION: Utiliser la nouvelle fonction generateDeviceKey
-            const deviceKey = generateDeviceKey(ip, deviceId);
+            // Générer la clé unique avec TOUTES les informations
+            const deviceKey = generateUniqueKey(ip, deviceId, userAgent, sessionId);
             const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
             
             if (disconnectedNumber) {
@@ -363,19 +446,20 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Gestion messages avec Device ID
-function handleClientMessage(ws, message, ip, deviceId) {
-    // CORRECTION: Utiliser la nouvelle fonction generateDeviceKey
-    const deviceKey = generateDeviceKey(ip, deviceId);
+// Gestion messages avec identification ULTRA PRÉCISE
+function handleClientMessage(ws, message, ip, deviceId, userAgent, sessionId) {
+    // GÉNÉRATION DE CLÉ ULTRA PRÉCISE
+    const deviceKey = generateUniqueKey(ip, deviceId, userAgent, sessionId);
     
-    console.log(`🔑 Traitement message ${message.type} - DeviceKey: ${deviceKey}`);
+    console.log(`🔑 Message ${message.type} - Clé: ${deviceKey}`);
+    console.log(`📊 Détails: IP=${ip}, DeviceID=${deviceId}, SessionID=${sessionId.substring(0, 8)}...`);
     
     const handlers = {
         authenticate: () => {
             const users = loadUsers();
             const user = users.find(u => u.number === message.number && u.password === message.password);
             if (user) {
-                // Sauvegarder l'association device → user
+                // Sauvegarder l'association avec la clé ULTRA PRÉCISE
                 TRUSTED_DEVICES.set(deviceKey, message.number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -391,10 +475,12 @@ function handleClientMessage(ws, message, ip, deviceId) {
                     username: user.username, 
                     score: user.score, 
                     number: user.number,
-                    token: token
+                    token: token,
+                    sessionId: sessionId // Renvoyer le sessionId
                 }));
                 
-                console.log(`✅ Connexion: ${user.username} (${deviceKey})`);
+                console.log(`✅ Connexion: ${user.username}`);
+                console.log(`🔐 Clé enregistrée: ${deviceKey}`);
             } else {
                 ws.send(JSON.stringify({ type: 'auth_failed', message: 'Numéro ou mot de passe incorrect' }));
             }
@@ -416,7 +502,7 @@ function handleClientMessage(ws, message, ip, deviceId) {
                 users.push(newUser);
                 saveUsers(users);
                 
-                // Sauvegarder l'association device → user
+                // Sauvegarder avec la clé ULTRA PRÉCISE
                 TRUSTED_DEVICES.set(deviceKey, number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -431,10 +517,12 @@ function handleClientMessage(ws, message, ip, deviceId) {
                     username, 
                     score: 0, 
                     number,
-                    token: token
+                    token: token,
+                    sessionId: sessionId // Renvoyer le sessionId
                 }));
                 
-                console.log(`✅ Inscription: ${username} (${deviceKey})`);
+                console.log(`✅ Inscription: ${username}`);
+                console.log(`🔐 Clé enregistrée: ${deviceKey}`);
             }
         },
 
@@ -491,7 +579,8 @@ function handleClientMessage(ws, message, ip, deviceId) {
                         username: user.username, 
                         score: user.score, 
                         number: user.number,
-                        token: token
+                        token: token,
+                        sessionId: sessionId // Renvoyer le sessionId
                     }));
                     
                     // Reconnexion lobby
@@ -503,11 +592,13 @@ function handleClientMessage(ws, message, ip, deviceId) {
                         game.broadcastGameState(); 
                     }
                     
-                    console.log(`🔄 Auto-login: ${user.username} (${deviceKey})`);
+                    console.log(`🔄 Auto-login: ${user.username}`);
+                    console.log(`🔐 Clé utilisée: ${deviceKey}`);
                 } else {
                     ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Utilisateur non trouvé' }));
                 }
             } else {
+                console.log(`❌ Auto-login échoué - Clé non trouvée: ${deviceKey}`);
                 ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Appareil non reconnu' }));
             }
         },
@@ -591,8 +682,9 @@ function handleGameAction(ws, message, deviceKey) {
 // Démarrage
 app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur OPTIMISÉ POUR ITCH.IO actif sur le port ${PORT}`);
-    console.log('✅ Identification unique: Device ID uniquement pour itch.io');
-    console.log('✅ IP + Device ID pour les autres plateformes');
-    console.log('✅ Auto-connexion fonctionnelle sur itch.io');
+    console.log(`🎮 Serveur ULTRA PRÉCIS actif sur le port ${PORT}`);
+    console.log('✅ Identification: User-Agent + DeviceID + SessionID + IP');
+    console.log('✅ Détection plateforme/navigateur');
+    console.log('✅ Sessions Web gérées individuellement');
+    console.log('✅ Compatible itch.io, APK, PC');
 });
