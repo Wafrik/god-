@@ -17,9 +17,6 @@ const PORT = process.env.PORT || 8000; // 🚀 IMPORTANT pour Render
 const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
 
-// NOUVEAU: Stockage des sessions WebGL par token unique
-const WEBGL_SESSIONS = new Map();
-
 // Utilitaires optimisés
 const loadUsers = () => {
     if (!fs.existsSync(USERS_FILE)) {
@@ -42,7 +39,7 @@ const loadTrustedDevices = () => {
 const saveTrustedDevices = (m) => fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(Object.fromEntries(m), null, 2));
 const generateId = () => Math.random().toString(36).substring(2, 10);
 
-// CORRECTION: Retour à la clé originale qui fonctionnait
+// Clé unique pour identifier les appareils : IP + Device ID
 const generateDeviceKey = (ip, deviceId) => `${ip}_${deviceId}`;
 
 // Chargement devices
@@ -302,7 +299,7 @@ class Game {
     getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec identification Device ID - VERSION ORIGINALE
+// WebSocket avec identification Device ID
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress;
     let deviceId = "unknown";
@@ -314,7 +311,7 @@ wss.on('connection', (ws, req) => {
         try { 
             const message = JSON.parse(data);
             
-            // Récupérer le deviceId du message - SYSTEME ORIGINAL
+            // Récupérer le deviceId du message
             if (message.deviceId) {
                 deviceId = message.deviceId;
             }
@@ -327,7 +324,7 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         setTimeout(() => {
-            // Trouver la connexion à fermer basée sur IP + Device ID - SYSTEME ORIGINAL
+            // Trouver la connexion à fermer basée sur IP + Device ID
             const deviceKey = generateDeviceKey(ip, deviceId);
             const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
             
@@ -356,7 +353,7 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Gestion messages avec Device ID - VERSION ORIGINALE
+// Gestion messages avec Device ID
 function handleClientMessage(ws, message, ip, deviceId) {
     const deviceKey = generateDeviceKey(ip, deviceId);
     
@@ -365,7 +362,7 @@ function handleClientMessage(ws, message, ip, deviceId) {
             const users = loadUsers();
             const user = users.find(u => u.number === message.number && u.password === message.password);
             if (user) {
-                // Sauvegarder l'association device → user - SYSTEME ORIGINAL
+                // Sauvegarder l'association device → user
                 TRUSTED_DEVICES.set(deviceKey, message.number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -406,7 +403,7 @@ function handleClientMessage(ws, message, ip, deviceId) {
                 users.push(newUser);
                 saveUsers(users);
                 
-                // Sauvegarder l'association device → user - SYSTEME ORIGINAL
+                // Sauvegarder l'association device → user
                 TRUSTED_DEVICES.set(deviceKey, number);
                 saveTrustedDevices(TRUSTED_DEVICES);
                 
@@ -428,7 +425,7 @@ function handleClientMessage(ws, message, ip, deviceId) {
             }
         },
 
-        // Handler pour la déconnexion manuelle
+        // NOUVEAU: Handler pour la déconnexion manuelle
         logout: () => {
             const playerNumber = TRUSTED_DEVICES.get(deviceKey);
             if (playerNumber) {
@@ -582,8 +579,7 @@ function handleGameAction(ws, message, deviceKey) {
 // Démarrage
 app.use(express.static('public'));
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎮 Serveur ORIGINAL AVEC AUTO-CONNEXION actif sur le port ${PORT}`);
-    console.log('✅ Système original de Device ID restauré');
-    console.log('✅ Auto-connexion 100% fonctionnelle');
-    console.log('✅ Gestion WebGL/itch.io optimisée');
+    console.log(`🎮 Serveur AVEC DEVICE ID actif sur le port ${PORT}`);
+    console.log('✅ Identification unique: IP + Device ID');
+    console.log('✅ Déconnexion manuelle implémentée');
 });
