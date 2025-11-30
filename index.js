@@ -8,11 +8,17 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Remplace la configuration PostgreSQL par :
+// ✅ CODE SÉCURISÉ
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || "postgresql://postgres_gode_user:vRTiWSdipdujN59gDWHFqPoIW5CgyppW@dpg-d4m1seshg0os73bi8h2g-a.frankfurt-postgres.render.com/postgres_gode",
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+// Vérification que la variable existe
+if (!process.env.DATABASE_URL) {
+  console.error('❌ DATABASE_URL non définie !');
+  process.exit(1); // Arrête le serveur si la variable manque
+}
 
 const PORT = process.env.PORT || 8000;
 
@@ -756,5 +762,6 @@ async function startServer() {
 }
 
 startServer();
+
 
 
