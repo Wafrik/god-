@@ -1,18 +1,28 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const { Pool } = require('pg');
+const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+
+// 🚀 CHEMINS EXISTANTS PRÉSERVÉS
+const USERS_FILE = path.join(__dirname, 'users.json');
+const TRUSTED_DEVICES_FILE = path.join(__dirname, 'trusted_devices.json');
+const PORT = process.env.PORT || 8000;
 
 // 🗄️ CONFIGURATION POSTGRESQL POUR RENDER
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
+
+// Structures optimisées (identiques)
+const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
+const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
 
 // Test de la connexion PostgreSQL
 pool.on('connect', () => {
@@ -23,14 +33,213 @@ pool.on('error', (err) => {
   console.error('❌ Erreur PostgreSQL:', err);
 });
 
-const PORT = process.env.PORT || 8000;
+// Utilitaires optimisés (identiques)
+const generateId = () => Math.random().toString(36).substring(2, 15);
 
-// Structures en mémoire
-const TRUSTED_DEVICES = new Map();
-const PLAYER_CONNECTIONS = new Map();
-const PLAYER_QUEUE = new Set();
-const ACTIVE_GAMES = new Map();
-const PLAYER_TO_GAME = new Map();
+const generateDeviceKey = (ip, deviceId) => {
+  if (ip.includes('127.0.0.1') || ip.includes('::1') || ip === '::ffff:127.0.0.1') {
+    return `web_${deviceId}`;
+  }
+  return `${ip}_${deviceId}`;
+};
+
+// 🗄️ FONCTIONS DATABASE AVEC FALLBACK (pour transition)
+const db = {
+  // Utilisateurs
+  async getUserByNumber(number) {
+    try {
+      const result = await pool.query('SELECT * FROM users WHERE number = $1', [number]);
+      return result.rows[0];
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL getUserByNumber, fallback JSON:', error);
+      // Fallback vers l'ancien système JSON
+      if (!fs.existsSync(USERS_FILE)) {
+        fs.writeFileSync(USERS_FILE, JSON.stringify([]));
+        return null;
+      }
+      const users = JSON.parse(fs.readFileSync(USERS_FILE));
+      return users.find(u => u.number === number);
+    }
+  },
+
+  async getUserByUsername(username) {
+    try {
+      const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+      return result.rows[0];
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL getUserByUsername, fallback JSON:', error);
+      if (!fs.existsSync(USERS_FILE)) return null;
+      const users = JSON.parse(fs.readFileSync(USERS_FILE));
+      return users.find(u => u.username === username);
+    }
+  },
+
+  async getUserByToken(token) {
+    try {
+      const result = await pool.query('SELECT * FROM users WHERE token = $1', [token]);
+      return result.rows[0];
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL getUserByToken, fallback JSON:', error);
+      if (!fs.existsSync(USERS_FILE)) return null;
+      const users = JSON.parse(fs.readFileSync(USERS_FILE));
+      return users.find(u => u.token === token);
+    }
+  },
+
+  async createUser(userData) {
+    try {
+      const { username, password, number, age } = userData;
+      const token = generateId() + generateId();
+      const result = await pool.query(
+        `INSERT INTO users (username, password, number, age, score, online, token) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7) 
+         RETURNING *`,
+        [username, password, number, age, 0, true, token]
+      );
+      console.log('✅ Utilisateur créé dans PostgreSQL:', username);
+      return result.rows[0];
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL createUser, fallback JSON:', error);
+      // Fallback vers l'ancien système JSON
+      const users = !fs.existsSync(USERS_FILE) ? [] : JSON.parse(fs.readFileSync(USERS_FILE));
+      const newUser = { 
+        username, 
+        password, 
+        number, 
+        age: parseInt(age), 
+        score: 0, 
+        online: true,
+        token: generateId() + generateId()
+      };
+      users.push(newUser);
+      fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+      return newUser;
+    }
+  },
+
+  async updateUserScore(number, newScore) {
+    try {
+      await pool.query(
+        'UPDATE users SET score = $1 WHERE number = $2',
+        [newScore, number]
+      );
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL updateUserScore, fallback JSON:', error);
+      // Fallback JSON
+      if (!fs.existsSync(USERS_FILE)) return;
+      const users = JSON.parse(fs.readFileSync(USERS_FILE));
+      const user = users.find(u => u.number === number);
+      if (user) {
+        user.score = newScore;
+        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+      }
+    }
+  },
+
+  async setUserOnlineStatus(number, online) {
+    try {
+      await pool.query(
+        'UPDATE users SET online = $1 WHERE number = $2',
+        [online, number]
+      );
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL setUserOnlineStatus, fallback JSON:', error);
+      // Fallback JSON
+      if (!fs.existsSync(USERS_FILE)) return;
+      const users = JSON.parse(fs.readFileSync(USERS_FILE));
+      const user = users.find(u => u.number === number);
+      if (user) {
+        user.online = online;
+        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+      }
+    }
+  },
+
+  async updateUserToken(number, token) {
+    try {
+      await pool.query(
+        'UPDATE users SET token = $1 WHERE number = $2',
+        [token, number]
+      );
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL updateUserToken, fallback JSON:', error);
+      // Fallback JSON
+      if (!fs.existsSync(USERS_FILE)) return;
+      const users = JSON.parse(fs.readFileSync(USERS_FILE));
+      const user = users.find(u => u.number === number);
+      if (user) {
+        user.token = token;
+        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+      }
+    }
+  },
+
+  // Appareils de confiance
+  async getTrustedDevice(deviceKey) {
+    try {
+      const result = await pool.query(
+        'SELECT * FROM trusted_devices WHERE device_key = $1',
+        [deviceKey]
+      );
+      return result.rows[0];
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL getTrustedDevice, fallback JSON:', error);
+      // Fallback JSON
+      if (!fs.existsSync(TRUSTED_DEVICES_FILE)) {
+        fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify({}));
+        return null;
+      }
+      const trustedDevices = JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
+      return trustedDevices[deviceKey] ? { device_key: deviceKey, user_number: trustedDevices[deviceKey] } : null;
+    }
+  },
+
+  async createTrustedDevice(deviceKey, userNumber) {
+    try {
+      await pool.query(
+        'INSERT INTO trusted_devices (device_key, user_number) VALUES ($1, $2) ON CONFLICT (device_key) DO UPDATE SET user_number = $2',
+        [deviceKey, userNumber]
+      );
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL createTrustedDevice, fallback JSON:', error);
+      // Fallback JSON
+      const trustedDevices = !fs.existsSync(TRUSTED_DEVICES_FILE) ? {} : JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
+      trustedDevices[deviceKey] = userNumber;
+      fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(trustedDevices, null, 2));
+    }
+  },
+
+  async deleteTrustedDevice(deviceKey) {
+    try {
+      await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL deleteTrustedDevice, fallback JSON:', error);
+      // Fallback JSON
+      if (!fs.existsSync(TRUSTED_DEVICES_FILE)) return;
+      const trustedDevices = JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
+      delete trustedDevices[deviceKey];
+      fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(trustedDevices, null, 2));
+    }
+  },
+
+  // Classement
+  async getLeaderboard() {
+    try {
+      const result = await pool.query(
+        'SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC LIMIT 100'
+      );
+      return result.rows;
+    } catch (error) {
+      console.error('❌ Erreur PostgreSQL getLeaderboard, fallback JSON:', error);
+      // Fallback JSON
+      if (!fs.existsSync(USERS_FILE)) return [];
+      const users = JSON.parse(fs.readFileSync(USERS_FILE));
+      return users.filter(u => u.score >= 0)
+                 .sort((a, b) => b.score - a.score)
+                 .slice(0, 100);
+    }
+  }
+};
 
 // 🗄️ INITIALISATION DE LA BASE DE DONNÉES
 async function initializeDatabase() {
@@ -57,119 +266,40 @@ async function initializeDatabase() {
         id SERIAL PRIMARY KEY,
         device_key VARCHAR(200) UNIQUE NOT NULL,
         user_number VARCHAR(20) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_number) REFERENCES users(number) ON DELETE CASCADE
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    console.log('🗄️ Base de données initialisée');
+    console.log('🗄️ Tables PostgreSQL initialisées');
   } catch (error) {
     console.error('❌ Erreur initialisation base de données:', error);
   }
 }
 
-// Utilitaires optimisés
-const generateId = () => Math.random().toString(36).substring(2, 15);
-const generateDeviceKey = (ip, deviceId) => {
-  if (ip.includes('127.0.0.1') || ip.includes('::1') || ip === '::ffff:127.0.0.1') {
-    return `web_${deviceId}`;
-  }
-  return `${ip}_${deviceId}`;
-};
-
-// 🗄️ FONCTIONS DATABASE
-const db = {
-  // Utilisateurs
-  async getUserByNumber(number) {
-    const result = await pool.query('SELECT * FROM users WHERE number = $1', [number]);
-    return result.rows[0];
-  },
-
-  async getUserByUsername(username) {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    return result.rows[0];
-  },
-
-  async getUserByToken(token) {
-    const result = await pool.query('SELECT * FROM users WHERE token = $1', [token]);
-    return result.rows[0];
-  },
-
-  async createUser(userData) {
-    const { username, password, number, age } = userData;
-    const result = await pool.query(
-      `INSERT INTO users (username, password, number, age, score, online, token) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7) 
-       RETURNING *`,
-      [username, password, number, age, 0, true, generateId() + generateId()]
-    );
-    return result.rows[0];
-  },
-
-  async updateUserScore(number, newScore) {
-    await pool.query(
-      'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-      [newScore, number]
-    );
-  },
-
-  async setUserOnlineStatus(number, online) {
-    await pool.query(
-      'UPDATE users SET online = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-      [online, number]
-    );
-  },
-
-  async updateUserToken(number, token) {
-    await pool.query(
-      'UPDATE users SET token = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-      [token, number]
-    );
-  },
-
-  // Appareils de confiance
-  async getTrustedDevice(deviceKey) {
-    const result = await pool.query(
-      'SELECT * FROM trusted_devices WHERE device_key = $1',
-      [deviceKey]
-    );
-    return result.rows[0];
-  },
-
-  async createTrustedDevice(deviceKey, userNumber) {
-    await pool.query(
-      'INSERT INTO trusted_devices (device_key, user_number) VALUES ($1, $2) ON CONFLICT (device_key) DO UPDATE SET user_number = $2',
-      [deviceKey, userNumber]
-    );
-  },
-
-  async deleteTrustedDevice(deviceKey) {
-    await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
-  },
-
-  // Classement
-  async getLeaderboard() {
-    const result = await pool.query(
-      'SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC LIMIT 100'
-    );
-    return result.rows;
-  }
-};
-
-// Chargement des appareils de confiance au démarrage
+// Chargement des appareils de confiance au démarrage (identique)
 async function loadTrustedDevices() {
   try {
     const result = await pool.query('SELECT * FROM trusted_devices');
     result.rows.forEach(row => {
       TRUSTED_DEVICES.set(row.device_key, row.user_number);
     });
-    console.log(`📱 ${result.rows.length} appareils de confiance chargés`);
+    console.log(`📱 ${result.rows.length} appareils de confiance chargés depuis PostgreSQL`);
   } catch (error) {
-    console.error('❌ Erreur chargement appareils de confiance:', error);
+    console.error('❌ Erreur chargement appareils PostgreSQL, fallback JSON:', error);
+    // Fallback JSON
+    if (!fs.existsSync(TRUSTED_DEVICES_FILE)) {
+      fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify({}));
+      return;
+    }
+    const trustedDevices = JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
+    Object.entries(trustedDevices).forEach(([key, value]) => {
+      TRUSTED_DEVICES.set(key, value);
+    });
+    console.log(`📱 ${Object.keys(trustedDevices).length} appareils de confiance chargés depuis JSON`);
   }
 }
 
-// Classe Game (identique mais avec appels DB)
+// ⚡ CLASSE GAME IDENTIQUE À VOTRE VERSION ORIGINALE
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
@@ -432,7 +562,7 @@ class Game {
   getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec système de TOKEN
+// WebSocket avec système de TOKEN (identique)
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   let deviceId = "unknown";
@@ -482,7 +612,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Gestion messages avec TOKEN PRINCIPAL
+// Gestion messages avec TOKEN PRINCIPAL (adapté pour PostgreSQL)
 async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   
@@ -752,7 +882,12 @@ app.use(express.static('public'));
 
 // Route de santé pour Render
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'OK', database: 'PostgreSQL', timestamp: new Date().toISOString() });
+  res.status(200).json({ 
+    status: 'OK', 
+    database: 'PostgreSQL', 
+    region: 'Frankfurt EU',
+    timestamp: new Date().toISOString() 
+  });
 });
 
 // Initialisation au démarrage
@@ -765,6 +900,7 @@ async function startServer() {
       console.log(`🎮 Serveur PostgreSQL ACTIF sur le port ${PORT}`);
       console.log('🗄️ Base de données PostgreSQL initialisée');
       console.log('✅ Système de token principal activé');
+      console.log('✅ Fallback JSON préservé');
       console.log('✅ Données persistantes garanties');
     });
   } catch (error) {
