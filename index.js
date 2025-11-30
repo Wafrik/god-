@@ -8,9 +8,9 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 🗄️ CONFIGURATION POSTGRESQL POUR RENDER
+// Remplace la configuration PostgreSQL par :
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: process.env.DATABASE_URL || "postgresql://postgres_gode_user:vRTiWSdipdujN59gDWHFqPoIW5CgyppW@dpg-d4m1seshg0os73bi8h2g-a.frankfurt-postgres.render.com/postgres_gode",
   ssl: { rejectUnauthorized: false }
 });
 
@@ -756,4 +756,5 @@ async function startServer() {
 }
 
 startServer();
+
 
