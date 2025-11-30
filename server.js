@@ -1,28 +1,27 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
 const { Pool } = require('pg');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 🚀 CHEMINS EXISTANTS PRÉSERVÉS
-const USERS_FILE = path.join(__dirname, 'users.json');
-const TRUSTED_DEVICES_FILE = path.join(__dirname, 'trusted_devices.json');
-const PORT = process.env.PORT || 8000;
-
 // 🗄️ CONFIGURATION POSTGRESQL POUR RENDER
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: { rejectUnauthorized: false }
 });
 
-// Structures optimisées (identiques)
-const TRUSTED_DEVICES = new Map(), PLAYER_CONNECTIONS = new Map(), PLAYER_QUEUE = new Set();
-const ACTIVE_GAMES = new Map(), PLAYER_TO_GAME = new Map();
+const PORT = process.env.PORT || 8000;
+
+// Structures en mémoire
+const TRUSTED_DEVICES = new Map();
+const PLAYER_CONNECTIONS = new Map();
+const PLAYER_QUEUE = new Set();
+const ACTIVE_GAMES = new Map();
+const PLAYER_TO_GAME = new Map();
 
 // Test de la connexion PostgreSQL
 pool.on('connect', () => {
@@ -33,7 +32,7 @@ pool.on('error', (err) => {
   console.error('❌ Erreur PostgreSQL:', err);
 });
 
-// Utilitaires optimisés (identiques)
+// Utilitaires optimisés
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
 const generateDeviceKey = (ip, deviceId) => {
@@ -43,201 +42,90 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// 🗄️ FONCTIONS DATABASE AVEC FALLBACK (pour transition)
+// 🗄️ FONCTIONS DATABASE 100% POSTGRESQL
 const db = {
   // Utilisateurs
   async getUserByNumber(number) {
-    try {
-      const result = await pool.query('SELECT * FROM users WHERE number = $1', [number]);
-      return result.rows[0];
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL getUserByNumber, fallback JSON:', error);
-      // Fallback vers l'ancien système JSON
-      if (!fs.existsSync(USERS_FILE)) {
-        fs.writeFileSync(USERS_FILE, JSON.stringify([]));
-        return null;
-      }
-      const users = JSON.parse(fs.readFileSync(USERS_FILE));
-      return users.find(u => u.number === number);
-    }
+    const result = await pool.query('SELECT * FROM users WHERE number = $1', [number]);
+    return result.rows[0];
   },
 
   async getUserByUsername(username) {
-    try {
-      const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-      return result.rows[0];
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL getUserByUsername, fallback JSON:', error);
-      if (!fs.existsSync(USERS_FILE)) return null;
-      const users = JSON.parse(fs.readFileSync(USERS_FILE));
-      return users.find(u => u.username === username);
-    }
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    return result.rows[0];
   },
 
   async getUserByToken(token) {
-    try {
-      const result = await pool.query('SELECT * FROM users WHERE token = $1', [token]);
-      return result.rows[0];
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL getUserByToken, fallback JSON:', error);
-      if (!fs.existsSync(USERS_FILE)) return null;
-      const users = JSON.parse(fs.readFileSync(USERS_FILE));
-      return users.find(u => u.token === token);
-    }
+    const result = await pool.query('SELECT * FROM users WHERE token = $1', [token]);
+    return result.rows[0];
   },
 
   async createUser(userData) {
-    try {
-      const { username, password, number, age } = userData;
-      const token = generateId() + generateId();
-      const result = await pool.query(
-        `INSERT INTO users (username, password, number, age, score, online, token) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7) 
-         RETURNING *`,
-        [username, password, number, age, 0, true, token]
-      );
-      console.log('✅ Utilisateur créé dans PostgreSQL:', username);
-      return result.rows[0];
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL createUser, fallback JSON:', error);
-      // Fallback vers l'ancien système JSON
-      const users = !fs.existsSync(USERS_FILE) ? [] : JSON.parse(fs.readFileSync(USERS_FILE));
-      const newUser = { 
-        username, 
-        password, 
-        number, 
-        age: parseInt(age), 
-        score: 0, 
-        online: true,
-        token: generateId() + generateId()
-      };
-      users.push(newUser);
-      fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-      return newUser;
-    }
+    const { username, password, number, age } = userData;
+    const token = generateId() + generateId();
+    const result = await pool.query(
+      `INSERT INTO users (username, password, number, age, score, online, token) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7) 
+       RETURNING *`,
+      [username, password, number, age, 0, true, token]
+    );
+    console.log('✅ Utilisateur créé dans PostgreSQL:', username);
+    return result.rows[0];
   },
 
   async updateUserScore(number, newScore) {
-    try {
-      await pool.query(
-        'UPDATE users SET score = $1 WHERE number = $2',
-        [newScore, number]
-      );
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL updateUserScore, fallback JSON:', error);
-      // Fallback JSON
-      if (!fs.existsSync(USERS_FILE)) return;
-      const users = JSON.parse(fs.readFileSync(USERS_FILE));
-      const user = users.find(u => u.number === number);
-      if (user) {
-        user.score = newScore;
-        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-      }
-    }
+    await pool.query(
+      'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+      [newScore, number]
+    );
   },
 
   async setUserOnlineStatus(number, online) {
-    try {
-      await pool.query(
-        'UPDATE users SET online = $1 WHERE number = $2',
-        [online, number]
-      );
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL setUserOnlineStatus, fallback JSON:', error);
-      // Fallback JSON
-      if (!fs.existsSync(USERS_FILE)) return;
-      const users = JSON.parse(fs.readFileSync(USERS_FILE));
-      const user = users.find(u => u.number === number);
-      if (user) {
-        user.online = online;
-        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-      }
-    }
+    await pool.query(
+      'UPDATE users SET online = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+      [online, number]
+    );
   },
 
   async updateUserToken(number, token) {
-    try {
-      await pool.query(
-        'UPDATE users SET token = $1 WHERE number = $2',
-        [token, number]
-      );
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL updateUserToken, fallback JSON:', error);
-      // Fallback JSON
-      if (!fs.existsSync(USERS_FILE)) return;
-      const users = JSON.parse(fs.readFileSync(USERS_FILE));
-      const user = users.find(u => u.number === number);
-      if (user) {
-        user.token = token;
-        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-      }
-    }
+    await pool.query(
+      'UPDATE users SET token = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+      [token, number]
+    );
   },
 
   // Appareils de confiance
   async getTrustedDevice(deviceKey) {
-    try {
-      const result = await pool.query(
-        'SELECT * FROM trusted_devices WHERE device_key = $1',
-        [deviceKey]
-      );
-      return result.rows[0];
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL getTrustedDevice, fallback JSON:', error);
-      // Fallback JSON
-      if (!fs.existsSync(TRUSTED_DEVICES_FILE)) {
-        fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify({}));
-        return null;
-      }
-      const trustedDevices = JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
-      return trustedDevices[deviceKey] ? { device_key: deviceKey, user_number: trustedDevices[deviceKey] } : null;
-    }
+    const result = await pool.query(
+      'SELECT * FROM trusted_devices WHERE device_key = $1',
+      [deviceKey]
+    );
+    return result.rows[0];
   },
 
   async createTrustedDevice(deviceKey, userNumber) {
-    try {
-      await pool.query(
-        'INSERT INTO trusted_devices (device_key, user_number) VALUES ($1, $2) ON CONFLICT (device_key) DO UPDATE SET user_number = $2',
-        [deviceKey, userNumber]
-      );
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL createTrustedDevice, fallback JSON:', error);
-      // Fallback JSON
-      const trustedDevices = !fs.existsSync(TRUSTED_DEVICES_FILE) ? {} : JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
-      trustedDevices[deviceKey] = userNumber;
-      fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(trustedDevices, null, 2));
-    }
+    await pool.query(
+      'INSERT INTO trusted_devices (device_key, user_number) VALUES ($1, $2) ON CONFLICT (device_key) DO UPDATE SET user_number = $2',
+      [deviceKey, userNumber]
+    );
   },
 
   async deleteTrustedDevice(deviceKey) {
-    try {
-      await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL deleteTrustedDevice, fallback JSON:', error);
-      // Fallback JSON
-      if (!fs.existsSync(TRUSTED_DEVICES_FILE)) return;
-      const trustedDevices = JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
-      delete trustedDevices[deviceKey];
-      fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify(trustedDevices, null, 2));
-    }
+    await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
   },
 
   // Classement
   async getLeaderboard() {
-    try {
-      const result = await pool.query(
-        'SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC LIMIT 100'
-      );
-      return result.rows;
-    } catch (error) {
-      console.error('❌ Erreur PostgreSQL getLeaderboard, fallback JSON:', error);
-      // Fallback JSON
-      if (!fs.existsSync(USERS_FILE)) return [];
-      const users = JSON.parse(fs.readFileSync(USERS_FILE));
-      return users.filter(u => u.score >= 0)
-                 .sort((a, b) => b.score - a.score)
-                 .slice(0, 100);
-    }
+    const result = await pool.query(
+      'SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC LIMIT 100'
+    );
+    return result.rows;
+  },
+
+  // Migration des données existantes (optionnel)
+  async migrateFromJSON() {
+    console.log('🔄 Vérification des données existantes...');
+    // Cette fonction peut être utilisée plus tard si besoin
   }
 };
 
@@ -273,10 +161,11 @@ async function initializeDatabase() {
     console.log('🗄️ Tables PostgreSQL initialisées');
   } catch (error) {
     console.error('❌ Erreur initialisation base de données:', error);
+    throw error; // On arrête tout si PostgreSQL ne fonctionne pas
   }
 }
 
-// Chargement des appareils de confiance au démarrage (identique)
+// Chargement des appareils de confiance au démarrage
 async function loadTrustedDevices() {
   try {
     const result = await pool.query('SELECT * FROM trusted_devices');
@@ -285,21 +174,11 @@ async function loadTrustedDevices() {
     });
     console.log(`📱 ${result.rows.length} appareils de confiance chargés depuis PostgreSQL`);
   } catch (error) {
-    console.error('❌ Erreur chargement appareils PostgreSQL, fallback JSON:', error);
-    // Fallback JSON
-    if (!fs.existsSync(TRUSTED_DEVICES_FILE)) {
-      fs.writeFileSync(TRUSTED_DEVICES_FILE, JSON.stringify({}));
-      return;
-    }
-    const trustedDevices = JSON.parse(fs.readFileSync(TRUSTED_DEVICES_FILE));
-    Object.entries(trustedDevices).forEach(([key, value]) => {
-      TRUSTED_DEVICES.set(key, value);
-    });
-    console.log(`📱 ${Object.keys(trustedDevices).length} appareils de confiance chargés depuis JSON`);
+    console.error('❌ Erreur chargement appareils:', error);
   }
 }
 
-// ⚡ CLASSE GAME IDENTIQUE À VOTRE VERSION ORIGINALE
+// ⚡ CLASSE GAME (identique mais 100% PostgreSQL)
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
@@ -390,13 +269,11 @@ class Game {
     const slot = parseInt(slotIndex);
     if (!this.availableSlots[player.role].includes(slot)) return false;
 
-    // Mise à jour combinaison
     if (combination) {
       const parts = combination.split('-');
       if (parts.length === 6) this.playerCombinations[player.role] = parts.map(Number);
     }
 
-    // Initialisation combinaisons si manquantes
     const oppRole = player.role === 'player1' ? 'player2' : 'player1';
     if (!this.playerCombinations.player1) this.playerCombinations.player1 = [1,2,3,4,5,6];
     if (!this.playerCombinations.player2) this.playerCombinations.player2 = [1,2,3,4,5,6];
@@ -409,7 +286,6 @@ class Game {
     this.scores[player.role] += realValue;
     this.selectionsThisManche++;
 
-    // Notification aux joueurs
     this.players.forEach(p => {
       if (p.ws?.readyState === WebSocket.OPEN) {
         const isCurrentPlayer = p.role === player.role;
@@ -562,21 +438,19 @@ class Game {
   getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec système de TOKEN (identique)
+// WebSocket avec système de TOKEN
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   let deviceId = "unknown";
   
   console.log(`🌐 Nouvelle connexion depuis: ${ip}`);
   
-  // Envoyer un message de bienvenue
   ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
   
   ws.on('message', async (data) => {
     try { 
       const message = JSON.parse(data);
       
-      // Récupérer le deviceId du message
       if (message.deviceId) {
         deviceId = message.deviceId;
       }
@@ -596,10 +470,8 @@ wss.on('connection', (ws, req) => {
         PLAYER_CONNECTIONS.delete(disconnectedNumber);
         PLAYER_QUEUE.delete(disconnectedNumber);
         
-        // Marquer comme hors ligne
         await db.setUserOnlineStatus(disconnectedNumber, false);
         
-        // Gérer la déconnexion du jeu
         const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
         const game = ACTIVE_GAMES.get(gameId);
         const player = game?.getPlayerByNumber(disconnectedNumber);
@@ -612,28 +484,22 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Gestion messages avec TOKEN PRINCIPAL (adapté pour PostgreSQL)
+// Gestion messages avec TOKEN PRINCIPAL
 async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   
   console.log(`🔑 Message ${message.type} - Device: ${deviceId}`);
-  if (message.token) {
-    console.log(`🔑 Token fourni: ${message.token.substring(0, 10)}...`);
-  }
   
   const handlers = {
     authenticate: async () => {
       const user = await db.getUserByNumber(message.number);
       if (user && user.password === message.password) {
-        // GÉNÉRER OU METTRE À JOUR LE TOKEN
         if (!user.token) {
           const newToken = generateId() + generateId();
           await db.updateUserToken(user.number, newToken);
           user.token = newToken;
-          console.log(`🔑 Nouveau token généré pour ${user.username}`);
         }
         
-        // Sauvegarder l'association device → user
         TRUSTED_DEVICES.set(deviceKey, message.number);
         await db.createTrustedDevice(deviceKey, message.number);
         
@@ -648,7 +514,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           token: user.token
         }));
         
-        console.log(`✅ Connexion: ${user.username} (Token activé)`);
+        console.log(`✅ Connexion PostgreSQL: ${user.username}`);
       } else {
         ws.send(JSON.stringify({ type: 'auth_failed', message: 'Numéro ou mot de passe incorrect' }));
       }
@@ -665,47 +531,37 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       } else if (await db.getUserByNumber(number)) {
         ws.send(JSON.stringify({ type: 'register_failed', message: "Numéro déjà utilisé" }));
       } else {
-        try {
-          const newUser = await db.createUser({ username, password, number, age: parseInt(age) });
-          
-          // Sauvegarder l'association device → user
-          TRUSTED_DEVICES.set(deviceKey, number);
-          await db.createTrustedDevice(deviceKey, number);
-          
-          PLAYER_CONNECTIONS.set(number, ws);
-          
-          ws.send(JSON.stringify({ 
-            type: 'register_success', 
-            message: "Inscription réussie", 
-            username, 
-            score: 0, 
-            number,
-            token: newUser.token
-          }));
-          
-          console.log(`✅ Inscription: ${username} (Token créé)`);
-        } catch (error) {
-          console.error('❌ Erreur inscription:', error);
-          ws.send(JSON.stringify({ type: 'register_failed', message: "Erreur lors de l'inscription" }));
-        }
+        const newUser = await db.createUser({ username, password, number, age: parseInt(age) });
+        
+        TRUSTED_DEVICES.set(deviceKey, number);
+        await db.createTrustedDevice(deviceKey, number);
+        
+        PLAYER_CONNECTIONS.set(number, ws);
+        
+        ws.send(JSON.stringify({ 
+          type: 'register_success', 
+          message: "Inscription réussie", 
+          username, 
+          score: 0, 
+          number,
+          token: newUser.token
+        }));
+        
+        console.log(`✅ Inscription PostgreSQL: ${username}`);
       }
     },
 
     logout: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (playerNumber) {
-        // Supprimer l'appareil des devices trusted
         TRUSTED_DEVICES.delete(deviceKey);
         await db.deleteTrustedDevice(deviceKey);
         
-        // Supprimer la connexion
         PLAYER_CONNECTIONS.delete(playerNumber);
         PLAYER_QUEUE.delete(playerNumber);
         
-        // Marquer comme hors ligne dans la base
         await db.setUserOnlineStatus(playerNumber, false);
         
-        // Gérer la déconnexion du jeu si en cours
         const gameId = PLAYER_TO_GAME.get(playerNumber);
         const game = ACTIVE_GAMES.get(gameId);
         const player = game?.getPlayerByNumber(playerNumber);
@@ -714,7 +570,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         console.log(`🚪 Déconnexion manuelle: ${playerNumber}`);
         
-        // Envoyer confirmation
         ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie' }));
       } else {
         ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
@@ -722,7 +577,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     },
     
     auto_login: async () => {
-      // PRIORITÉ ABSOLUE AU TOKEN
       if (message.token) {
         const user = await db.getUserByToken(message.token);
         
@@ -730,7 +584,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           PLAYER_CONNECTIONS.set(user.number, ws);
           await db.setUserOnlineStatus(user.number, true);
           
-          // Sauvegarder aussi l'association device (pour compatibilité)
           if (deviceId && deviceId !== "unknown") {
             TRUSTED_DEVICES.set(deviceKey, user.number);
             await db.createTrustedDevice(deviceKey, user.number);
@@ -744,7 +597,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             token: user.token
           }));
           
-          // Reconnexion lobby si en jeu
           const gameId = PLAYER_TO_GAME.get(user.number);
           const game = ACTIVE_GAMES.get(gameId);
           const player = game?.getPlayerByNumber(user.number);
@@ -753,16 +605,14 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             game.broadcastGameState(); 
           }
           
-          console.log(`🔄 Auto-login PAR TOKEN: ${user.username}`);
+          console.log(`🔄 Auto-login PostgreSQL: ${user.username}`);
           return;
         } else {
-          console.log(`❌ Token invalide: ${message.token.substring(0, 10)}...`);
           ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Token invalide' }));
           return;
         }
       }
       
-      // FALLBACK: ancien système par device (pour compatibilité)
       const trustedNumber = TRUSTED_DEVICES.get(deviceKey);
       if (trustedNumber) {
         const user = await db.getUserByNumber(trustedNumber);
@@ -770,12 +620,10 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           PLAYER_CONNECTIONS.set(trustedNumber, ws);
           await db.setUserOnlineStatus(trustedNumber, true);
           
-          // S'assurer que l'utilisateur a un token
           if (!user.token) {
             const newToken = generateId() + generateId();
             await db.updateUserToken(user.number, newToken);
             user.token = newToken;
-            console.log(`🔑 Token généré pour ${user.username} (fallback device)`);
           }
           
           ws.send(JSON.stringify({ 
@@ -786,12 +634,11 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             token: user.token
           }));
           
-          console.log(`🔄 Auto-login par device: ${user.username}`);
+          console.log(`🔄 Auto-login par device PostgreSQL: ${user.username}`);
         } else {
           ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Utilisateur non trouvé' }));
         }
       } else {
-        console.log(`❌ Auto-login échoué - Pas de token ni device reconnu`);
         ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Appareil non reconnu' }));
       }
     },
@@ -893,18 +740,17 @@ app.get('/health', (req, res) => {
 // Initialisation au démarrage
 async function startServer() {
   try {
+    console.log('🚀 Démarrage serveur 100% PostgreSQL...');
     await initializeDatabase();
     await loadTrustedDevices();
     
     server.listen(PORT, '0.0.0.0', () => {
-      console.log(`🎮 Serveur PostgreSQL ACTIF sur le port ${PORT}`);
-      console.log('🗄️ Base de données PostgreSQL initialisée');
-      console.log('✅ Système de token principal activé');
-      console.log('✅ Fallback JSON préservé');
-      console.log('✅ Données persistantes garanties');
+      console.log(`🎮 Serveur 100% PostgreSQL ACTIF sur le port ${PORT}`);
+      console.log('🗄️ Toutes les données stockées en PostgreSQL');
+      console.log('✅ Aucun fallback JSON - Données persistantes garanties');
     });
   } catch (error) {
-    console.error('❌ Erreur démarrage serveur:', error);
+    console.error('❌ Erreur démarrage serveur PostgreSQL:', error);
     process.exit(1);
   }
 }
