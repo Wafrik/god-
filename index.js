@@ -22,9 +22,13 @@ if (!process.env.DATABASE_URL) {
 
 const PORT = process.env.PORT || 8000;
 
+// Clé admin (à mettre dans les variables d'environnement sur Render)
+const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
+
 // Structures en mémoire
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
+const ADMIN_CONNECTIONS = new Map(); // Nouvelles connexions admin
 const PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
@@ -133,7 +137,7 @@ const db = {
     const result = await pool.query(`
       SELECT username, number, age, score, created_at, online 
       FROM users 
-      WHERE score > 0 
+      WHERE score >= 0 
       ORDER BY score DESC
     `);
     return result.rows;
@@ -459,6 +463,8 @@ class Game {
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   let deviceId = "unknown";
+  let isAdminConnection = false;
+  let adminId = null;
   
   console.log(`🌐 Nouvelle connexion depuis: ${ip}`);
   
@@ -472,36 +478,156 @@ wss.on('connection', (ws, req) => {
         deviceId = message.deviceId;
       }
       
-      await handleClientMessage(ws, message, ip, deviceId); 
+      // Vérifier si c'est une connexion admin
+      if (message.type === 'admin_authenticate') {
+        isAdminConnection = true;
+        adminId = 'admin_' + generateId();
+        ADMIN_CONNECTIONS.set(adminId, ws);
+      }
+      
+      if (isAdminConnection) {
+        await handleAdminMessage(ws, message, adminId);
+      } else {
+        await handleClientMessage(ws, message, ip, deviceId);
+      }
+      
     } catch(e) {
       console.error("❌ Erreur parsing message:", e);
     }
   });
 
   ws.on('close', async () => {
-    setTimeout(async () => {
-      const deviceKey = generateDeviceKey(ip, deviceId);
-      const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
-      
-      if (disconnectedNumber) {
-        PLAYER_CONNECTIONS.delete(disconnectedNumber);
-        PLAYER_QUEUE.delete(disconnectedNumber);
+    if (isAdminConnection && adminId) {
+      ADMIN_CONNECTIONS.delete(adminId);
+      console.log(`🔴 Déconnexion admin: ${adminId}`);
+    } else {
+      setTimeout(async () => {
+        const deviceKey = generateDeviceKey(ip, deviceId);
+        const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
         
-        await db.setUserOnlineStatus(disconnectedNumber, false);
-        
-        const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
-        const game = ACTIVE_GAMES.get(gameId);
-        const player = game?.getPlayerByNumber(disconnectedNumber);
-        if (player) await game.handlePlayerDisconnect(player);
-        PLAYER_TO_GAME.delete(disconnectedNumber);
-        
-        console.log(`🔴 Déconnexion: ${disconnectedNumber} (${deviceKey})`);
-      }
-    }, 10000);
+        if (disconnectedNumber) {
+          PLAYER_CONNECTIONS.delete(disconnectedNumber);
+          PLAYER_QUEUE.delete(disconnectedNumber);
+          
+          await db.setUserOnlineStatus(disconnectedNumber, false);
+          
+          const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
+          const game = ACTIVE_GAMES.get(gameId);
+          const player = game?.getPlayerByNumber(disconnectedNumber);
+          if (player) await game.handlePlayerDisconnect(player);
+          PLAYER_TO_GAME.delete(disconnectedNumber);
+          
+          console.log(`🔴 Déconnexion: ${disconnectedNumber} (${deviceKey})`);
+        }
+      }, 10000);
+    }
   });
 });
 
-// Gestion messages avec TOKEN PRINCIPAL
+// Gestion messages ADMIN
+async function handleAdminMessage(ws, message, adminId) {
+  console.log(`🔐 Message admin ${message.type} - Admin: ${adminId}`);
+  
+  const handlers = {
+    admin_authenticate: async () => {
+      if (message.admin_key === ADMIN_KEY) {
+        // Authentification admin réussie
+        ws.send(JSON.stringify({ 
+          type: 'admin_auth_success', 
+          message: 'Authentification admin réussie' 
+        }));
+        
+        console.log("🔐 Connexion admin réussie");
+      } else {
+        ws.send(JSON.stringify({ 
+          type: 'admin_auth_failed', 
+          message: 'Clé admin invalide' 
+        }));
+        console.log("❌ Tentative de connexion admin échouée");
+      }
+    },
+
+    admin_export_data: async () => {
+      try {
+        // Vérifier la clé admin
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const players = await db.getAllPlayers();
+        const data = players.map((player, index) => ({
+          rank: index + 1,
+          username: player.username,
+          number: player.number,
+          age: player.age,
+          score: player.score,
+          created_at: player.created_at,
+          online: player.online
+        }));
+        
+        ws.send(JSON.stringify({
+          type: 'admin_export_data',
+          success: true,
+          data: data,
+          count: data.length
+        }));
+        
+        console.log(`📊 Export admin: ${data.length} joueurs exportés`);
+      } catch (error) {
+        console.error('❌ Erreur export admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_export_data', 
+          success: false, 
+          message: 'Erreur lors de l\'export' 
+        }));
+      }
+    },
+
+    admin_reset_scores: async () => {
+      try {
+        // Vérifier la clé admin
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const resetCount = await db.resetAllScores();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_reset_scores',
+          success: true,
+          message: `Scores réinitialisés`,
+          players_reset: resetCount
+        }));
+        
+        console.log(`🔄 Reset admin: ${resetCount} scores réinitialisés`);
+      } catch (error) {
+        console.error('❌ Erreur reset admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_reset_scores', 
+          success: false, 
+          message: 'Erreur lors du reset' 
+        }));
+      }
+    }
+  };
+  
+  if (handlers[message.type]) {
+    await handlers[message.type]();
+  } else {
+    ws.send(JSON.stringify({ 
+      type: 'error', 
+      message: 'Commande admin inconnue' 
+    }));
+  }
+}
+
+// Gestion messages avec TOKEN PRINCIPAL (pour les joueurs)
 async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   
@@ -695,73 +821,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     
     player_move: () => handleGameAction(ws, message, deviceKey),
     dice_swap: () => handleGameAction(ws, message, deviceKey),
-    emoji_used: () => handleGameAction(ws, message, deviceKey),
-
-    // NOUVEAU: Fonctions admin
-    admin_export_data: async () => {
-      try {
-        const playerNumber = TRUSTED_DEVICES.get(deviceKey);
-        if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
-        
-        // Vérifier si c'est un admin (tu peux ajouter une vérification spécifique ici)
-        // Pour l'instant, on permet à tous les utilisateurs authentifiés pour le test
-        
-        const players = await db.getAllPlayers();
-        const data = players.map((player, index) => ({
-          rank: index + 1,
-          username: player.username,
-          number: player.number,
-          age: player.age,
-          score: player.score,
-          created_at: player.created_at,
-          online: player.online
-        }));
-        
-        ws.send(JSON.stringify({
-          type: 'admin_export_data',
-          success: true,
-          data: data,
-          count: data.length
-        }));
-        
-        console.log(`📊 Export admin: ${data.length} joueurs exportés`);
-      } catch (error) {
-        console.error('❌ Erreur export admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_export_data', 
-          success: false, 
-          message: 'Erreur lors de l\'export' 
-        }));
-      }
-    },
-
-    admin_reset_scores: async () => {
-      try {
-        const playerNumber = TRUSTED_DEVICES.get(deviceKey);
-        if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
-        
-        // Vérifier si c'est un admin (tu peux ajouter une vérification spécifique ici)
-        // Pour l'instant, on permet à tous les utilisateurs authentifiés pour le test
-        
-        const resetCount = await db.resetAllScores();
-        
-        ws.send(JSON.stringify({
-          type: 'admin_reset_scores',
-          success: true,
-          message: `Scores réinitialisés`,
-          players_reset: resetCount
-        }));
-        
-        console.log(`🔄 Reset admin: ${resetCount} scores réinitialisés`);
-      } catch (error) {
-        console.error('❌ Erreur reset admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_reset_scores', 
-          success: false, 
-          message: 'Erreur lors du reset' 
-        }));
-      }
-    }
+    emoji_used: () => handleGameAction(ws, message, deviceKey)
   };
   
   if (handlers[message.type]) {
@@ -828,7 +888,8 @@ async function startServer() {
       console.log(`🎮 Serveur 100% PostgreSQL ACTIF sur le port ${PORT}`);
       console.log('🗄️ Toutes les données stockées en PostgreSQL');
       console.log('✅ Aucun fallback JSON - Données persistantes garanties');
-      console.log('🔧 Fonctions admin disponibles via WebSocket: admin_export_data et admin_reset_scores');
+      console.log('🔐 Système admin activé');
+      console.log('🔧 Routes admin disponibles via WebSocket');
     });
   } catch (error) {
     console.error('❌ Erreur démarrage serveur PostgreSQL:', error);
