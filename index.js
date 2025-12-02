@@ -128,10 +128,21 @@ const db = {
     return result.rows;
   },
 
-  // Migration des données existantes (optionnel)
-  async migrateFromJSON() {
-    console.log('🔄 Vérification des données existantes...');
-    // Cette fonction peut être utilisée plus tard si besoin
+  // NOUVEAU: Récupérer tous les joueurs pour l'export Excel
+  async getAllPlayers() {
+    const result = await pool.query(`
+      SELECT username, number, age, score, created_at, online 
+      FROM users 
+      WHERE score > 0 
+      ORDER BY score DESC
+    `);
+    return result.rows;
+  },
+
+  // NOUVEAU: Reset tous les scores
+  async resetAllScores() {
+    const result = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
+    return result.rowCount;
   }
 };
 
@@ -730,8 +741,65 @@ function handleGameAction(ws, message, deviceKey) {
   actions[message.type]?.();
 }
 
-// Démarrage
-app.use(express.static('public'));
+// 🔧 NOUVEAU: ROUTES ADMIN POUR L'EXPORT ET RESET
+
+// Route pour exporter les données en CSV
+app.get('/admin/export', async (req, res) => {
+  try {
+    // Clé d'admin dans les variables d'environnement
+    const adminKey = req.query.key || req.headers['x-admin-key'];
+    
+    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+      return res.status(403).json({ error: 'Accès non autorisé' });
+    }
+
+    const players = await db.getAllPlayers();
+    const weekEnd = new Date().toISOString().split('T')[0];
+    
+    // Générer le contenu CSV
+    let csv = 'Classement,Pseudo,Numéro,Âge,Score,Date inscription,En ligne,Semaine terminée\n';
+    
+    players.forEach((player, index) => {
+      csv += `${index + 1},${player.username},${player.number},${player.age},${player.score},${player.created_at},${player.online ? 'Oui' : 'Non'},${weekEnd}\n`;
+    });
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=classement-semaine-${weekEnd}.csv`);
+    res.send(csv);
+
+    console.log(`📊 Rapport hebdomadaire exporté: ${players.length} joueurs`);
+
+  } catch (error) {
+    console.error('❌ Erreur export:', error);
+    res.status(500).json({ error: 'Erreur lors de l\'export' });
+  }
+});
+
+// Route pour reset tous les scores
+app.post('/admin/reset-scores', async (req, res) => {
+  try {
+    // Clé d'admin dans les variables d'environnement
+    const adminKey = req.query.key || req.headers['x-admin-key'];
+    
+    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+      return res.status(403).json({ error: 'Accès non autorisé' });
+    }
+
+    const resetCount = await db.resetAllScores();
+    
+    res.json({ 
+      message: `Scores reset avec succès`, 
+      players_reset: resetCount,
+      timestamp: new Date().toISOString()
+    });
+
+    console.log(`🔄 Scores reset: ${resetCount} joueurs affectés`);
+
+  } catch (error) {
+    console.error('❌ Erreur reset scores:', error);
+    res.status(500).json({ error: 'Erreur lors du reset' });
+  }
+});
 
 // Route de santé pour Render
 app.get('/health', (req, res) => {
@@ -754,6 +822,7 @@ async function startServer() {
       console.log(`🎮 Serveur 100% PostgreSQL ACTIF sur le port ${PORT}`);
       console.log('🗄️ Toutes les données stockées en PostgreSQL');
       console.log('✅ Aucun fallback JSON - Données persistantes garanties');
+      console.log('🔧 Routes admin disponibles: /admin/export et /admin/reset-scores');
     });
   } catch (error) {
     console.error('❌ Erreur démarrage serveur PostgreSQL:', error);
@@ -762,6 +831,3 @@ async function startServer() {
 }
 
 startServer();
-
-
-
