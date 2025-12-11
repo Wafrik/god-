@@ -33,6 +33,9 @@ const PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 
+// 🎯 NOUVEAU: Suivi des pubs par joueur par jour
+const DAILY_ADS_TRACKER = new Map(); // Format: { "joueurId_date": count }
+
 // Test de la connexion PostgreSQL
 pool.on('connect', () => {
   console.log('✅ Connecté à PostgreSQL');
@@ -50,6 +53,12 @@ const generateDeviceKey = (ip, deviceId) => {
     return `web_${deviceId}`;
   }
   return `${ip}_${deviceId}`;
+};
+
+// Fonction pour obtenir la date du jour (YYYY-MM-DD)
+const getTodayDate = () => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 };
 
 // 🗄️ FONCTIONS DATABASE 100% POSTGRESQL
@@ -90,6 +99,13 @@ const db = {
     );
   },
 
+  async incrementUserScore(number, pointsToAdd) {
+    await pool.query(
+      'UPDATE users SET score = score + $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+      [pointsToAdd, number]
+    );
+  },
+
   async setUserOnlineStatus(number, online) {
     await pool.query(
       'UPDATE users SET online = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
@@ -124,6 +140,31 @@ const db = {
     await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
   },
 
+  // 🎯 NOUVEAU: Suivi des pubs par joueur
+  async getPlayerAdsToday(playerNumber) {
+    const today = getTodayDate();
+    const result = await pool.query(
+      'SELECT ads_count FROM player_ads WHERE player_number = $1 AND date = $2',
+      [playerNumber, today]
+    );
+    return result.rows[0] || { ads_count: 0 };
+  },
+
+  async incrementPlayerAds(playerNumber) {
+    const today = getTodayDate();
+    // Incrémente ou insère
+    await pool.query(`
+      INSERT INTO player_ads (player_number, date, ads_count) 
+      VALUES ($1, $2, 1)
+      ON CONFLICT (player_number, date) 
+      DO UPDATE SET ads_count = player_ads.ads_count + 1
+    `, [playerNumber, today]);
+  },
+
+  async resetPlayerAds(playerNumber) {
+    await pool.query('DELETE FROM player_ads WHERE player_number = $1', [playerNumber]);
+  },
+
   // Classement
   async getLeaderboard() {
     const result = await pool.query(
@@ -146,6 +187,12 @@ const db = {
   // Reset tous les scores
   async resetAllScores() {
     const result = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
+    return result.rowCount;
+  },
+
+  // Reset tous les compteurs de pubs
+  async resetAllAdsCounters() {
+    const result = await pool.query('DELETE FROM player_ads');
     return result.rowCount;
   }
 };
@@ -176,6 +223,18 @@ async function initializeDatabase() {
         device_key VARCHAR(200) UNIQUE NOT NULL,
         user_number VARCHAR(20) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 🎯 NOUVELLE TABLE: Suivi des pubs par joueur par jour
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS player_ads (
+        id SERIAL PRIMARY KEY,
+        player_number VARCHAR(20) NOT NULL,
+        date DATE NOT NULL,
+        ads_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(player_number, date)
       )
     `);
 
@@ -614,6 +673,36 @@ async function handleAdminMessage(ws, message, adminId) {
           message: 'Erreur lors du reset' 
         }));
       }
+    },
+
+    admin_reset_ads: async () => {
+      try {
+        // Vérifier la clé admin
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const resetCount = await db.resetAllAdsCounters();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_reset_ads',
+          success: true,
+          message: `Compteurs de pubs réinitialisés`,
+          ads_reset: resetCount
+        }));
+        
+        console.log(`🔄 Reset admin: ${resetCount} compteurs de pubs réinitialisés`);
+      } catch (error) {
+        console.error('❌ Erreur reset pubs admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_reset_ads', 
+          success: false, 
+          message: 'Erreur lors du reset des pubs' 
+        }));
+      }
     }
   };
   
@@ -795,6 +884,80 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }));
       ws.send(JSON.stringify({ type: 'leaderboard', leaderboard: formattedLeaderboard }));
     },
+
+    // 🎯 NOUVEAU: Vérifier le nombre de pubs disponibles aujourd'hui
+    check_ads_availability: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) {
+        return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      }
+
+      try {
+        const adsData = await db.getPlayerAdsToday(playerNumber);
+        const adsToday = adsData.ads_count || 0;
+        const maxAdsPerDay = 10;
+        const remainingAds = Math.max(0, maxAdsPerDay - adsToday);
+        
+        ws.send(JSON.stringify({
+          type: 'ads_availability',
+          ads_today: adsToday,
+          max_per_day: maxAdsPerDay,
+          remaining: remainingAds,
+          can_watch_ad: remainingAds > 0
+        }));
+      } catch (error) {
+        console.error('❌ Erreur vérification pubs:', error);
+        ws.send(JSON.stringify({ type: 'error', message: 'Erreur vérification pubs' }));
+      }
+    },
+
+    // 🎯 NOUVEAU: Récompenser après avoir regardé une pub
+    reward_ad_watched: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) {
+        return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      }
+
+      try {
+        // Vérifier combien de pubs déjà vues aujourd'hui
+        const adsData = await db.getPlayerAdsToday(playerNumber);
+        const adsToday = adsData.ads_count || 0;
+        const maxAdsPerDay = 10;
+
+        if (adsToday >= maxAdsPerDay) {
+          return ws.send(JSON.stringify({
+            type: 'ad_reward_failed',
+            message: 'Limite quotidienne atteinte (10 pubs/jour)',
+            ads_today: adsToday,
+            max_per_day: maxAdsPerDay
+          }));
+        }
+
+        // Incrémenter le compteur de pubs
+        await db.incrementPlayerAds(playerNumber);
+        
+        // Ajouter 10 points au score
+        await db.incrementUserScore(playerNumber, 10);
+        
+        // Récupérer le nouveau score
+        const user = await db.getUserByNumber(playerNumber);
+        
+        ws.send(JSON.stringify({
+          type: 'ad_reward_success',
+          message: '+10 points ajoutés !',
+          points_added: 10,
+          new_score: user.score,
+          ads_today: adsToday + 1,
+          max_per_day: maxAdsPerDay,
+          remaining: maxAdsPerDay - (adsToday + 1)
+        }));
+
+        console.log(`🎬 Pub regardée par ${playerNumber}: +10 points (total pubs aujourd'hui: ${adsToday + 1})`);
+      } catch (error) {
+        console.error('❌ Erreur récompense pub:', error);
+        ws.send(JSON.stringify({ type: 'error', message: 'Erreur ajout points' }));
+      }
+    },
     
     join_queue: () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
@@ -889,6 +1052,7 @@ async function startServer() {
       console.log('🗄️ Toutes les données stockées en PostgreSQL');
       console.log('✅ Aucun fallback JSON - Données persistantes garanties');
       console.log('🔐 Système admin activé');
+      console.log('🎬 Système de pubs activé (+10 points, max 10/jour)');
       console.log('🔧 Routes admin disponibles via WebSocket');
     });
   } catch (error) {
