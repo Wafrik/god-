@@ -489,25 +489,40 @@ class Game {
     setTimeout(() => this.cleanup(), 5000);
   }
 
-  async _updatePlayerScores(winner) {
-    try {
-      for (const player of this.players) {
-        const user = await db.getUserByNumber(player.number);
-        if (user) {
-          if (winner === 'draw') continue;
-          
-          const totalScore = this.scores[player.role];
-          const newScore = winner === player.role ? 
-            user.score + totalScore : 
-            Math.max(0, user.score - totalScore);
-          
-          await db.updateUserScore(player.number, newScore);
+  // ⚡ CLASSE GAME - Méthode mise à jour des scores avec bonus de 200 points
+async _updatePlayerScores(winner) {
+  try {
+    for (const player of this.players) {
+      const user = await db.getUserByNumber(player.number);
+      if (user) {
+        // En cas de match nul, aucun changement de score
+        if (winner === 'draw') {
+          continue; // On passe au joueur suivant sans modifier le score
         }
+
+        // Récupère le score marqué par ce joueur pendant la partie
+        const totalScore = this.scores[player.role];
+        
+        // Calcul du nouveau score
+        let newScore = user.score; // Commence par le score actuel
+        
+        if (winner === player.role) {
+          // 🎉 JOUEUR GAGNANT : Score de la partie + Bonus de 200 points
+          newScore = user.score + totalScore + 200;
+          console.log(`🏆 Bonus appliqué! ${player.number} gagne ${totalScore} + 200 = ${totalScore + 200} points`);
+        } else {
+          // ❌ JOUEUR PERDANT : Pénalité (score de la partie uniquement)
+          newScore = Math.max(0, user.score - totalScore);
+        }
+        
+        // Mise à jour dans la base de données
+        await db.updateUserScore(player.number, newScore);
       }
-    } catch (error) {
-      console.error('❌ Erreur mise à jour scores:', error);
     }
+  } catch (error) {
+    console.error('❌ Erreur mise à jour scores:', error);
   }
+}
 
   cleanup() {
     if (this.timerInterval) clearInterval(this.timerInterval);
@@ -1062,3 +1077,4 @@ async function startServer() {
 }
 
 startServer();
+
