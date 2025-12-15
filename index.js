@@ -33,31 +33,53 @@ const PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 
-// 🤖 BOTS SIMPLES (10 masculins, 10 féminins)
+// 🤖 BOTS SIMPLES (20 originaux + 20 nouveaux)
 const BOTS = [
-  // Bots Masculins
-  { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 120, avatar: "👨‍💼" },
-  { id: "bot_m_002", username: "Thomas", gender: "M", baseScore: 95, avatar: "👨‍🎓" },
-  { id: "bot_m_003", username: "Alexandre", gender: "M", baseScore: 150, avatar: "👨‍🔧" },
-  { id: "bot_m_004", username: "Mathis", gender: "M", baseScore: 80, avatar: "👨‍🍳" },
-  { id: "bot_m_005", username: "Nathan", gender: "M", baseScore: 110, avatar: "👨‍🚀" },
-  { id: "bot_m_006", username: "Enzo", gender: "M", baseScore: 130, avatar: "👨‍🎨" },
-  { id: "bot_m_007", username: "Louis", gender: "M", baseScore: 100, avatar: "👨‍⚕️" },
-  { id: "bot_m_008", username: "Gabriel", gender: "M", baseScore: 140, avatar: "👨‍✈️" },
-  { id: "bot_m_009", username: "Hugo", gender: "M", baseScore: 90, avatar: "👨‍🌾" },
-  { id: "bot_m_010", username: "Raphaël", gender: "M", baseScore: 125, avatar: "👨‍🔬" },
+  // Bots Masculins originaux
+  { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 120 },
+  { id: "bot_m_002", username: "Thomas", gender: "M", baseScore: 95 },
+  { id: "bot_m_003", username: "Alexandre", gender: "M", baseScore: 150 },
+  { id: "bot_m_004", username: "Mathis", gender: "M", baseScore: 80 },
+  { id: "bot_m_005", username: "Nathan", gender: "M", baseScore: 110 },
+  { id: "bot_m_006", username: "Enzo", gender: "M", baseScore: 130 },
+  { id: "bot_m_007", username: "Louis", gender: "M", baseScore: 100 },
+  { id: "bot_m_008", username: "Gabriel", gender: "M", baseScore: 140 },
+  { id: "bot_m_009", username: "Hugo", gender: "M", baseScore: 90 },
+  { id: "bot_m_010", username: "Raphaël", gender: "M", baseScore: 125 },
   
-  // Bots Féminins
-  { id: "bot_f_001", username: "Emma", gender: "F", baseScore: 115, avatar: "👩‍💼" },
-  { id: "bot_f_002", username: "Léa", gender: "F", baseScore: 85, avatar: "👩‍🎓" },
-  { id: "bot_f_003", username: "Manon", gender: "F", baseScore: 145, avatar: "👩‍🔧" },
-  { id: "bot_f_004", username: "Chloé", gender: "F", baseScore: 105, avatar: "👩‍🍳" },
-  { id: "bot_f_005", username: "Camille", gender: "F", baseScore: 135, avatar: "👩‍🚀" },
-  { id: "bot_f_006", username: "Sarah", gender: "F", baseScore: 95, avatar: "👩‍🎨" },
-  { id: "bot_f_007", username: "Julie", gender: "F", baseScore: 120, avatar: "👩‍⚕️" },
-  { id: "bot_f_008", username: "Clara", gender: "F", baseScore: 160, avatar: "👩‍✈️" },
-  { id: "bot_f_009", username: "Inès", gender: "F", baseScore: 75, avatar: "👩‍🌾" },
-  { id: "bot_f_010", username: "Zoé", gender: "F", baseScore: 110, avatar: "👩‍🔬" }
+  // Bots Féminins originaux
+  { id: "bot_f_001", username: "Emma", gender: "F", baseScore: 115 },
+  { id: "bot_f_002", username: "Léa", gender: "F", baseScore: 85 },
+  { id: "bot_f_003", username: "Manon", gender: "F", baseScore: 145 },
+  { id: "bot_f_004", username: "Chloé", gender: "F", baseScore: 105 },
+  { id: "bot_f_005", username: "Camille", gender: "F", baseScore: 135 },
+  { id: "bot_f_006", username: "Sarah", gender: "F", baseScore: 95 },
+  { id: "bot_f_007", username: "Julie", gender: "F", baseScore: 120 },
+  { id: "bot_f_008", username: "Clara", gender: "F", baseScore: 160 },
+  { id: "bot_f_009", username: "Inès", gender: "F", baseScore: 75 },
+  { id: "bot_f_010", username: "Zoé", gender: "F", baseScore: 110 },
+  
+  // NOUVEAUX BOTS (sans indicateur robot)
+  { id: "bot_001", username: "Zaboule", gender: "M", baseScore: 125 },
+  { id: "bot_002", username: "Ddk", gender: "M", baseScore: 110 },
+  { id: "bot_003", username: "Zokou la panthère", gender: "M", baseScore: 145 },
+  { id: "bot_004", username: "Atom", gender: "M", baseScore: 130 },
+  { id: "bot_005", username: "Yven125", gender: "M", baseScore: 95 },
+  { id: "bot_006", username: "Pataff4", gender: "M", baseScore: 115 },
+  { id: "bot_007", username: "Afrocc", gender: "M", baseScore: 140 },
+  { id: "bot_008", username: "Le babato deluxe", gender: "M", baseScore: 120 },
+  { id: "bot_009", username: "Miello", gender: "M", baseScore: 105 },
+  { id: "bot_010", username: "2418coto", gender: "M", baseScore: 135 },
+  { id: "bot_011", username: "Yako2001", gender: "M", baseScore: 100 },
+  { id: "bot_012", username: "Ziparotus", gender: "M", baseScore: 150 },
+  { id: "bot_013", username: "Agapli", gender: "F", baseScore: 110 },
+  { id: "bot_014", username: "Mireille68", gender: "F", baseScore: 90 },
+  { id: "bot_015", username: "Pela8", gender: "F", baseScore: 125 },
+  { id: "bot_016", username: "Sylivie", gender: "F", baseScore: 105 },
+  { id: "bot_017", username: "Soeur cartie", gender: "F", baseScore: 140 },
+  { id: "bot_018", username: "Zezeta23", gender: "F", baseScore: 115 },
+  { id: "bot_019", username: "Timo", gender: "M", baseScore: 130 },
+  { id: "bot_020", username: "Lina", gender: "F", baseScore: 120 }
 ];
 
 // Scores actuels des bots (chargés depuis PostgreSQL)
@@ -85,11 +107,19 @@ function getRandomBot() {
   };
 }
 
-// 🤖 Mettre à jour le score d'un bot
-async function updateBotScore(botId, newScore) {
+// 🤖 Mettre à jour le score d'un bot (avec +200 quand il gagne)
+async function updateBotScore(botId, newScore, isWin = false) {
   try {
+    let finalScore = newScore;
+    
+    // Ajouter +200 points si le bot gagne
+    if (isWin) {
+      finalScore = newScore + 200;
+      console.log(`🏆 Bot ${botId} gagne! Bonus +200 points`);
+    }
+    
     // Mettre à jour en mémoire
-    BOT_SCORES.set(botId, newScore);
+    BOT_SCORES.set(botId, finalScore);
     
     // Mettre à jour dans PostgreSQL
     await pool.query(`
@@ -99,9 +129,9 @@ async function updateBotScore(botId, newScore) {
       DO UPDATE SET 
         score = $2, 
         last_played = CURRENT_TIMESTAMP
-    `, [botId, newScore]);
+    `, [botId, finalScore]);
     
-    console.log(` Score mis à jour pour ${botId}: ${newScore}`);
+    console.log(`🤖 Score mis à jour pour ${botId}: ${finalScore} ${isWin ? '(avec bonus victoire)' : ''}`);
     return true;
   } catch (error) {
     console.error('❌ Erreur mise à jour score bot:', error);
@@ -116,9 +146,9 @@ async function loadBotScores() {
     result.rows.forEach(row => {
       BOT_SCORES.set(row.bot_id, row.score);
     });
-    console.log(` ${result.rows.length} scores de bots chargés`);
+    console.log(`🤖 ${result.rows.length} scores de bots chargés`);
   } catch (error) {
-    console.log('📝 Table bot_scores pas encore créée');
+    console.log('📝 Chargement des scores bots...');
   }
 }
 
@@ -182,7 +212,7 @@ const db = {
   },
 
   // Mettre à jour le score après match bot
-  async updateUserScoreAfterBotMatch(playerNumber, pointsChange, isWin) {
+  async updateUserScoreAfterBotMatch(playerNumber, pointsChange, isWin, botScore) {
     try {
       if (isWin) {
         // Victoire contre bot: points gagnés + bonus
@@ -190,12 +220,14 @@ const db = {
           'UPDATE users SET score = score + $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
           [pointsChange + 200, playerNumber]
         );
+        console.log(`🏆 Joueur ${playerNumber} gagne contre bot! +${pointsChange + 200} points`);
       } else {
         // Défaite contre bot: points perdus
         await pool.query(
           'UPDATE users SET score = GREATEST(0, score - $1), updated_at = CURRENT_TIMESTAMP WHERE number = $2',
           [pointsChange, playerNumber]
         );
+        console.log(`😢 Joueur ${playerNumber} perd contre bot! -${pointsChange} points`);
       }
       return true;
     } catch (error) {
@@ -233,7 +265,7 @@ const db = {
     
     // Récupérer les bots avec leurs scores
     const botsResult = await pool.query(
-      'SELECT bs.bot_id, bs.score, b.username, b.avatar FROM bot_scores bs LEFT JOIN bot_profiles b ON bs.bot_id = b.id ORDER BY bs.score DESC LIMIT 20'
+      'SELECT bs.bot_id, bs.score, b.username FROM bot_scores bs LEFT JOIN bot_profiles b ON bs.bot_id = b.id ORDER BY bs.score DESC LIMIT 20'
     ).catch(() => ({ rows: [] }));
     
     const leaderboard = [];
@@ -248,14 +280,13 @@ const db = {
       });
     });
     
-    // Ajouter les bots
+    // Ajouter les bots (sans indicateur robot)
     botsResult.rows.forEach((bot) => {
       leaderboard.push({
         rank: leaderboard.length + 1,
-        username: bot.username ? ` ${bot.username}` : ` Bot ${bot.bot_id}`,
+        username: bot.username || `Bot_${bot.bot_id}`,
         score: bot.score,
-        is_bot: true,
-        avatar: bot.avatar || ''
+        is_bot: false // Marqué comme non-bot pour le classement
       });
     });
     
@@ -322,7 +353,6 @@ async function initializeDatabase() {
         id VARCHAR(50) PRIMARY KEY,
         username VARCHAR(50) NOT NULL,
         gender VARCHAR(1) NOT NULL,
-        avatar VARCHAR(20),
         base_score INTEGER DEFAULT 100,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
@@ -339,32 +369,22 @@ async function initializeDatabase() {
       )
     `);
 
-    // Insérer les bots dans la table des profils
+    // Insérer tous les bots dans la table des profils
     for (const bot of BOTS) {
       await pool.query(`
-        INSERT INTO bot_profiles (id, username, gender, avatar, base_score) 
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (id) DO NOTHING
-      `, [bot.id, bot.username, bot.gender, bot.avatar, bot.baseScore]);
+        INSERT INTO bot_profiles (id, username, gender, base_score) 
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (id) DO UPDATE SET
+          username = EXCLUDED.username,
+          gender = EXCLUDED.gender,
+          base_score = EXCLUDED.base_score
+      `, [bot.id, bot.username, bot.gender, bot.baseScore]);
     }
 
-    console.log('🗄️ Tables PostgreSQL initialisées avec 20 bots');
+    console.log(`🗄️ Tables PostgreSQL initialisées avec ${BOTS.length} bots`);
   } catch (error) {
     console.error('❌ Erreur initialisation base de données:', error);
     throw error;
-  }
-}
-
-// Charger les scores des bots
-async function loadBotScores() {
-  try {
-    const result = await pool.query('SELECT bot_id, score FROM bot_scores');
-    result.rows.forEach(row => {
-      BOT_SCORES.set(row.bot_id, row.score);
-    });
-    console.log(`🤖 ${result.rows.length} scores de bots chargés`);
-  } catch (error) {
-    console.log('📝 Chargement des scores bots...');
   }
 }
 
@@ -1078,22 +1098,35 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       });
     }
     
+    // Déterminer si le bot a gagné
+    const isBotWin = !isPlayerWin;
+    
     // Mettre à jour le score du joueur
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(
       playerNumber, 
       pointsChange, 
-      isPlayerWin
+      isPlayerWin,
+      botScore
     );
     
-    // Mettre à jour le score du bot
-    const botUpdateSuccess = await updateBotScore(botId, botScore);
+    // Mettre à jour le score du bot (avec +200 s'il gagne)
+    const botUpdateSuccess = await updateBotScore(botId, botScore, isBotWin);
     
     if (playerUpdateSuccess && botUpdateSuccess) {
+      const newPlayerScore = isPlayerWin ? 
+        (playerScore + pointsChange + 200) : 
+        Math.max(0, playerScore - pointsChange);
+      
+      const newBotScore = isBotWin ? 
+        (botScore + 200) : 
+        botScore;
+      
       res.json({
         success: true,
         message: "Scores mis à jour avec succès",
-        playerScore: playerScore + (isPlayerWin ? pointsChange + 200 : -pointsChange),
-        botScore: botScore
+        playerScore: newPlayerScore,
+        botScore: newBotScore,
+        bonusApplied: isBotWin ? "Bot +200 points" : (isPlayerWin ? "Joueur +200 points" : "Pas de bonus")
       });
     } else {
       res.status(500).json({
@@ -1116,7 +1149,8 @@ app.get('/leaderboard-with-bots', async (req, res) => {
     const leaderboard = await db.getLeaderboard();
     res.json({
       success: true,
-      leaderboard: leaderboard
+      leaderboard: leaderboard,
+      count: leaderboard.length
     });
   } catch (error) {
     console.error('❌ Erreur /leaderboard-with-bots:', error);
@@ -1133,6 +1167,7 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     database: 'PostgreSQL', 
     bots_count: BOTS.length,
+    total_bots: BOTS.length,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1147,7 +1182,7 @@ async function startServer() {
     
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🎮 Serveur ACTIF sur le port ${PORT}`);
-      console.log(`🤖 ${BOTS.length} bots disponibles (${BOTS.filter(b => b.gender === 'M').length} M, ${BOTS.filter(b => b.gender === 'F').length} F)`);
+      console.log(`🤖 ${BOTS.length} bots disponibles`);
       console.log('🔧 Routes bots disponibles:');
       console.log('  GET  /get-bot - Obtenir un bot aléatoire');
       console.log('  POST /update-bot-match - Mettre à jour les scores');
@@ -1160,4 +1195,3 @@ async function startServer() {
 }
 
 startServer();
-
