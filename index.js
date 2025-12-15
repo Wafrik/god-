@@ -17,35 +17,53 @@ const pool = new Pool({
 // Vérification que la variable existe
 if (!process.env.DATABASE_URL) {
   console.error('❌ DATABASE_URL non définie !');
-  process.exit(1); // Arrête le serveur si la variable manque
+  process.exit(1);
 }
 
 const PORT = process.env.PORT || 8000;
 
-// Clé admin (à mettre dans les variables d'environnement sur Render)
+// Clé admin
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 
 // Structures en mémoire
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
-const ADMIN_CONNECTIONS = new Map(); // Nouvelles connexions admin
+const ADMIN_CONNECTIONS = new Map();
 const PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 
-// 🎯 NOUVEAU: Suivi des pubs par joueur par jour
-const DAILY_ADS_TRACKER = new Map(); // Format: { "joueurId_date": count }
+// 🤖 BOTS SIMPLES (10 masculins, 10 féminins)
+const BOTS = [
+  // Bots Masculins
+  { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 120, avatar: "👨‍💼" },
+  { id: "bot_m_002", username: "Thomas", gender: "M", baseScore: 95, avatar: "👨‍🎓" },
+  { id: "bot_m_003", username: "Alexandre", gender: "M", baseScore: 150, avatar: "👨‍🔧" },
+  { id: "bot_m_004", username: "Mathis", gender: "M", baseScore: 80, avatar: "👨‍🍳" },
+  { id: "bot_m_005", username: "Nathan", gender: "M", baseScore: 110, avatar: "👨‍🚀" },
+  { id: "bot_m_006", username: "Enzo", gender: "M", baseScore: 130, avatar: "👨‍🎨" },
+  { id: "bot_m_007", username: "Louis", gender: "M", baseScore: 100, avatar: "👨‍⚕️" },
+  { id: "bot_m_008", username: "Gabriel", gender: "M", baseScore: 140, avatar: "👨‍✈️" },
+  { id: "bot_m_009", username: "Hugo", gender: "M", baseScore: 90, avatar: "👨‍🌾" },
+  { id: "bot_m_010", username: "Raphaël", gender: "M", baseScore: 125, avatar: "👨‍🔬" },
+  
+  // Bots Féminins
+  { id: "bot_f_001", username: "Emma", gender: "F", baseScore: 115, avatar: "👩‍💼" },
+  { id: "bot_f_002", username: "Léa", gender: "F", baseScore: 85, avatar: "👩‍🎓" },
+  { id: "bot_f_003", username: "Manon", gender: "F", baseScore: 145, avatar: "👩‍🔧" },
+  { id: "bot_f_004", username: "Chloé", gender: "F", baseScore: 105, avatar: "👩‍🍳" },
+  { id: "bot_f_005", username: "Camille", gender: "F", baseScore: 135, avatar: "👩‍🚀" },
+  { id: "bot_f_006", username: "Sarah", gender: "F", baseScore: 95, avatar: "👩‍🎨" },
+  { id: "bot_f_007", username: "Julie", gender: "F", baseScore: 120, avatar: "👩‍⚕️" },
+  { id: "bot_f_008", username: "Clara", gender: "F", baseScore: 160, avatar: "👩‍✈️" },
+  { id: "bot_f_009", username: "Inès", gender: "F", baseScore: 75, avatar: "👩‍🌾" },
+  { id: "bot_f_010", username: "Zoé", gender: "F", baseScore: 110, avatar: "👩‍🔬" }
+];
 
-// Test de la connexion PostgreSQL
-pool.on('connect', () => {
-  console.log('✅ Connecté à PostgreSQL');
-});
+// Scores actuels des bots (chargés depuis PostgreSQL)
+const BOT_SCORES = new Map();
 
-pool.on('error', (err) => {
-  console.error('❌ Erreur PostgreSQL:', err);
-});
-
-// Utilitaires optimisés
+// Utilitaires
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
 const generateDeviceKey = (ip, deviceId) => {
@@ -55,13 +73,56 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// Fonction pour obtenir la date du jour (YYYY-MM-DD)
-const getTodayDate = () => {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-};
+// 🤖 Obtenir un bot aléatoire
+function getRandomBot() {
+  const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
+  const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
+  
+  return {
+    ...randomBot,
+    score: botScore,
+    is_bot: true
+  };
+}
 
-// 🗄️ FONCTIONS DATABASE 100% POSTGRESQL
+// 🤖 Mettre à jour le score d'un bot
+async function updateBotScore(botId, newScore) {
+  try {
+    // Mettre à jour en mémoire
+    BOT_SCORES.set(botId, newScore);
+    
+    // Mettre à jour dans PostgreSQL
+    await pool.query(`
+      INSERT INTO bot_scores (bot_id, score, last_played) 
+      VALUES ($1, $2, CURRENT_TIMESTAMP)
+      ON CONFLICT (bot_id) 
+      DO UPDATE SET 
+        score = $2, 
+        last_played = CURRENT_TIMESTAMP
+    `, [botId, newScore]);
+    
+    console.log(`🤖 Score mis à jour pour ${botId}: ${newScore}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Erreur mise à jour score bot:', error);
+    return false;
+  }
+}
+
+// 🤖 Charger les scores des bots
+async function loadBotScores() {
+  try {
+    const result = await pool.query('SELECT bot_id, score FROM bot_scores');
+    result.rows.forEach(row => {
+      BOT_SCORES.set(row.bot_id, row.score);
+    });
+    console.log(`🤖 ${result.rows.length} scores de bots chargés`);
+  } catch (error) {
+    console.log('📝 Table bot_scores pas encore créée');
+  }
+}
+
+// 🗄️ FONCTIONS DATABASE
 const db = {
   // Utilisateurs
   async getUserByNumber(number) {
@@ -88,7 +149,7 @@ const db = {
        RETURNING *`,
       [username, password, number, age, 0, true, token]
     );
-    console.log('✅ Utilisateur créé dans PostgreSQL:', username);
+    console.log('✅ Utilisateur créé:', username);
     return result.rows[0];
   },
 
@@ -120,6 +181,29 @@ const db = {
     );
   },
 
+  // Mettre à jour le score après match bot
+  async updateUserScoreAfterBotMatch(playerNumber, pointsChange, isWin) {
+    try {
+      if (isWin) {
+        // Victoire contre bot: points gagnés + bonus
+        await pool.query(
+          'UPDATE users SET score = score + $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+          [pointsChange + 200, playerNumber]
+        );
+      } else {
+        // Défaite contre bot: points perdus
+        await pool.query(
+          'UPDATE users SET score = GREATEST(0, score - $1), updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+          [pointsChange, playerNumber]
+        );
+      }
+      return true;
+    } catch (error) {
+      console.error('❌ Erreur mise à jour score après match bot:', error);
+      return false;
+    }
+  },
+
   // Appareils de confiance
   async getTrustedDevice(deviceKey) {
     const result = await pool.query(
@@ -140,40 +224,52 @@ const db = {
     await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
   },
 
-  // 🎯 NOUVEAU: Suivi des pubs par joueur
-  async getPlayerAdsToday(playerNumber) {
-    const today = getTodayDate();
-    const result = await pool.query(
-      'SELECT ads_count FROM player_ads WHERE player_number = $1 AND date = $2',
-      [playerNumber, today]
-    );
-    return result.rows[0] || { ads_count: 0 };
-  },
-
-  async incrementPlayerAds(playerNumber) {
-    const today = getTodayDate();
-    // Incrémente ou insère
-    await pool.query(`
-      INSERT INTO player_ads (player_number, date, ads_count) 
-      VALUES ($1, $2, 1)
-      ON CONFLICT (player_number, date) 
-      DO UPDATE SET ads_count = player_ads.ads_count + 1
-    `, [playerNumber, today]);
-  },
-
-  async resetPlayerAds(playerNumber) {
-    await pool.query('DELETE FROM player_ads WHERE player_number = $1', [playerNumber]);
-  },
-
-  // Classement
+  // Classement - INCLURE LES BOTS
   async getLeaderboard() {
-    const result = await pool.query(
-      'SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC LIMIT 100'
+    // Récupérer les vrais joueurs
+    const playersResult = await pool.query(
+      'SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC LIMIT 80'
     );
-    return result.rows;
+    
+    // Récupérer les bots avec leurs scores
+    const botsResult = await pool.query(
+      'SELECT bs.bot_id, bs.score, b.username, b.avatar FROM bot_scores bs LEFT JOIN bot_profiles b ON bs.bot_id = b.id ORDER BY bs.score DESC LIMIT 20'
+    ).catch(() => ({ rows: [] }));
+    
+    const leaderboard = [];
+    
+    // Ajouter les vrais joueurs
+    playersResult.rows.forEach((user, index) => {
+      leaderboard.push({
+        rank: index + 1,
+        username: user.username,
+        score: user.score,
+        is_bot: false
+      });
+    });
+    
+    // Ajouter les bots
+    botsResult.rows.forEach((bot) => {
+      leaderboard.push({
+        rank: leaderboard.length + 1,
+        username: bot.username ? `🤖 ${bot.username}` : `🤖 Bot ${bot.bot_id}`,
+        score: bot.score,
+        is_bot: true,
+        avatar: bot.avatar || '🤖'
+      });
+    });
+    
+    // Trier par score et limiter à 100
+    return leaderboard
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 100)
+      .map((item, index) => ({
+        ...item,
+        rank: index + 1
+      }));
   },
 
-  // Récupérer tous les joueurs pour l'export (ordonnés par score)
+  // Récupérer tous les joueurs
   async getAllPlayers() {
     const result = await pool.query(`
       SELECT username, number, age, score, created_at, online 
@@ -187,12 +283,6 @@ const db = {
   // Reset tous les scores
   async resetAllScores() {
     const result = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
-    return result.rowCount;
-  },
-
-  // Reset tous les compteurs de pubs
-  async resetAllAdsCounters() {
-    const result = await pool.query('DELETE FROM player_ads');
     return result.rowCount;
   }
 };
@@ -226,39 +316,72 @@ async function initializeDatabase() {
       )
     `);
 
-    // 🎯 NOUVELLE TABLE: Suivi des pubs par joueur par jour
+    // Table des profils de bots
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS player_ads (
-        id SERIAL PRIMARY KEY,
-        player_number VARCHAR(20) NOT NULL,
-        date DATE NOT NULL,
-        ads_count INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(player_number, date)
+      CREATE TABLE IF NOT EXISTS bot_profiles (
+        id VARCHAR(50) PRIMARY KEY,
+        username VARCHAR(50) NOT NULL,
+        gender VARCHAR(1) NOT NULL,
+        avatar VARCHAR(20),
+        base_score INTEGER DEFAULT 100,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    console.log('🗄️ Tables PostgreSQL initialisées');
+    // Table des scores des bots
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_scores (
+        id SERIAL PRIMARY KEY,
+        bot_id VARCHAR(50) UNIQUE NOT NULL,
+        score INTEGER DEFAULT 0,
+        last_played TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (bot_id) REFERENCES bot_profiles(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Insérer les bots dans la table des profils
+    for (const bot of BOTS) {
+      await pool.query(`
+        INSERT INTO bot_profiles (id, username, gender, avatar, base_score) 
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (id) DO NOTHING
+      `, [bot.id, bot.username, bot.gender, bot.avatar, bot.baseScore]);
+    }
+
+    console.log('🗄️ Tables PostgreSQL initialisées avec 20 bots');
   } catch (error) {
     console.error('❌ Erreur initialisation base de données:', error);
-    throw error; // On arrête tout si PostgreSQL ne fonctionne pas
+    throw error;
   }
 }
 
-// Chargement des appareils de confiance au démarrage
+// Charger les scores des bots
+async function loadBotScores() {
+  try {
+    const result = await pool.query('SELECT bot_id, score FROM bot_scores');
+    result.rows.forEach(row => {
+      BOT_SCORES.set(row.bot_id, row.score);
+    });
+    console.log(`🤖 ${result.rows.length} scores de bots chargés`);
+  } catch (error) {
+    console.log('📝 Chargement des scores bots...');
+  }
+}
+
+// Charger les appareils de confiance
 async function loadTrustedDevices() {
   try {
     const result = await pool.query('SELECT * FROM trusted_devices');
     result.rows.forEach(row => {
       TRUSTED_DEVICES.set(row.device_key, row.user_number);
     });
-    console.log(`📱 ${result.rows.length} appareils de confiance chargés depuis PostgreSQL`);
+    console.log(`📱 ${result.rows.length} appareils de confiance chargés`);
   } catch (error) {
     console.error('❌ Erreur chargement appareils:', error);
   }
 }
 
-// ⚡ CLASSE GAME (identique mais 100% PostgreSQL)
+// ⚡ CLASSE GAME (pour matchs réels)
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
@@ -489,40 +612,32 @@ class Game {
     setTimeout(() => this.cleanup(), 5000);
   }
 
-  // ⚡ CLASSE GAME - Méthode mise à jour des scores avec bonus de 200 points
-async _updatePlayerScores(winner) {
-  try {
-    for (const player of this.players) {
-      const user = await db.getUserByNumber(player.number);
-      if (user) {
-        // En cas de match nul, aucun changement de score
-        if (winner === 'draw') {
-          continue; // On passe au joueur suivant sans modifier le score
-        }
+  async _updatePlayerScores(winner) {
+    try {
+      for (const player of this.players) {
+        const user = await db.getUserByNumber(player.number);
+        if (user) {
+          if (winner === 'draw') {
+            continue;
+          }
 
-        // Récupère le score marqué par ce joueur pendant la partie
-        const totalScore = this.scores[player.role];
-        
-        // Calcul du nouveau score
-        let newScore = user.score; // Commence par le score actuel
-        
-        if (winner === player.role) {
-          // 🎉 JOUEUR GAGNANT : Score de la partie + Bonus de 200 points
-          newScore = user.score + totalScore + 200;
-          console.log(`🏆 Bonus appliqué! ${player.number} gagne ${totalScore} + 200 = ${totalScore + 200} points`);
-        } else {
-          // ❌ JOUEUR PERDANT : Pénalité (score de la partie uniquement)
-          newScore = Math.max(0, user.score - totalScore);
+          const totalScore = this.scores[player.role];
+          let newScore = user.score;
+          
+          if (winner === player.role) {
+            newScore = user.score + totalScore + 200;
+            console.log(`🏆 Bonus appliqué! ${player.number} gagne ${totalScore} + 200 = ${totalScore + 200} points`);
+          } else {
+            newScore = Math.max(0, user.score - totalScore);
+          }
+          
+          await db.updateUserScore(player.number, newScore);
         }
-        
-        // Mise à jour dans la base de données
-        await db.updateUserScore(player.number, newScore);
       }
+    } catch (error) {
+      console.error('❌ Erreur mise à jour scores:', error);
     }
-  } catch (error) {
-    console.error('❌ Erreur mise à jour scores:', error);
   }
-}
 
   cleanup() {
     if (this.timerInterval) clearInterval(this.timerInterval);
@@ -552,7 +667,6 @@ wss.on('connection', (ws, req) => {
         deviceId = message.deviceId;
       }
       
-      // Vérifier si c'est une connexion admin
       if (message.type === 'admin_authenticate') {
         isAdminConnection = true;
         adminId = 'admin_' + generateId();
@@ -605,12 +719,10 @@ async function handleAdminMessage(ws, message, adminId) {
   const handlers = {
     admin_authenticate: async () => {
       if (message.admin_key === ADMIN_KEY) {
-        // Authentification admin réussie
         ws.send(JSON.stringify({ 
           type: 'admin_auth_success', 
           message: 'Authentification admin réussie' 
         }));
-        
         console.log("🔐 Connexion admin réussie");
       } else {
         ws.send(JSON.stringify({ 
@@ -623,7 +735,6 @@ async function handleAdminMessage(ws, message, adminId) {
 
     admin_export_data: async () => {
       try {
-        // Vérifier la clé admin
         if (message.admin_key !== ADMIN_KEY) {
           return ws.send(JSON.stringify({ 
             type: 'error', 
@@ -662,7 +773,6 @@ async function handleAdminMessage(ws, message, adminId) {
 
     admin_reset_scores: async () => {
       try {
-        // Vérifier la clé admin
         if (message.admin_key !== ADMIN_KEY) {
           return ws.send(JSON.stringify({ 
             type: 'error', 
@@ -686,36 +796,6 @@ async function handleAdminMessage(ws, message, adminId) {
           type: 'admin_reset_scores', 
           success: false, 
           message: 'Erreur lors du reset' 
-        }));
-      }
-    },
-
-    admin_reset_ads: async () => {
-      try {
-        // Vérifier la clé admin
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
-
-        const resetCount = await db.resetAllAdsCounters();
-        
-        ws.send(JSON.stringify({
-          type: 'admin_reset_ads',
-          success: true,
-          message: `Compteurs de pubs réinitialisés`,
-          ads_reset: resetCount
-        }));
-        
-        console.log(`🔄 Reset admin: ${resetCount} compteurs de pubs réinitialisés`);
-      } catch (error) {
-        console.error('❌ Erreur reset pubs admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_reset_ads', 
-          success: false, 
-          message: 'Erreur lors du reset des pubs' 
         }));
       }
     }
@@ -761,7 +841,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           token: user.token
         }));
         
-        console.log(`✅ Connexion PostgreSQL: ${user.username}`);
+        console.log(`✅ Connexion: ${user.username}`);
       } else {
         ws.send(JSON.stringify({ type: 'auth_failed', message: 'Numéro ou mot de passe incorrect' }));
       }
@@ -794,7 +874,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           token: newUser.token
         }));
         
-        console.log(`✅ Inscription PostgreSQL: ${username}`);
+        console.log(`✅ Inscription: ${username}`);
       }
     },
 
@@ -852,7 +932,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             game.broadcastGameState(); 
           }
           
-          console.log(`🔄 Auto-login PostgreSQL: ${user.username}`);
+          console.log(`🔄 Auto-login: ${user.username}`);
           return;
         } else {
           ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Token invalide' }));
@@ -881,7 +961,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             token: user.token
           }));
           
-          console.log(`🔄 Auto-login par device PostgreSQL: ${user.username}`);
+          console.log(`🔄 Auto-login par device: ${user.username}`);
         } else {
           ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Utilisateur non trouvé' }));
         }
@@ -892,86 +972,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     
     get_leaderboard: async () => {
       const leaderboard = await db.getLeaderboard();
-      const formattedLeaderboard = leaderboard.map((user, index) => ({
-        rank: index + 1,
-        username: user.username,
-        score: user.score
-      }));
-      ws.send(JSON.stringify({ type: 'leaderboard', leaderboard: formattedLeaderboard }));
-    },
-
-    // 🎯 NOUVEAU: Vérifier le nombre de pubs disponibles aujourd'hui
-    check_ads_availability: async () => {
-      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
-      if (!playerNumber) {
-        return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
-      }
-
-      try {
-        const adsData = await db.getPlayerAdsToday(playerNumber);
-        const adsToday = adsData.ads_count || 0;
-        const maxAdsPerDay = 10;
-        const remainingAds = Math.max(0, maxAdsPerDay - adsToday);
-        
-        ws.send(JSON.stringify({
-          type: 'ads_availability',
-          ads_today: adsToday,
-          max_per_day: maxAdsPerDay,
-          remaining: remainingAds,
-          can_watch_ad: remainingAds > 0
-        }));
-      } catch (error) {
-        console.error('❌ Erreur vérification pubs:', error);
-        ws.send(JSON.stringify({ type: 'error', message: 'Erreur vérification pubs' }));
-      }
-    },
-
-    // 🎯 NOUVEAU: Récompenser après avoir regardé une pub
-    reward_ad_watched: async () => {
-      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
-      if (!playerNumber) {
-        return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
-      }
-
-      try {
-        // Vérifier combien de pubs déjà vues aujourd'hui
-        const adsData = await db.getPlayerAdsToday(playerNumber);
-        const adsToday = adsData.ads_count || 0;
-        const maxAdsPerDay = 10;
-
-        if (adsToday >= maxAdsPerDay) {
-          return ws.send(JSON.stringify({
-            type: 'ad_reward_failed',
-            message: 'Limite quotidienne atteinte (10 pubs/jour)',
-            ads_today: adsToday,
-            max_per_day: maxAdsPerDay
-          }));
-        }
-
-        // Incrémenter le compteur de pubs
-        await db.incrementPlayerAds(playerNumber);
-        
-        // Ajouter 10 points au score
-        await db.incrementUserScore(playerNumber, 10);
-        
-        // Récupérer le nouveau score
-        const user = await db.getUserByNumber(playerNumber);
-        
-        ws.send(JSON.stringify({
-          type: 'ad_reward_success',
-          message: '+10 points ajoutés !',
-          points_added: 10,
-          new_score: user.score,
-          ads_today: adsToday + 1,
-          max_per_day: maxAdsPerDay,
-          remaining: maxAdsPerDay - (adsToday + 1)
-        }));
-
-        console.log(`🎬 Pub regardée par ${playerNumber}: +10 points (total pubs aujourd'hui: ${adsToday + 1})`);
-      } catch (error) {
-        console.error('❌ Erreur récompense pub:', error);
-        ws.send(JSON.stringify({ type: 'error', message: 'Erreur ajout points' }));
-      }
+      ws.send(JSON.stringify({ type: 'leaderboard', leaderboard: leaderboard }));
     },
     
     join_queue: () => {
@@ -1045,12 +1046,93 @@ function handleGameAction(ws, message, deviceKey) {
   actions[message.type]?.();
 }
 
+// 🎯 NOUVELLES ROUTES HTTP POUR LES BOTS
+
+// 1. Route pour obtenir un bot aléatoire
+app.get('/get-bot', (req, res) => {
+  try {
+    const bot = getRandomBot();
+    res.json({
+      success: true,
+      bot: bot,
+      message: "Bot sélectionné avec succès"
+    });
+  } catch (error) {
+    console.error('❌ Erreur /get-bot:', error);
+    res.status(500).json({
+      success: false,
+      message: "Erreur serveur"
+    });
+  }
+});
+
+// 2. Route pour mettre à jour les scores après un match bot
+app.post('/update-bot-match', express.json(), async (req, res) => {
+  try {
+    const { playerNumber, botId, playerScore, botScore, isPlayerWin, pointsChange } = req.body;
+    
+    if (!playerNumber || !botId) {
+      return res.status(400).json({
+        success: false,
+        message: "Données manquantes"
+      });
+    }
+    
+    // Mettre à jour le score du joueur
+    const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(
+      playerNumber, 
+      pointsChange, 
+      isPlayerWin
+    );
+    
+    // Mettre à jour le score du bot
+    const botUpdateSuccess = await updateBotScore(botId, botScore);
+    
+    if (playerUpdateSuccess && botUpdateSuccess) {
+      res.json({
+        success: true,
+        message: "Scores mis à jour avec succès",
+        playerScore: playerScore + (isPlayerWin ? pointsChange + 200 : -pointsChange),
+        botScore: botScore
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        message: "Erreur lors de la mise à jour des scores"
+      });
+    }
+  } catch (error) {
+    console.error('❌ Erreur /update-bot-match:', error);
+    res.status(500).json({
+      success: false,
+      message: "Erreur serveur"
+    });
+  }
+});
+
+// 3. Route pour obtenir le classement avec bots
+app.get('/leaderboard-with-bots', async (req, res) => {
+  try {
+    const leaderboard = await db.getLeaderboard();
+    res.json({
+      success: true,
+      leaderboard: leaderboard
+    });
+  } catch (error) {
+    console.error('❌ Erreur /leaderboard-with-bots:', error);
+    res.status(500).json({
+      success: false,
+      message: "Erreur serveur"
+    });
+  }
+});
+
 // Route de santé pour Render
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
     database: 'PostgreSQL', 
-    region: 'Frankfurt EU',
+    bots_count: BOTS.length,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1058,23 +1140,23 @@ app.get('/health', (req, res) => {
 // Initialisation au démarrage
 async function startServer() {
   try {
-    console.log('🚀 Démarrage serveur 100% PostgreSQL...');
+    console.log('🚀 Démarrage serveur avec bots...');
     await initializeDatabase();
     await loadTrustedDevices();
+    await loadBotScores();
     
     server.listen(PORT, '0.0.0.0', () => {
-      console.log(`🎮 Serveur 100% PostgreSQL ACTIF sur le port ${PORT}`);
-      console.log('🗄️ Toutes les données stockées en PostgreSQL');
-      console.log('✅ Aucun fallback JSON - Données persistantes garanties');
-      console.log('🔐 Système admin activé');
-      console.log('🎬 Système de pubs activé (+10 points, max 10/jour)');
-      console.log('🔧 Routes admin disponibles via WebSocket');
+      console.log(`🎮 Serveur ACTIF sur le port ${PORT}`);
+      console.log(`🤖 ${BOTS.length} bots disponibles (${BOTS.filter(b => b.gender === 'M').length} M, ${BOTS.filter(b => b.gender === 'F').length} F)`);
+      console.log('🔧 Routes bots disponibles:');
+      console.log('  GET  /get-bot - Obtenir un bot aléatoire');
+      console.log('  POST /update-bot-match - Mettre à jour les scores');
+      console.log('  GET  /leaderboard-with-bots - Classement avec bots');
     });
   } catch (error) {
-    console.error('❌ Erreur démarrage serveur PostgreSQL:', error);
+    console.error('❌ Erreur démarrage serveur:', error);
     process.exit(1);
   }
 }
 
 startServer();
-
