@@ -107,15 +107,19 @@ function getRandomBot() {
   };
 }
 
-// 🤖 Mettre à jour le score d'un bot (avec +200 quand il gagne)
-async function updateBotScore(botId, newScore, isWin = false) {
+// 🤖 Mettre à jour le score d'un bot (avec +200 quand il gagne, -scorePartie quand il perd)
+async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
   try {
-    let finalScore = newScore;
+    let finalScore = currentBotScore;
     
-    // Ajouter +200 points si le bot gagne
     if (isWin) {
-      finalScore = newScore + 200;
-      console.log(`🏆 Bot ${botId} gagne! Bonus +200 points`);
+      // Bot gagne: score global + (scorePartie + 200)
+      finalScore = currentBotScore + gameScore + 200;
+      console.log(`🏆 Bot ${botId} gagne! +${gameScore} (score partie) + 200 = ${gameScore + 200} points`);
+    } else {
+      // Bot perd: score global - scorePartie (minimum 0)
+      finalScore = Math.max(0, currentBotScore - gameScore);
+      console.log(`😢 Bot ${botId} perd! -${gameScore} points (score de la partie)`);
     }
     
     // Mettre à jour en mémoire
@@ -131,7 +135,7 @@ async function updateBotScore(botId, newScore, isWin = false) {
         last_played = CURRENT_TIMESTAMP
     `, [botId, finalScore]);
     
-    console.log(`🤖 Score mis à jour pour ${botId}: ${finalScore} ${isWin ? '(avec bonus victoire)' : ''}`);
+    console.log(`🤖 Score mis à jour pour ${botId}: ${finalScore} ${isWin ? '(avec bonus victoire)' : '(avec pénalité défaite)'}`);
     return true;
   } catch (error) {
     console.error('❌ Erreur mise à jour score bot:', error);
@@ -212,22 +216,23 @@ const db = {
   },
 
   // Mettre à jour le score après match bot
-  async updateUserScoreAfterBotMatch(playerNumber, pointsChange, isWin, botScore) {
+  async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, botGameScore) {
     try {
       if (isWin) {
-        // Victoire contre bot: points gagnés + bonus
+        // Victoire contre bot: score global + (scorePartie + 200)
+        const pointsToAdd = playerGameScore + 200;
         await pool.query(
           'UPDATE users SET score = score + $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-          [pointsChange + 200, playerNumber]
+          [pointsToAdd, playerNumber]
         );
-        console.log(`🏆 Joueur ${playerNumber} gagne contre bot! +${pointsChange + 200} points`);
+        console.log(`🏆 Joueur ${playerNumber} gagne contre bot! +${playerGameScore} (score partie) + 200 = ${playerGameScore + 200} points`);
       } else {
-        // Défaite contre bot: points perdus
+        // Défaite contre bot: score global - scorePartie (minimum 0)
         await pool.query(
           'UPDATE users SET score = GREATEST(0, score - $1), updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-          [pointsChange, playerNumber]
+          [playerGameScore, playerNumber]
         );
-        console.log(`😢 Joueur ${playerNumber} perd contre bot! -${pointsChange} points`);
+        console.log(`😢 Joueur ${playerNumber} perd contre bot! -${playerGameScore} points (score de la partie)`);
       }
       return true;
     } catch (error) {
@@ -649,6 +654,7 @@ class Game {
             console.log(`🏆 Bonus appliqué! ${player.number} gagne ${totalScore} + 200 = ${totalScore + 200} points`);
           } else {
             newScore = Math.max(0, user.score - totalScore);
+            console.log(`😢 Pénalité! ${player.number} perd -${totalScore} points`);
           }
           
           await db.updateUserScore(player.number, newScore);
@@ -1089,9 +1095,9 @@ app.get('/get-bot', (req, res) => {
 // 2. Route pour mettre à jour les scores après un match bot
 app.post('/update-bot-match', express.json(), async (req, res) => {
   try {
-    const { playerNumber, botId, playerScore, botScore, isPlayerWin, pointsChange } = req.body;
+    const { playerNumber, botId, playerScore, botScore, isPlayerWin } = req.body;
     
-    if (!playerNumber || !botId) {
+    if (!playerNumber || !botId || playerScore === undefined || botScore === undefined) {
       return res.status(400).json({
         success: false,
         message: "Données manquantes"
@@ -1104,22 +1110,22 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
     // Mettre à jour le score du joueur
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(
       playerNumber, 
-      pointsChange, 
+      playerScore,  // Score de la partie du joueur
       isPlayerWin,
       botScore
     );
     
-    // Mettre à jour le score du bot (avec +200 s'il gagne)
-    const botUpdateSuccess = await updateBotScore(botId, botScore, isBotWin);
+    // Mettre à jour le score du bot
+    const botUpdateSuccess = await updateBotScore(botId, botScore, isBotWin, botScore);
     
     if (playerUpdateSuccess && botUpdateSuccess) {
       const newPlayerScore = isPlayerWin ? 
-        (playerScore + pointsChange + 200) : 
-        Math.max(0, playerScore - pointsChange);
+        (playerScore + 200) :  // Gagne: +200 seulement
+        Math.max(0, -playerScore);  // Perd: déduit son score de la partie
       
       const newBotScore = isBotWin ? 
-        (botScore + 200) : 
-        botScore;
+        (botScore + 200) :  // Gagne: +200 seulement
+        Math.max(0, -botScore);  // Perd: déduit son score de la partie
       
       res.json({
         success: true,
