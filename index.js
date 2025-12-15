@@ -101,7 +101,7 @@ async function updateBotScore(botId, newScore) {
         last_played = CURRENT_TIMESTAMP
     `, [botId, newScore]);
     
-    console.log(`🤖 Score mis à jour pour ${botId}: ${newScore}`);
+    console.log(` Score mis à jour pour ${botId}: ${newScore}`);
     return true;
   } catch (error) {
     console.error('❌ Erreur mise à jour score bot:', error);
@@ -116,7 +116,7 @@ async function loadBotScores() {
     result.rows.forEach(row => {
       BOT_SCORES.set(row.bot_id, row.score);
     });
-    console.log(`🤖 ${result.rows.length} scores de bots chargés`);
+    console.log(` ${result.rows.length} scores de bots chargés`);
   } catch (error) {
     console.log('📝 Table bot_scores pas encore créée');
   }
@@ -252,10 +252,10 @@ const db = {
     botsResult.rows.forEach((bot) => {
       leaderboard.push({
         rank: leaderboard.length + 1,
-        username: bot.username ? `🤖 ${bot.username}` : `🤖 Bot ${bot.bot_id}`,
+        username: bot.username ? ` ${bot.username}` : ` Bot ${bot.bot_id}`,
         score: bot.score,
         is_bot: true,
-        avatar: bot.avatar || '🤖'
+        avatar: bot.avatar || ''
       });
     });
     
@@ -1160,3 +1160,4 @@ async function startServer() {
 }
 
 startServer();
+
