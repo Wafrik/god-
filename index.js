@@ -261,49 +261,59 @@ const db = {
     await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
   },
 
-  // Classement - INCLURE LES BOTS
-  async getLeaderboard() {
-    // Récupérer les vrais joueurs
-    const playersResult = await pool.query(
-      'SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC LIMIT 80'
-    );
+  // Classement - INCLURE LES BOTS - TOUTE LA LISTE
+async getLeaderboard() {
+  try {
+    // Récupérer TOUS les vrais joueurs
+    const playersResult = await pool.query(`
+      SELECT username, score 
+      FROM users 
+      WHERE score >= 0 
+      ORDER BY score DESC
+    `);
     
-    // Récupérer les bots avec leurs scores
-    const botsResult = await pool.query(
-      'SELECT bs.bot_id, bs.score, b.username FROM bot_scores bs LEFT JOIN bot_profiles b ON bs.bot_id = b.id ORDER BY bs.score DESC LIMIT 20'
-    ).catch(() => ({ rows: [] }));
+    // Récupérer TOUS les bots
+    const botsResult = await pool.query(`
+      SELECT bs.bot_id, bs.score, b.username 
+      FROM bot_scores bs 
+      LEFT JOIN bot_profiles b ON bs.bot_id = b.id 
+      ORDER BY bs.score DESC
+    `).catch(() => ({ rows: [] }));
     
     const leaderboard = [];
     
     // Ajouter les vrais joueurs
-    playersResult.rows.forEach((user, index) => {
+    playersResult.rows.forEach((user) => {
       leaderboard.push({
-        rank: index + 1,
         username: user.username,
         score: user.score,
         is_bot: false
       });
     });
     
-    // Ajouter les bots (sans indicateur robot)
+    // Ajouter les bots
     botsResult.rows.forEach((bot) => {
       leaderboard.push({
-        rank: leaderboard.length + 1,
         username: bot.username || `Bot_${bot.bot_id}`,
         score: bot.score,
-        is_bot: false // Marqué comme non-bot pour le classement
+        is_bot: false
       });
     });
     
-    // Trier par score et limiter à 100
-    return leaderboard
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 100)
-      .map((item, index) => ({
-        ...item,
-        rank: index + 1
-      }));
-  },
+    // Trier par score décroissant
+    leaderboard.sort((a, b) => b.score - a.score);
+    
+    // Assigner les rangs
+    return leaderboard.map((item, index) => ({
+      ...item,
+      rank: index + 1
+    }));
+    
+  } catch (error) {
+    console.error('❌ Erreur récupération classement:', error);
+    return [];
+  }
+},
 
   // Récupérer tous les joueurs
   async getAllPlayers() {
@@ -1201,3 +1211,4 @@ async function startServer() {
 }
 
 startServer();
+
