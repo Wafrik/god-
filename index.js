@@ -107,7 +107,7 @@ function getRandomBot() {
   };
 }
 
-// 🤖 Mettre à jour le score d'un bot (avec +200 quand il gagne, -scorePartie quand il perd)
+// 🤖 Mettre à jour le score d'un bot
 async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
   try {
     let finalScore = currentBotScore;
@@ -115,11 +115,11 @@ async function updateBotScore(botId, currentBotScore, isWin = false, gameScore =
     if (isWin) {
       // Bot gagne: score global + (scorePartie + 200)
       finalScore = currentBotScore + gameScore + 200;
-      console.log(`🏆 Bot ${botId} gagne! +${gameScore} (score partie) + 200 = ${gameScore + 200} points`);
+      console.log(`🏆 Bot ${botId} gagne! Ancien: ${currentBotScore}, +${gameScore} (score partie) + 200 = ${finalScore} points`);
     } else {
       // Bot perd: score global - scorePartie (minimum 0)
       finalScore = Math.max(0, currentBotScore - gameScore);
-      console.log(`😢 Bot ${botId} perd! -${gameScore} points (score de la partie)`);
+      console.log(`😢 Bot ${botId} perd! Ancien: ${currentBotScore}, -${gameScore} = ${finalScore} points`);
     }
     
     // Mettre à jour en mémoire
@@ -216,24 +216,29 @@ const db = {
   },
 
   // Mettre à jour le score après match bot
-  async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, botGameScore) {
+  async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin) {
     try {
+      // Récupérer le score actuel du joueur
+      const playerResult = await pool.query('SELECT score FROM users WHERE number = $1', [playerNumber]);
+      const currentScore = playerResult.rows[0]?.score || 0;
+      
+      let newScore;
+      
       if (isWin) {
         // Victoire contre bot: score global + (scorePartie + 200)
-        const pointsToAdd = playerGameScore + 200;
-        await pool.query(
-          'UPDATE users SET score = score + $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-          [pointsToAdd, playerNumber]
-        );
-        console.log(`🏆 Joueur ${playerNumber} gagne contre bot! +${playerGameScore} (score partie) + 200 = ${playerGameScore + 200} points`);
+        newScore = currentScore + playerGameScore + 200;
+        console.log(`🏆 Joueur ${playerNumber} gagne contre bot! Ancien: ${currentScore}, +${playerGameScore} + 200 = ${newScore} points`);
       } else {
         // Défaite contre bot: score global - scorePartie (minimum 0)
-        await pool.query(
-          'UPDATE users SET score = GREATEST(0, score - $1), updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-          [playerGameScore, playerNumber]
-        );
-        console.log(`😢 Joueur ${playerNumber} perd contre bot! -${playerGameScore} points (score de la partie)`);
+        newScore = Math.max(0, currentScore - playerGameScore);
+        console.log(`😢 Joueur ${playerNumber} perd contre bot! Ancien: ${currentScore}, -${playerGameScore} = ${newScore} points`);
       }
+      
+      await pool.query(
+        'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+        [newScore, playerNumber]
+      );
+      
       return true;
     } catch (error) {
       console.error('❌ Erreur mise à jour score après match bot:', error);
@@ -262,58 +267,58 @@ const db = {
   },
 
   // Classement - INCLURE LES BOTS - TOUTE LA LISTE
-async getLeaderboard() {
-  try {
-    // Récupérer TOUS les vrais joueurs
-    const playersResult = await pool.query(`
-      SELECT username, score 
-      FROM users 
-      WHERE score >= 0 
-      ORDER BY score DESC
-    `);
-    
-    // Récupérer TOUS les bots
-    const botsResult = await pool.query(`
-      SELECT bs.bot_id, bs.score, b.username 
-      FROM bot_scores bs 
-      LEFT JOIN bot_profiles b ON bs.bot_id = b.id 
-      ORDER BY bs.score DESC
-    `).catch(() => ({ rows: [] }));
-    
-    const leaderboard = [];
-    
-    // Ajouter les vrais joueurs
-    playersResult.rows.forEach((user) => {
-      leaderboard.push({
-        username: user.username,
-        score: user.score,
-        is_bot: false
+  async getLeaderboard() {
+    try {
+      // Récupérer TOUS les vrais joueurs
+      const playersResult = await pool.query(`
+        SELECT username, score 
+        FROM users 
+        WHERE score >= 0 
+        ORDER BY score DESC
+      `);
+      
+      // Récupérer TOUS les bots
+      const botsResult = await pool.query(`
+        SELECT bs.bot_id, bs.score, b.username 
+        FROM bot_scores bs 
+        LEFT JOIN bot_profiles b ON bs.bot_id = b.id 
+        ORDER BY bs.score DESC
+      `).catch(() => ({ rows: [] }));
+      
+      const leaderboard = [];
+      
+      // Ajouter les vrais joueurs
+      playersResult.rows.forEach((user) => {
+        leaderboard.push({
+          username: user.username,
+          score: user.score,
+          is_bot: false
+        });
       });
-    });
-    
-    // Ajouter les bots
-    botsResult.rows.forEach((bot) => {
-      leaderboard.push({
-        username: bot.username || `Bot_${bot.bot_id}`,
-        score: bot.score,
-        is_bot: false
+      
+      // Ajouter les bots
+      botsResult.rows.forEach((bot) => {
+        leaderboard.push({
+          username: bot.username || `Bot_${bot.bot_id}`,
+          score: bot.score,
+          is_bot: false
+        });
       });
-    });
-    
-    // Trier par score décroissant
-    leaderboard.sort((a, b) => b.score - a.score);
-    
-    // Assigner les rangs
-    return leaderboard.map((item, index) => ({
-      ...item,
-      rank: index + 1
-    }));
-    
-  } catch (error) {
-    console.error('❌ Erreur récupération classement:', error);
-    return [];
-  }
-},
+      
+      // Trier par score décroissant
+      leaderboard.sort((a, b) => b.score - a.score);
+      
+      // Assigner les rangs
+      return leaderboard.map((item, index) => ({
+        ...item,
+        rank: index + 1
+      }));
+      
+    } catch (error) {
+      console.error('❌ Erreur récupération classement:', error);
+      return [];
+    }
+  },
 
   // Récupérer tous les joueurs
   async getAllPlayers() {
@@ -1121,27 +1126,20 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(
       playerNumber, 
       playerScore,  // Score de la partie du joueur
-      isPlayerWin,
-      botScore
+      isPlayerWin
     );
     
+    // Récupérer le score actuel du bot
+    const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
+    const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
+    
     // Mettre à jour le score du bot
-    const botUpdateSuccess = await updateBotScore(botId, botScore, isBotWin, botScore);
+    const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore);
     
     if (playerUpdateSuccess && botUpdateSuccess) {
-      const newPlayerScore = isPlayerWin ? 
-        (playerScore + 200) :  // Gagne: +200 seulement
-        Math.max(0, -playerScore);  // Perd: déduit son score de la partie
-      
-      const newBotScore = isBotWin ? 
-        (botScore + 200) :  // Gagne: +200 seulement
-        Math.max(0, -botScore);  // Perd: déduit son score de la partie
-      
       res.json({
         success: true,
         message: "Scores mis à jour avec succès",
-        playerScore: newPlayerScore,
-        botScore: newBotScore,
         bonusApplied: isBotWin ? "Bot +200 points" : (isPlayerWin ? "Joueur +200 points" : "Pas de bonus")
       });
     } else {
@@ -1211,4 +1209,3 @@ async function startServer() {
 }
 
 startServer();
-
