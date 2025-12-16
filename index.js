@@ -85,6 +85,12 @@ const BOTS = [
 // Scores actuels des bots (chargés depuis PostgreSQL)
 const BOT_SCORES = new Map();
 
+// 🤖 BOTS - Points automatiques toutes les 3 heures
+const BOT_AUTO_INCREMENT_MIN = 70    // Minimum
+const BOT_AUTO_INCREMENT_MAX = 200   // Maximum
+const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000 // 3 heures en millisecondes
+let botAutoIncrementInterval = null
+
 // Utilitaires
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
@@ -140,6 +146,46 @@ async function updateBotScore(botId, currentBotScore, isWin = false, gameScore =
   } catch (error) {
     console.error('❌ Erreur mise à jour score bot:', error);
     return false;
+  }
+}
+
+// 🤖 Incrémenter automatiquement les scores des bots (toutes les 3 heures)
+async function incrementBotScoresAutomatically() {
+  try {
+    console.log('🤖 [AUTO-INCREMENT] Début incrément automatique des scores bots...');
+    
+    // Récupérer tous les bots
+    const result = await pool.query('SELECT bot_id, score, username FROM bot_scores bs LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id');
+    
+    let totalIncremented = 0;
+    let totalPointsAdded = 0;
+    
+    for (const row of result.rows) {
+      // Générer un incrément aléatoire entre 70 et 200
+      const increment = Math.floor(Math.random() * (BOT_AUTO_INCREMENT_MAX - BOT_AUTO_INCREMENT_MIN + 1)) + BOT_AUTO_INCREMENT_MIN;
+      
+      // Mettre à jour le score
+      const newScore = row.score + increment;
+      
+      await pool.query(
+        'UPDATE bot_scores SET score = $1, last_played = CURRENT_TIMESTAMP WHERE bot_id = $2',
+        [newScore, row.bot_id]
+      );
+      
+      // Mettre à jour en mémoire
+      BOT_SCORES.set(row.bot_id, newScore);
+      
+      totalIncremented++;
+      totalPointsAdded += increment;
+      
+      console.log(`🤖 [AUTO] ${row.username || row.bot_id}: +${increment} points (${row.score} → ${newScore})`);
+    }
+    
+    console.log(`✅ [AUTO-INCREMENT] ${totalIncremented} bots ont reçu +${totalPointsAdded} points au total`);
+    return { success: true, botsUpdated: totalIncremented, totalPointsAdded };
+  } catch (error) {
+    console.error('❌ Erreur incrément automatique bots:', error);
+    return { success: false, error: error.message };
   }
 }
 
@@ -385,6 +431,7 @@ async function initializeDatabase() {
         bot_id VARCHAR(50) UNIQUE NOT NULL,
         score INTEGER DEFAULT 0,
         last_played TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_auto_increment TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (bot_id) REFERENCES bot_profiles(id) ON DELETE CASCADE
       )
     `);
@@ -399,6 +446,13 @@ async function initializeDatabase() {
           gender = EXCLUDED.gender,
           base_score = EXCLUDED.base_score
       `, [bot.id, bot.username, bot.gender, bot.baseScore]);
+      
+      // Initialiser les scores des bots
+      await pool.query(`
+        INSERT INTO bot_scores (bot_id, score) 
+        VALUES ($1, $2)
+        ON CONFLICT (bot_id) DO NOTHING
+      `, [bot.id, bot.baseScore]);
     }
 
     console.log(`🗄️ Tables PostgreSQL initialisées avec ${BOTS.length} bots`);
@@ -1175,13 +1229,48 @@ app.get('/leaderboard-with-bots', async (req, res) => {
   }
 });
 
+// 4. Route pour forcer l'incrément des bots (admin)
+app.post('/force-bot-increment', express.json(), async (req, res) => {
+  try {
+    const { admin_key } = req.body;
+    
+    if (admin_key !== ADMIN_KEY) {
+      return res.status(403).json({
+        success: false,
+        message: "Clé admin invalide"
+      });
+    }
+    
+    const result = await incrementBotScoresAutomatically();
+    
+    res.json({
+      success: result.success,
+      message: "Incrément forcé des scores bots effectué",
+      botsUpdated: result.botsUpdated,
+      totalPointsAdded: result.totalPointsAdded
+    });
+  } catch (error) {
+    console.error('❌ Erreur /force-bot-increment:', error);
+    res.status(500).json({
+      success: false,
+      message: "Erreur serveur"
+    });
+  }
+});
+
 // Route de santé pour Render
 app.get('/health', (req, res) => {
+  const botScores = Array.from(BOT_SCORES.entries()).slice(0, 5);
+  const botScoresStr = botScores.map(([id, score]) => `${id}:${score}`).join(', ');
+  
   res.status(200).json({ 
     status: 'OK', 
     database: 'PostgreSQL', 
-    bots_count: BOTS.length,
     total_bots: BOTS.length,
+    bot_increment_active: botAutoIncrementInterval !== null,
+    increment_interval: '3h',
+    increment_range: `${BOT_AUTO_INCREMENT_MIN}-${BOT_AUTO_INCREMENT_MAX} points`,
+    sample_bot_scores: botScoresStr,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1194,18 +1283,52 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
+    // 🕐 Démarrer l'incrément automatique des bots (toutes les 3 heures)
+    botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
+    console.log(`⏰ Incrément automatique activé: ${BOT_INCREMENT_INTERVAL / 1000 / 60} minutes`);
+    
+    // Faire un premier incrément après 1 minute (pour tests)
+    setTimeout(() => {
+      incrementBotScoresAutomatically();
+    }, 60 * 1000);
+    
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🎮 Serveur ACTIF sur le port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
+      console.log(`⏰ Incrément automatique: ${BOT_AUTO_INCREMENT_MIN}-${BOT_AUTO_INCREMENT_MAX} points toutes les 3h`);
       console.log('🔧 Routes bots disponibles:');
       console.log('  GET  /get-bot - Obtenir un bot aléatoire');
       console.log('  POST /update-bot-match - Mettre à jour les scores');
       console.log('  GET  /leaderboard-with-bots - Classement avec bots');
+      console.log('  POST /force-bot-increment - Forcer l\'incrément (admin)');
     });
   } catch (error) {
     console.error('❌ Erreur démarrage serveur:', error);
     process.exit(1);
   }
 }
+
+// Nettoyage à l'arrêt
+process.on('SIGTERM', () => {
+  console.log('🔴 Arrêt du serveur...');
+  if (botAutoIncrementInterval) {
+    clearInterval(botAutoIncrementInterval);
+  }
+  server.close(() => {
+    console.log('✅ Serveur arrêté proprement');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('🔴 Interruption (Ctrl+C)...');
+  if (botAutoIncrementInterval) {
+    clearInterval(botAutoIncrementInterval);
+  }
+  server.close(() => {
+    console.log('✅ Serveur arrêté proprement');
+    process.exit(0);
+  });
+});
 
 startServer();
