@@ -91,6 +91,9 @@ const BOT_AUTO_INCREMENT_MAX = 200   // Maximum
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000 // 3 heures en millisecondes
 let botAutoIncrementInterval = null
 
+// Seuil de difficulté
+const HIGH_SCORE_THRESHOLD = 10000  // À partir de 10 000 points
+
 // Utilitaires
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
@@ -113,19 +116,27 @@ function getRandomBot() {
   };
 }
 
-// 🤖 Mettre à jour le score d'un bot
+// 🤖 Mettre à jour le score d'un bot avec système de seuil
 async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
   try {
     let finalScore = currentBotScore;
+    const isHighScore = currentBotScore >= HIGH_SCORE_THRESHOLD;
     
     if (isWin) {
       // Bot gagne: score global + (scorePartie + 200)
       finalScore = currentBotScore + gameScore + 200;
       console.log(`🏆 Bot ${botId} gagne! Ancien: ${currentBotScore}, +${gameScore} (score partie) + 200 = ${finalScore} points`);
     } else {
-      // Bot perd: score global - scorePartie (minimum 0)
-      finalScore = Math.max(0, currentBotScore - gameScore);
-      console.log(`😢 Bot ${botId} perd! Ancien: ${currentBotScore}, -${gameScore} = ${finalScore} points`);
+      // Bot perd: règles selon le score
+      if (isHighScore) {
+        // Score ≥ 10 000: pénalité sévère (-scorePartie - 200)
+        finalScore = Math.max(0, currentBotScore - gameScore - 200);
+        console.log(`🔥 Bot ${botId} perd (≥10k)! Pénalité sévère: ${currentBotScore} - ${gameScore} - 200 = ${finalScore} points`);
+      } else {
+        // Score < 10 000: pénalité normale (-scorePartie seulement)
+        finalScore = Math.max(0, currentBotScore - gameScore);
+        console.log(`😢 Bot ${botId} perd (<10k)! Pénalité normale: ${currentBotScore} - ${gameScore} = ${finalScore} points`);
+      }
     }
     
     // Mettre à jour en mémoire
@@ -141,7 +152,7 @@ async function updateBotScore(botId, currentBotScore, isWin = false, gameScore =
         last_played = CURRENT_TIMESTAMP
     `, [botId, finalScore]);
     
-    console.log(`🤖 Score mis à jour pour ${botId}: ${finalScore} ${isWin ? '(avec bonus victoire)' : '(avec pénalité défaite)'}`);
+    console.log(`🤖 Score mis à jour pour ${botId}: ${finalScore} ${isWin ? '(avec bonus victoire)' : `(avec pénalité ${isHighScore ? 'sévère' : 'normale'})`}`);
     return true;
   } catch (error) {
     console.error('❌ Erreur mise à jour score bot:', error);
@@ -261,12 +272,13 @@ const db = {
     );
   },
 
-  // Mettre à jour le score après match bot
+  // Mettre à jour le score après match bot (avec système de seuil)
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin) {
     try {
       // Récupérer le score actuel du joueur
       const playerResult = await pool.query('SELECT score FROM users WHERE number = $1', [playerNumber]);
       const currentScore = playerResult.rows[0]?.score || 0;
+      const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
       
       let newScore;
       
@@ -275,9 +287,16 @@ const db = {
         newScore = currentScore + playerGameScore + 200;
         console.log(`🏆 Joueur ${playerNumber} gagne contre bot! Ancien: ${currentScore}, +${playerGameScore} + 200 = ${newScore} points`);
       } else {
-        // Défaite contre bot: score global - scorePartie (minimum 0)
-        newScore = Math.max(0, currentScore - playerGameScore);
-        console.log(`😢 Joueur ${playerNumber} perd contre bot! Ancien: ${currentScore}, -${playerGameScore} = ${newScore} points`);
+        // Défaite contre bot: règles selon le score
+        if (isHighScore) {
+          // Score ≥ 10 000: pénalité sévère (-scorePartie - 200)
+          newScore = Math.max(0, currentScore - playerGameScore - 200);
+          console.log(`🔥 Joueur ${playerNumber} perd (≥10k)! Pénalité sévère: ${currentScore} - ${playerGameScore} - 200 = ${newScore} points`);
+        } else {
+          // Score < 10 000: pénalité normale (-scorePartie seulement)
+          newScore = Math.max(0, currentScore - playerGameScore);
+          console.log(`😢 Joueur ${playerNumber} perd (<10k)! Pénalité normale: ${currentScore} - ${playerGameScore} = ${newScore} points`);
+        }
       }
       
       await pool.query(
@@ -475,7 +494,7 @@ async function loadTrustedDevices() {
   }
 }
 
-// ⚡ CLASSE GAME (pour matchs réels)
+// ⚡ CLASSE GAME (pour matchs réels) - MODIFIÉ POUR LE SEUIL
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
@@ -717,13 +736,23 @@ class Game {
 
           const totalScore = this.scores[player.role];
           let newScore = user.score;
+          const isHighScore = user.score >= HIGH_SCORE_THRESHOLD;
           
           if (winner === player.role) {
+            // Victoire: toujours +scorePartie + 200
             newScore = user.score + totalScore + 200;
-            console.log(`🏆 Bonus appliqué! ${player.number} gagne ${totalScore} + 200 = ${totalScore + 200} points`);
+            console.log(`🏆 ${player.number} gagne! Ancien: ${user.score}, +${totalScore} + 200 = ${newScore} points`);
           } else {
-            newScore = Math.max(0, user.score - totalScore);
-            console.log(`😢 Pénalité! ${player.number} perd -${totalScore} points`);
+            // Défaite: règles selon le score
+            if (isHighScore) {
+              // Score ≥ 10 000: pénalité sévère (-scorePartie - 200)
+              newScore = Math.max(0, user.score - totalScore - 200);
+              console.log(`🔥 ${player.number} perd (≥10k)! Pénalité sévère: ${user.score} - ${totalScore} - 200 = ${newScore} points`);
+            } else {
+              // Score < 10 000: pénalité normale (-scorePartie seulement)
+              newScore = Math.max(0, user.score - totalScore);
+              console.log(`😢 ${player.number} perd (<10k)! Pénalité normale: ${user.score} - ${totalScore} = ${newScore} points`);
+            }
           }
           
           await db.updateUserScore(player.number, newScore);
@@ -1267,6 +1296,8 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
+    high_score_threshold: HIGH_SCORE_THRESHOLD,
+    high_score_rule: '≥10k: -scorePartie -200 | <10k: -scorePartie only',
     bot_increment_active: botAutoIncrementInterval !== null,
     increment_interval: '3h',
     increment_range: `${BOT_AUTO_INCREMENT_MIN}-${BOT_AUTO_INCREMENT_MAX} points`,
@@ -1295,6 +1326,7 @@ async function startServer() {
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`🎮 Serveur ACTIF sur le port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
+      console.log(`🔥 Règle seuil: ${HIGH_SCORE_THRESHOLD}+ points = défaite -score -200`);
       console.log(`⏰ Incrément automatique: ${BOT_AUTO_INCREMENT_MIN}-${BOT_AUTO_INCREMENT_MAX} points toutes les 3h`);
       console.log('🔧 Routes bots disponibles:');
       console.log('  GET  /get-bot - Obtenir un bot aléatoire');
