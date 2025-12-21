@@ -396,10 +396,35 @@ const db = {
     return result.rows;
   },
 
-  // Reset tous les scores
+  // Reset tous les scores (joueurs ET bots)
   async resetAllScores() {
-    const result = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
-    return result.rowCount;
+    try {
+      // Reset des scores des joueurs
+      const playersReset = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
+      
+      // Reset des scores des bots à leur base_score (ou à 0)
+      const botsReset = await pool.query(`
+        UPDATE bot_scores bs 
+        SET score = bp.base_score 
+        FROM bot_profiles bp 
+        WHERE bs.bot_id = bp.id
+      `);
+      
+      // Mettre à jour en mémoire
+      for (const bot of BOTS) {
+        BOT_SCORES.set(bot.id, bot.baseScore);
+      }
+      
+      console.log(`🔄 Reset complet: ${playersReset.rowCount} joueurs et ${BOTS.length} bots resetés`);
+      
+      return { 
+        playersReset: playersReset.rowCount,
+        botsReset: BOTS.length 
+      };
+    } catch (error) {
+      console.error('❌ Erreur reset scores:', error);
+      throw error;
+    }
   }
 };
 
@@ -904,16 +929,17 @@ async function handleAdminMessage(ws, message, adminId) {
           }));
         }
 
-        const resetCount = await db.resetAllScores();
+        const resetResult = await db.resetAllScores();
         
         ws.send(JSON.stringify({
           type: 'admin_reset_scores',
           success: true,
           message: `Scores réinitialisés`,
-          players_reset: resetCount
+          players_reset: resetResult.playersReset,
+          bots_reset: resetResult.botsReset
         }));
         
-        console.log(`🔄 Reset admin: ${resetCount} scores réinitialisés`);
+        console.log(`🔄 Reset admin: ${resetResult.playersReset} joueurs et ${resetResult.botsReset} bots resetés à 0`);
       } catch (error) {
         console.error('❌ Erreur reset admin:', error);
         ws.send(JSON.stringify({ 
@@ -1328,6 +1354,7 @@ async function startServer() {
       console.log(`🤖 ${BOTS.length} bots disponibles`);
       console.log(`🔥 Règle seuil: ${HIGH_SCORE_THRESHOLD}+ points = défaite -score -200`);
       console.log(`⏰ Incrément automatique: ${BOT_AUTO_INCREMENT_MIN}-${BOT_AUTO_INCREMENT_MAX} points toutes les 3h`);
+      console.log(`🔄 Reset admin: Reset les bots à leur base_score (non à 0)`);
       console.log('🔧 Routes bots disponibles:');
       console.log('  GET  /get-bot - Obtenir un bot aléatoire');
       console.log('  POST /update-bot-match - Mettre à jour les scores');
