@@ -8,34 +8,30 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ✅ CODE SÉCURISÉ
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Vérification que la variable existe
 if (!process.env.DATABASE_URL) {
-  console.error('❌ DATABASE_URL non définie !');
+  console.error('DATABASE_URL non définie');
   process.exit(1);
 }
 
 const PORT = process.env.PORT || 8000;
-
-// Clé admin
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
+const HIGH_SCORE_THRESHOLD = 10000;
+const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 
-// Structures en mémoire
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
 const ADMIN_CONNECTIONS = new Map();
 const PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
+const BOT_SCORES = new Map();
 
-// 🤖 BOTS SIMPLES (20 originaux + 20 nouveaux)
 const BOTS = [
-  // Bots Masculins originaux
   { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 0 },
   { id: "bot_m_002", username: "Thomas", gender: "M", baseScore: 0 },
   { id: "bot_m_003", username: "Alexandre", gender: "M", baseScore: 0 },
@@ -46,8 +42,6 @@ const BOTS = [
   { id: "bot_m_008", username: "Gabriel", gender: "M", baseScore: 0 },
   { id: "bot_m_009", username: "Hugo", gender: "M", baseScore: 0 },
   { id: "bot_m_010", username: "Raphaël", gender: "M", baseScore: 0 },
-  
-  // Bots Féminins originaux
   { id: "bot_f_001", username: "Emma", gender: "F", baseScore: 0 },
   { id: "bot_f_002", username: "Léa", gender: "F", baseScore: 0 },
   { id: "bot_f_003", username: "Manon", gender: "F", baseScore: 0 },
@@ -58,8 +52,6 @@ const BOTS = [
   { id: "bot_f_008", username: "Clara", gender: "F", baseScore: 0 },
   { id: "bot_f_009", username: "Inès", gender: "F", baseScore: 0 },
   { id: "bot_f_010", username: "Zoé", gender: "F", baseScore: 0 },
-  
-  // NOUVEAUX BOTS (sans indicateur robot)
   { id: "bot_001", username: "Zaboule", gender: "M", baseScore: 0 },
   { id: "bot_002", username: "Ddk", gender: "M", baseScore: 0 },
   { id: "bot_003", username: "Zokou la panthère", gender: "M", baseScore: 0 },
@@ -82,19 +74,8 @@ const BOTS = [
   { id: "bot_020", username: "Lina", gender: "F", baseScore: 0 }
 ];
 
-// Scores actuels des bots (chargés depuis PostgreSQL)
-const BOT_SCORES = new Map();
+let botAutoIncrementInterval = null;
 
-// 🤖 BOTS - Points automatiques toutes les 3 heures
-const BOT_AUTO_INCREMENT_MIN = 70    // Minimum
-const BOT_AUTO_INCREMENT_MAX = 200   // Maximum
-const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000 // 3 heures en millisecondes
-let botAutoIncrementInterval = null
-
-// Seuil de difficulté
-const HIGH_SCORE_THRESHOLD = 10000  // À partir de 10 000 points
-
-// Utilitaires
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
 const generateDeviceKey = (ip, deviceId) => {
@@ -104,78 +85,49 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// 🤖 Obtenir un bot aléatoire
 function getRandomBot() {
   const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
   const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
-  
-  return {
-    ...randomBot,
-    score: botScore,
-    is_bot: true
-  };
+  return { ...randomBot, score: botScore, is_bot: true };
 }
 
-// 🤖 Mettre à jour le score d'un bot avec système de seuil
 async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
   try {
     let finalScore = currentBotScore;
     const isHighScore = currentBotScore >= HIGH_SCORE_THRESHOLD;
-    
+
     if (isWin) {
-      // Bot gagne: score global + (scorePartie + 200)
       finalScore = currentBotScore + gameScore + 200;
-      console.log(`🏆 Bot ${botId} gagne! Ancien: ${currentBotScore}, +${gameScore} (score partie) + 200 = ${finalScore} points`);
     } else {
-      // Bot perd: règles selon le score
       if (isHighScore) {
-        // Score ≥ 10 000: pénalité sévère (-scorePartie - 200)
         finalScore = Math.max(0, currentBotScore - gameScore - 200);
-        console.log(`🔥 Bot ${botId} perd (≥10k)! Pénalité sévère: ${currentBotScore} - ${gameScore} - 200 = ${finalScore} points`);
       } else {
-        // Score < 10 000: pénalité normale (-scorePartie seulement)
         finalScore = Math.max(0, currentBotScore - gameScore);
-        console.log(`😢 Bot ${botId} perd (<10k)! Pénalité normale: ${currentBotScore} - ${gameScore} = ${finalScore} points`);
       }
     }
-    
-    // Mettre à jour en mémoire
+
     BOT_SCORES.set(botId, finalScore);
-    
-    // Mettre à jour dans PostgreSQL
+
     await pool.query(`
       INSERT INTO bot_scores (bot_id, score, last_played) 
       VALUES ($1, $2, CURRENT_TIMESTAMP)
       ON CONFLICT (bot_id) 
-      DO UPDATE SET 
-        score = $2, 
-        last_played = CURRENT_TIMESTAMP
+      DO UPDATE SET score = $2, last_played = CURRENT_TIMESTAMP
     `, [botId, finalScore]);
-    
-    console.log(`🤖 Score mis à jour pour ${botId}: ${finalScore} ${isWin ? '(avec bonus victoire)' : `(avec pénalité ${isHighScore ? 'sévère' : 'normale'})`}`);
+
     return true;
   } catch (error) {
-    console.error('❌ Erreur mise à jour score bot:', error);
+    console.error('Erreur score bot:', error);
     return false;
   }
 }
 
-// 🤖 Incrémenter automatiquement les scores des bots (toutes les 3 heures)
 async function incrementBotScoresAutomatically() {
   try {
-    console.log('🤖 [AUTO-INCREMENT] Début incrément automatique des scores bots...');
-    
-    // Récupérer tous les bots
-    const result = await pool.query('SELECT bot_id, score, username FROM bot_scores bs LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id');
-    
-    let totalIncremented = 0;
-    let totalPointsAdded = 0;
+    const result = await pool.query('SELECT bot_id, score FROM bot_scores');
     
     for (const row of result.rows) {
-      // Générer un incrément aléatoire entre 70 et 200
-      const increment = Math.floor(Math.random() * (BOT_AUTO_INCREMENT_MAX - BOT_AUTO_INCREMENT_MIN + 1)) + BOT_AUTO_INCREMENT_MIN;
-      
-      // Mettre à jour le score
+      const increment = Math.floor(Math.random() * (200 - 70 + 1)) + 70;
       const newScore = row.score + increment;
       
       await pool.query(
@@ -183,39 +135,28 @@ async function incrementBotScoresAutomatically() {
         [newScore, row.bot_id]
       );
       
-      // Mettre à jour en mémoire
       BOT_SCORES.set(row.bot_id, newScore);
-      
-      totalIncremented++;
-      totalPointsAdded += increment;
-      
-      console.log(`🤖 [AUTO] ${row.username || row.bot_id}: +${increment} points (${row.score} → ${newScore})`);
     }
     
-    console.log(`✅ [AUTO-INCREMENT] ${totalIncremented} bots ont reçu +${totalPointsAdded} points au total`);
-    return { success: true, botsUpdated: totalIncremented, totalPointsAdded };
+    return { success: true };
   } catch (error) {
-    console.error('❌ Erreur incrément automatique bots:', error);
-    return { success: false, error: error.message };
+    console.error('Erreur incrément bots:', error);
+    return { success: false };
   }
 }
 
-// 🤖 Charger les scores des bots
 async function loadBotScores() {
   try {
     const result = await pool.query('SELECT bot_id, score FROM bot_scores');
     result.rows.forEach(row => {
       BOT_SCORES.set(row.bot_id, row.score);
     });
-    console.log(`🤖 ${result.rows.length} scores de bots chargés`);
   } catch (error) {
-    console.log('📝 Chargement des scores bots...');
+    // Ignorer si table non existante
   }
 }
 
-// 🗄️ FONCTIONS DATABASE
 const db = {
-  // Utilisateurs
   async getUserByNumber(number) {
     const result = await pool.query('SELECT * FROM users WHERE number = $1', [number]);
     return result.rows[0];
@@ -236,11 +177,9 @@ const db = {
     const token = generateId() + generateId();
     const result = await pool.query(
       `INSERT INTO users (username, password, number, age, score, online, token) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7) 
-       RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
       [username, password, number, age, 0, true, token]
     );
-    console.log('✅ Utilisateur créé:', username);
     return result.rows[0];
   },
 
@@ -248,13 +187,6 @@ const db = {
     await pool.query(
       'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
       [newScore, number]
-    );
-  },
-
-  async incrementUserScore(number, pointsToAdd) {
-    await pool.query(
-      'UPDATE users SET score = score + $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-      [pointsToAdd, number]
     );
   },
 
@@ -272,10 +204,8 @@ const db = {
     );
   },
 
-  // Mettre à jour le score après match bot (avec système de seuil)
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin) {
     try {
-      // Récupérer le score actuel du joueur
       const playerResult = await pool.query('SELECT score FROM users WHERE number = $1', [playerNumber]);
       const currentScore = playerResult.rows[0]?.score || 0;
       const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
@@ -283,19 +213,12 @@ const db = {
       let newScore;
       
       if (isWin) {
-        // Victoire contre bot: score global + (scorePartie + 200)
         newScore = currentScore + playerGameScore + 200;
-        console.log(`🏆 Joueur ${playerNumber} gagne contre bot! Ancien: ${currentScore}, +${playerGameScore} + 200 = ${newScore} points`);
       } else {
-        // Défaite contre bot: règles selon le score
         if (isHighScore) {
-          // Score ≥ 10 000: pénalité sévère (-scorePartie - 200)
           newScore = Math.max(0, currentScore - playerGameScore - 200);
-          console.log(`🔥 Joueur ${playerNumber} perd (≥10k)! Pénalité sévère: ${currentScore} - ${playerGameScore} - 200 = ${newScore} points`);
         } else {
-          // Score < 10 000: pénalité normale (-scorePartie seulement)
           newScore = Math.max(0, currentScore - playerGameScore);
-          console.log(`😢 Joueur ${playerNumber} perd (<10k)! Pénalité normale: ${currentScore} - ${playerGameScore} = ${newScore} points`);
         }
       }
       
@@ -306,12 +229,11 @@ const db = {
       
       return true;
     } catch (error) {
-      console.error('❌ Erreur mise à jour score après match bot:', error);
+      console.error('Erreur mise à jour score bot match:', error);
       return false;
     }
   },
 
-  // Appareils de confiance
   async getTrustedDevice(deviceKey) {
     const result = await pool.query(
       'SELECT * FROM trusted_devices WHERE device_key = $1',
@@ -331,28 +253,20 @@ const db = {
     await pool.query('DELETE FROM trusted_devices WHERE device_key = $1', [deviceKey]);
   },
 
-  // Classement - INCLURE LES BOTS - TOUTE LA LISTE
   async getLeaderboard() {
     try {
-      // Récupérer TOUS les vrais joueurs
       const playersResult = await pool.query(`
-        SELECT username, score 
-        FROM users 
-        WHERE score >= 0 
-        ORDER BY score DESC
+        SELECT username, score FROM users WHERE score >= 0 ORDER BY score DESC
       `);
       
-      // Récupérer TOUS les bots
       const botsResult = await pool.query(`
         SELECT bs.bot_id, bs.score, b.username 
-        FROM bot_scores bs 
-        LEFT JOIN bot_profiles b ON bs.bot_id = b.id 
+        FROM bot_scores bs LEFT JOIN bot_profiles b ON bs.bot_id = b.id 
         ORDER BY bs.score DESC
       `).catch(() => ({ rows: [] }));
       
       const leaderboard = [];
       
-      // Ajouter les vrais joueurs
       playersResult.rows.forEach((user) => {
         leaderboard.push({
           username: user.username,
@@ -361,7 +275,6 @@ const db = {
         });
       });
       
-      // Ajouter les bots
       botsResult.rows.forEach((bot) => {
         leaderboard.push({
           username: bot.username || `Bot_${bot.bot_id}`,
@@ -370,22 +283,18 @@ const db = {
         });
       });
       
-      // Trier par score décroissant
       leaderboard.sort((a, b) => b.score - a.score);
       
-      // Assigner les rangs
       return leaderboard.map((item, index) => ({
         ...item,
         rank: index + 1
       }));
-      
     } catch (error) {
-      console.error('❌ Erreur récupération classement:', error);
+      console.error('Erreur classement:', error);
       return [];
     }
   },
 
-  // Récupérer tous les joueurs
   async getAllPlayers() {
     const result = await pool.query(`
       SELECT username, number, age, score, created_at, online 
@@ -396,13 +305,10 @@ const db = {
     return result.rows;
   },
 
-  // Reset tous les scores (joueurs ET bots)
   async resetAllScores() {
     try {
-      // Reset des scores des joueurs
       const playersReset = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
       
-      // Reset des scores des bots à leur base_score (ou à 0)
       const botsReset = await pool.query(`
         UPDATE bot_scores bs 
         SET score = bp.base_score 
@@ -410,28 +316,86 @@ const db = {
         WHERE bs.bot_id = bp.id
       `);
       
-      // Mettre à jour en mémoire
       for (const bot of BOTS) {
         BOT_SCORES.set(bot.id, bot.baseScore);
       }
-      
-      console.log(`🔄 Reset complet: ${playersReset.rowCount} joueurs et ${BOTS.length} bots resetés`);
       
       return { 
         playersReset: playersReset.rowCount,
         botsReset: BOTS.length 
       };
     } catch (error) {
-      console.error('❌ Erreur reset scores:', error);
+      console.error('Erreur reset scores:', error);
       throw error;
+    }
+  },
+
+  async updatePlayerScoreById(playerId, points, operation) {
+    try {
+      if (!playerId) return { success: false, message: "ID joueur manquant" };
+      
+      const player = await pool.query('SELECT * FROM users WHERE number = $1', [playerId]);
+      if (!player.rows[0]) return { success: false, message: "Joueur non trouvé" };
+      
+      const currentScore = player.rows[0].score;
+      let newScore;
+      
+      if (operation === "add") {
+        newScore = currentScore + points;
+      } else if (operation === "subtract") {
+        newScore = Math.max(0, currentScore - points);
+      } else {
+        return { success: false, message: "Opération invalide" };
+      }
+      
+      await pool.query(
+        'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
+        [newScore, playerId]
+      );
+      
+      return { 
+        success: true, 
+        player_id: playerId,
+        new_score: newScore,
+        points: points,
+        operation: operation
+      };
+    } catch (error) {
+      console.error('Erreur update score joueur:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  async getPlayersList() {
+    try {
+      const result = await pool.query(`
+        SELECT number as id, username, score, age, number, 
+               created_at, online, 
+               RANK() OVER (ORDER BY score DESC) as rank
+        FROM users 
+        WHERE score >= 0 
+        ORDER BY score DESC
+      `);
+      
+      return result.rows.map(player => ({
+        id: player.id,
+        username: player.username,
+        score: player.score,
+        rank: player.rank,
+        age: player.age,
+        number: player.number,
+        created_at: player.created_at,
+        online: player.online
+      }));
+    } catch (error) {
+      console.error('Erreur liste joueurs:', error);
+      return [];
     }
   }
 };
 
-// 🗄️ INITIALISATION DE LA BASE DE DONNÉES
 async function initializeDatabase() {
   try {
-    // Table des utilisateurs
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -447,7 +411,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table des appareils de confiance
     await pool.query(`
       CREATE TABLE IF NOT EXISTS trusted_devices (
         id SERIAL PRIMARY KEY,
@@ -457,7 +420,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table des profils de bots
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profiles (
         id VARCHAR(50) PRIMARY KEY,
@@ -468,7 +430,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table des scores des bots
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_scores (
         id SERIAL PRIMARY KEY,
@@ -480,7 +441,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Insérer tous les bots dans la table des profils
     for (const bot of BOTS) {
       await pool.query(`
         INSERT INTO bot_profiles (id, username, gender, base_score) 
@@ -491,7 +451,6 @@ async function initializeDatabase() {
           base_score = EXCLUDED.base_score
       `, [bot.id, bot.username, bot.gender, bot.baseScore]);
       
-      // Initialiser les scores des bots
       await pool.query(`
         INSERT INTO bot_scores (bot_id, score) 
         VALUES ($1, $2)
@@ -499,27 +458,23 @@ async function initializeDatabase() {
       `, [bot.id, bot.baseScore]);
     }
 
-    console.log(`🗄️ Tables PostgreSQL initialisées avec ${BOTS.length} bots`);
   } catch (error) {
-    console.error('❌ Erreur initialisation base de données:', error);
+    console.error('Erreur init DB:', error);
     throw error;
   }
 }
 
-// Charger les appareils de confiance
 async function loadTrustedDevices() {
   try {
     const result = await pool.query('SELECT * FROM trusted_devices');
     result.rows.forEach(row => {
       TRUSTED_DEVICES.set(row.device_key, row.user_number);
     });
-    console.log(`📱 ${result.rows.length} appareils de confiance chargés`);
   } catch (error) {
-    console.error('❌ Erreur chargement appareils:', error);
+    console.error('Erreur chargement devices:', error);
   }
 }
 
-// ⚡ CLASSE GAME (pour matchs réels) - MODIFIÉ POUR LE SEUIL
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
@@ -536,7 +491,6 @@ class Game {
     });
     
     ACTIVE_GAMES.set(id, this);
-    console.log(`🎮 Lobby ${id} créé: ${p1.username} vs ${p2.username}`);
     setTimeout(() => this.checkAndStartGame(), 1000);
   }
 
@@ -711,7 +665,7 @@ class Game {
         await db.updateUserScore(remainingPlayer.number, newRemainingScore);
       }
     } catch (error) {
-      console.error('❌ Erreur application pénalités déconnexion:', error);
+      console.error('Erreur pénalités déconnexion:', error);
     }
   }
 
@@ -755,28 +709,19 @@ class Game {
       for (const player of this.players) {
         const user = await db.getUserByNumber(player.number);
         if (user) {
-          if (winner === 'draw') {
-            continue;
-          }
+          if (winner === 'draw') continue;
 
           const totalScore = this.scores[player.role];
           let newScore = user.score;
           const isHighScore = user.score >= HIGH_SCORE_THRESHOLD;
           
           if (winner === player.role) {
-            // Victoire: toujours +scorePartie + 200
             newScore = user.score + totalScore + 200;
-            console.log(`🏆 ${player.number} gagne! Ancien: ${user.score}, +${totalScore} + 200 = ${newScore} points`);
           } else {
-            // Défaite: règles selon le score
             if (isHighScore) {
-              // Score ≥ 10 000: pénalité sévère (-scorePartie - 200)
               newScore = Math.max(0, user.score - totalScore - 200);
-              console.log(`🔥 ${player.number} perd (≥10k)! Pénalité sévère: ${user.score} - ${totalScore} - 200 = ${newScore} points`);
             } else {
-              // Score < 10 000: pénalité normale (-scorePartie seulement)
               newScore = Math.max(0, user.score - totalScore);
-              console.log(`😢 ${player.number} perd (<10k)! Pénalité normale: ${user.score} - ${totalScore} = ${newScore} points`);
             }
           }
           
@@ -784,7 +729,7 @@ class Game {
         }
       }
     } catch (error) {
-      console.error('❌ Erreur mise à jour scores:', error);
+      console.error('Erreur mise à jour scores:', error);
     }
   }
 
@@ -797,14 +742,11 @@ class Game {
   getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
 }
 
-// WebSocket avec système de TOKEN
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   let deviceId = "unknown";
   let isAdminConnection = false;
   let adminId = null;
-  
-  console.log(`🌐 Nouvelle connexion depuis: ${ip}`);
   
   ws.send(JSON.stringify({ type: 'connected', message: 'Serveur connecté' }));
   
@@ -829,14 +771,13 @@ wss.on('connection', (ws, req) => {
       }
       
     } catch(e) {
-      console.error("❌ Erreur parsing message:", e);
+      console.error("Erreur parsing message:", e);
     }
   });
 
   ws.on('close', async () => {
     if (isAdminConnection && adminId) {
       ADMIN_CONNECTIONS.delete(adminId);
-      console.log(`🔴 Déconnexion admin: ${adminId}`);
     } else {
       setTimeout(async () => {
         const deviceKey = generateDeviceKey(ip, deviceId);
@@ -853,17 +794,13 @@ wss.on('connection', (ws, req) => {
           const player = game?.getPlayerByNumber(disconnectedNumber);
           if (player) await game.handlePlayerDisconnect(player);
           PLAYER_TO_GAME.delete(disconnectedNumber);
-          
-          console.log(`🔴 Déconnexion: ${disconnectedNumber} (${deviceKey})`);
         }
       }, 10000);
     }
   });
 });
 
-// Gestion messages ADMIN
 async function handleAdminMessage(ws, message, adminId) {
-  console.log(`🔐 Message admin ${message.type} - Admin: ${adminId}`);
   
   const handlers = {
     admin_authenticate: async () => {
@@ -872,13 +809,11 @@ async function handleAdminMessage(ws, message, adminId) {
           type: 'admin_auth_success', 
           message: 'Authentification admin réussie' 
         }));
-        console.log("🔐 Connexion admin réussie");
       } else {
         ws.send(JSON.stringify({ 
           type: 'admin_auth_failed', 
           message: 'Clé admin invalide' 
         }));
-        console.log("❌ Tentative de connexion admin échouée");
       }
     },
 
@@ -908,14 +843,39 @@ async function handleAdminMessage(ws, message, adminId) {
           data: data,
           count: data.length
         }));
-        
-        console.log(`📊 Export admin: ${data.length} joueurs exportés`);
       } catch (error) {
-        console.error('❌ Erreur export admin:', error);
+        console.error('Erreur export admin:', error);
         ws.send(JSON.stringify({ 
           type: 'admin_export_data', 
           success: false, 
-          message: 'Erreur lors de l\'export' 
+          message: 'Erreur export' 
+        }));
+      }
+    },
+
+    admin_get_players: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const players = await db.getPlayersList();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_player_list',
+          success: true,
+          players: players,
+          count: players.length
+        }));
+      } catch (error) {
+        console.error('Erreur liste joueurs admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_player_list', 
+          success: false, 
+          message: 'Erreur liste joueurs' 
         }));
       }
     },
@@ -938,14 +898,52 @@ async function handleAdminMessage(ws, message, adminId) {
           players_reset: resetResult.playersReset,
           bots_reset: resetResult.botsReset
         }));
-        
-        console.log(`🔄 Reset admin: ${resetResult.playersReset} joueurs et ${resetResult.botsReset} bots resetés à 0`);
       } catch (error) {
-        console.error('❌ Erreur reset admin:', error);
+        console.error('Erreur reset admin:', error);
         ws.send(JSON.stringify({ 
           type: 'admin_reset_scores', 
           success: false, 
-          message: 'Erreur lors du reset' 
+          message: 'Erreur reset' 
+        }));
+      }
+    },
+
+    admin_update_player_score: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const { player_id, points, operation } = message;
+        
+        if (!player_id || !points || !operation) {
+          return ws.send(JSON.stringify({
+            type: 'admin_update_score',
+            success: false,
+            message: 'Données manquantes'
+          }));
+        }
+
+        const result = await db.updatePlayerScoreById(player_id, parseInt(points), operation);
+        
+        ws.send(JSON.stringify({
+          type: 'admin_update_score',
+          success: result.success,
+          message: result.message || 'Score mis à jour',
+          player_id: result.player_id,
+          new_score: result.new_score,
+          points: result.points,
+          operation: result.operation
+        }));
+      } catch (error) {
+        console.error('Erreur update score admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_update_score', 
+          success: false, 
+          message: 'Erreur mise à jour score' 
         }));
       }
     }
@@ -961,11 +959,8 @@ async function handleAdminMessage(ws, message, adminId) {
   }
 }
 
-// Gestion messages avec TOKEN PRINCIPAL (pour les joueurs)
 async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
-  
-  console.log(`🔑 Message ${message.type} - Device: ${deviceId}`);
   
   const handlers = {
     authenticate: async () => {
@@ -990,8 +985,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           number: user.number,
           token: user.token
         }));
-        
-        console.log(`✅ Connexion: ${user.username}`);
       } else {
         ws.send(JSON.stringify({ type: 'auth_failed', message: 'Numéro ou mot de passe incorrect' }));
       }
@@ -1000,7 +993,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     register: async () => {
       const { username, password, confirmPassword, number, age } = message;
       if (!username || !password || !confirmPassword || !number || !age) {
-        ws.send(JSON.stringify({ type: 'register_failed', message: "Tous les champs sont requis" }));
+        ws.send(JSON.stringify({ type: 'register_failed', message: "Tous les champs requis" }));
       } else if (password !== confirmPassword) {
         ws.send(JSON.stringify({ type: 'register_failed', message: "Mots de passe différents" }));
       } else if (await db.getUserByUsername(username)) {
@@ -1023,8 +1016,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           number,
           token: newUser.token
         }));
-        
-        console.log(`✅ Inscription: ${username}`);
       }
     },
 
@@ -1044,8 +1035,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         const player = game?.getPlayerByNumber(playerNumber);
         if (player) await game.handlePlayerDisconnect(player);
         PLAYER_TO_GAME.delete(playerNumber);
-        
-        console.log(`🚪 Déconnexion manuelle: ${playerNumber}`);
         
         ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie' }));
       } else {
@@ -1081,8 +1070,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             player.ws = ws; 
             game.broadcastGameState(); 
           }
-          
-          console.log(`🔄 Auto-login: ${user.username}`);
           return;
         } else {
           ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Token invalide' }));
@@ -1110,8 +1097,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             number: user.number,
             token: user.token
           }));
-          
-          console.log(`🔄 Auto-login par device: ${user.username}`);
         } else {
           ws.send(JSON.stringify({ type: 'auto_login_failed', message: 'Utilisateur non trouvé' }));
         }
@@ -1196,199 +1181,113 @@ function handleGameAction(ws, message, deviceKey) {
   actions[message.type]?.();
 }
 
-// 🎯 NOUVELLES ROUTES HTTP POUR LES BOTS
-
-// 1. Route pour obtenir un bot aléatoire
 app.get('/get-bot', (req, res) => {
   try {
     const bot = getRandomBot();
-    res.json({
-      success: true,
-      bot: bot,
-      message: "Bot sélectionné avec succès"
-    });
+    res.json({ success: true, bot: bot });
   } catch (error) {
-    console.error('❌ Erreur /get-bot:', error);
-    res.status(500).json({
-      success: false,
-      message: "Erreur serveur"
-    });
+    res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
 
-// 2. Route pour mettre à jour les scores après un match bot
 app.post('/update-bot-match', express.json(), async (req, res) => {
   try {
     const { playerNumber, botId, playerScore, botScore, isPlayerWin } = req.body;
     
     if (!playerNumber || !botId || playerScore === undefined || botScore === undefined) {
-      return res.status(400).json({
-        success: false,
-        message: "Données manquantes"
-      });
+      return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    // Déterminer si le bot a gagné
     const isBotWin = !isPlayerWin;
+    const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin);
     
-    // Mettre à jour le score du joueur
-    const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(
-      playerNumber, 
-      playerScore,  // Score de la partie du joueur
-      isPlayerWin
-    );
-    
-    // Récupérer le score actuel du bot
     const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
     const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
     
-    // Mettre à jour le score du bot
     const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore);
     
     if (playerUpdateSuccess && botUpdateSuccess) {
-      res.json({
-        success: true,
-        message: "Scores mis à jour avec succès",
-        bonusApplied: isBotWin ? "Bot +200 points" : (isPlayerWin ? "Joueur +200 points" : "Pas de bonus")
-      });
+      res.json({ success: true, message: "Scores mis à jour" });
     } else {
-      res.status(500).json({
-        success: false,
-        message: "Erreur lors de la mise à jour des scores"
-      });
+      res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
     }
   } catch (error) {
-    console.error('❌ Erreur /update-bot-match:', error);
-    res.status(500).json({
-      success: false,
-      message: "Erreur serveur"
-    });
+    res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
 
-// 3. Route pour obtenir le classement avec bots
 app.get('/leaderboard-with-bots', async (req, res) => {
   try {
     const leaderboard = await db.getLeaderboard();
-    res.json({
-      success: true,
-      leaderboard: leaderboard,
-      count: leaderboard.length
-    });
+    res.json({ success: true, leaderboard: leaderboard, count: leaderboard.length });
   } catch (error) {
-    console.error('❌ Erreur /leaderboard-with-bots:', error);
-    res.status(500).json({
-      success: false,
-      message: "Erreur serveur"
-    });
+    res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
 
-// 4. Route pour forcer l'incrément des bots (admin)
 app.post('/force-bot-increment', express.json(), async (req, res) => {
   try {
     const { admin_key } = req.body;
     
     if (admin_key !== ADMIN_KEY) {
-      return res.status(403).json({
-        success: false,
-        message: "Clé admin invalide"
-      });
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
     }
     
     const result = await incrementBotScoresAutomatically();
     
     res.json({
       success: result.success,
-      message: "Incrément forcé des scores bots effectué",
-      botsUpdated: result.botsUpdated,
-      totalPointsAdded: result.totalPointsAdded
+      message: "Incrément bots effectué"
     });
   } catch (error) {
-    console.error('❌ Erreur /force-bot-increment:', error);
-    res.status(500).json({
-      success: false,
-      message: "Erreur serveur"
-    });
+    res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
 
-// Route de santé pour Render
 app.get('/health', (req, res) => {
-  const botScores = Array.from(BOT_SCORES.entries()).slice(0, 5);
-  const botScoresStr = botScores.map(([id, score]) => `${id}:${score}`).join(', ');
-  
   res.status(200).json({ 
     status: 'OK', 
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
     high_score_threshold: HIGH_SCORE_THRESHOLD,
-    high_score_rule: '≥10k: -scorePartie -200 | <10k: -scorePartie only',
-    bot_increment_active: botAutoIncrementInterval !== null,
-    increment_interval: '3h',
-    increment_range: `${BOT_AUTO_INCREMENT_MIN}-${BOT_AUTO_INCREMENT_MAX} points`,
-    sample_bot_scores: botScoresStr,
     timestamp: new Date().toISOString() 
   });
 });
 
-// Initialisation au démarrage
 async function startServer() {
   try {
-    console.log('🚀 Démarrage serveur avec bots...');
     await initializeDatabase();
     await loadTrustedDevices();
     await loadBotScores();
     
-    // 🕐 Démarrer l'incrément automatique des bots (toutes les 3 heures)
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
-    console.log(`⏰ Incrément automatique activé: ${BOT_INCREMENT_INTERVAL / 1000 / 60} minutes`);
     
-    // Faire un premier incrément après 1 minute (pour tests)
     setTimeout(() => {
       incrementBotScoresAutomatically();
     }, 60 * 1000);
     
     server.listen(PORT, '0.0.0.0', () => {
-      console.log(`🎮 Serveur ACTIF sur le port ${PORT}`);
-      console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`🔥 Règle seuil: ${HIGH_SCORE_THRESHOLD}+ points = défaite -score -200`);
-      console.log(`⏰ Incrément automatique: ${BOT_AUTO_INCREMENT_MIN}-${BOT_AUTO_INCREMENT_MAX} points toutes les 3h`);
-      console.log(`🔄 Reset admin: Reset les bots à leur base_score (non à 0)`);
-      console.log('🔧 Routes bots disponibles:');
-      console.log('  GET  /get-bot - Obtenir un bot aléatoire');
-      console.log('  POST /update-bot-match - Mettre à jour les scores');
-      console.log('  GET  /leaderboard-with-bots - Classement avec bots');
-      console.log('  POST /force-bot-increment - Forcer l\'incrément (admin)');
+      console.log(`Serveur sur port ${PORT}`);
+      console.log(`${BOTS.length} bots disponibles`);
     });
   } catch (error) {
-    console.error('❌ Erreur démarrage serveur:', error);
+    console.error('Erreur démarrage:', error);
     process.exit(1);
   }
 }
 
-// Nettoyage à l'arrêt
 process.on('SIGTERM', () => {
-  console.log('🔴 Arrêt du serveur...');
-  if (botAutoIncrementInterval) {
-    clearInterval(botAutoIncrementInterval);
-  }
+  if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
-    console.log('✅ Serveur arrêté proprement');
     process.exit(0);
   });
 });
 
 process.on('SIGINT', () => {
-  console.log('🔴 Interruption (Ctrl+C)...');
-  if (botAutoIncrementInterval) {
-    clearInterval(botAutoIncrementInterval);
-  }
+  if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
-    console.log('✅ Serveur arrêté proprement');
     process.exit(0);
   });
 });
 
 startServer();
-
