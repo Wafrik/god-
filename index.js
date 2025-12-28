@@ -204,8 +204,14 @@ const db = {
     );
   },
 
-  async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin) {
+  async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
     try {
+      // Si c'est un match nul, aucun changement de score
+      if (isDraw) {
+        console.log(`Match nul - Aucun changement de score pour ${playerNumber}`);
+        return true;
+      }
+      
       const playerResult = await pool.query('SELECT score FROM users WHERE number = $1', [playerNumber]);
       const currentScore = playerResult.rows[0]?.score || 0;
       const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
@@ -214,11 +220,14 @@ const db = {
       
       if (isWin) {
         newScore = currentScore + playerGameScore + 200;
+        console.log(`🏆 Victoire ${playerNumber}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
+          console.log(`🔥 Défaite (≥10k) ${playerNumber}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
         } else {
           newScore = Math.max(0, currentScore - playerGameScore);
+          console.log(`😢 Défaite (<10k) ${playerNumber}: ${currentScore} - ${playerGameScore} = ${newScore}`);
         }
       }
       
@@ -390,6 +399,115 @@ const db = {
     } catch (error) {
       console.error('Erreur liste joueurs:', error);
       return [];
+    }
+  },
+
+  async getFullListWithBots() {
+    try {
+      // Récupérer tous les joueurs
+      const playersResult = await pool.query(`
+        SELECT number as id, username, score, age, number, 
+               created_at, online, false as is_bot,
+               RANK() OVER (ORDER BY score DESC) as rank
+        FROM users 
+        WHERE score >= 0 
+      `);
+      
+      // Récupérer tous les bots
+      const botsResult = await pool.query(`
+        SELECT bs.bot_id as id, b.username, bs.score, 
+               'bot' as number, 0 as age, 
+               bp.created_at, false as online, true as is_bot,
+               RANK() OVER (ORDER BY bs.score DESC) as rank
+        FROM bot_scores bs 
+        LEFT JOIN bot_profiles b ON bs.bot_id = b.id 
+        LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
+      `).catch(() => ({ rows: [] }));
+      
+      // Combiner les résultats
+      const combinedList = [];
+      
+      // Ajouter les joueurs
+      playersResult.rows.forEach(player => {
+        combinedList.push({
+          id: player.id,
+          username: player.username,
+          score: player.score,
+          rank: player.rank,
+          age: player.age,
+          number: player.number,
+          created_at: player.created_at,
+          online: player.online,
+          is_bot: false
+        });
+      });
+      
+      // Ajouter les bots
+      botsResult.rows.forEach(bot => {
+        combinedList.push({
+          id: bot.id,
+          username: bot.username,
+          score: bot.score,
+          rank: bot.rank,
+          age: bot.age,
+          number: bot.number,
+          created_at: bot.created_at,
+          online: bot.online,
+          is_bot: true
+        });
+      });
+      
+      // Trier par score décroissant
+      combinedList.sort((a, b) => b.score - a.score);
+      
+      // Réassigner les rangs après le tri combiné
+      combinedList.forEach((item, index) => {
+        item.rank = index + 1;
+      });
+      
+      return combinedList;
+    } catch (error) {
+      console.error('Erreur liste complète avec bots:', error);
+      return [];
+    }
+  },
+
+  async updateBotScoreById(botId, points, operation) {
+    try {
+      if (!botId) return { success: false, message: "ID bot manquant" };
+      
+      const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
+      if (!botResult.rows[0]) return { success: false, message: "Bot non trouvé" };
+      
+      const currentScore = botResult.rows[0].score;
+      let newScore;
+      
+      if (operation === "add") {
+        newScore = currentScore + points;
+      } else if (operation === "subtract") {
+        newScore = Math.max(0, currentScore - points);
+      } else {
+        return { success: false, message: "Opération invalide" };
+      }
+      
+      await pool.query(
+        'UPDATE bot_scores SET score = $1, last_played = CURRENT_TIMESTAMP WHERE bot_id = $2',
+        [newScore, botId]
+      );
+      
+      // Mettre à jour en mémoire
+      BOT_SCORES.set(botId, newScore);
+      
+      return { 
+        success: true, 
+        bot_id: botId,
+        new_score: newScore,
+        points: points,
+        operation: operation
+      };
+    } catch (error) {
+      console.error('Erreur update score bot:', error);
+      return { success: false, message: "Erreur serveur" };
     }
   }
 };
@@ -706,22 +824,29 @@ class Game {
 
   async _updatePlayerScores(winner) {
     try {
+      // Si match nul, aucun changement de score
+      if (winner === 'draw') {
+        console.log('Match nul - Aucun changement de score');
+        return;
+      }
+      
       for (const player of this.players) {
         const user = await db.getUserByNumber(player.number);
         if (user) {
-          if (winner === 'draw') continue;
-
           const totalScore = this.scores[player.role];
           let newScore = user.score;
           const isHighScore = user.score >= HIGH_SCORE_THRESHOLD;
           
           if (winner === player.role) {
             newScore = user.score + totalScore + 200;
+            console.log(`🏆 ${player.number} gagne: ${user.score} + ${totalScore} + 200 = ${newScore}`);
           } else {
             if (isHighScore) {
               newScore = Math.max(0, user.score - totalScore - 200);
+              console.log(`🔥 ${player.number} perd (≥10k): ${user.score} - ${totalScore} - 200 = ${newScore}`);
             } else {
               newScore = Math.max(0, user.score - totalScore);
+              console.log(`😢 ${player.number} perd (<10k): ${user.score} - ${totalScore} = ${newScore}`);
             }
           }
           
@@ -880,6 +1005,33 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
+    admin_get_full_list: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const fullList = await db.getFullListWithBots();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_full_list',
+          success: true,
+          data: fullList,
+          count: fullList.length
+        }));
+      } catch (error) {
+        console.error('Erreur liste complète admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_full_list', 
+          success: false, 
+          message: 'Erreur liste complète' 
+        }));
+      }
+    },
+
     admin_reset_scores: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -944,6 +1096,46 @@ async function handleAdminMessage(ws, message, adminId) {
           type: 'admin_update_score', 
           success: false, 
           message: 'Erreur mise à jour score' 
+        }));
+      }
+    },
+
+    admin_update_bot_score: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const { bot_id, points, operation } = message;
+        
+        if (!bot_id || !points || !operation) {
+          return ws.send(JSON.stringify({
+            type: 'admin_update_bot_score',
+            success: false,
+            message: 'Données manquantes'
+          }));
+        }
+
+        const result = await db.updateBotScoreById(bot_id, parseInt(points), operation);
+        
+        ws.send(JSON.stringify({
+          type: 'admin_update_bot_score',
+          success: result.success,
+          message: result.message || 'Score bot mis à jour',
+          bot_id: result.bot_id,
+          new_score: result.new_score,
+          points: result.points,
+          operation: result.operation
+        }));
+      } catch (error) {
+        console.error('Erreur update score bot admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_update_bot_score', 
+          success: false, 
+          message: 'Erreur mise à jour score bot' 
         }));
       }
     }
@@ -1199,17 +1391,33 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
     }
     
     const isBotWin = !isPlayerWin;
-    const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin);
+    const isDraw = (playerScore === botScore);
     
-    const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
-    const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
+    const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin, isDraw);
     
-    const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore);
-    
-    if (playerUpdateSuccess && botUpdateSuccess) {
-      res.json({ success: true, message: "Scores mis à jour" });
+    // Si c'est un match nul, le bot ne gagne ni ne perd de points
+    if (!isDraw) {
+      const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
+      const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
+      
+      const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore);
+      
+      if (playerUpdateSuccess && botUpdateSuccess) {
+        res.json({ 
+          success: true, 
+          message: "Scores mis à jour",
+          is_draw: isDraw
+        });
+      } else {
+        res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
+      }
     } else {
-      res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
+      // Match nul - aucun changement de score
+      res.json({ 
+        success: true, 
+        message: "Match nul - Aucun changement de score",
+        is_draw: true
+      });
     }
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
