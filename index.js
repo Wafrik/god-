@@ -23,6 +23,14 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 
+// CONFIGURATION MAJ - MODIFIEZ ICI
+const UPDATE_CONFIG = {
+  force_update: true,  // true = MAJ requise, false = pas de MAJ
+  min_version: "1.1.0",
+  latest_version: "1.2.0",
+  update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
+};
+
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
 const ADMIN_CONNECTIONS = new Map();
@@ -1155,6 +1163,32 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   
   const handlers = {
+    // AJOUTEZ CE HANDLER POUR LA MAJ
+    check_update: async () => {
+      console.log('📱 Vérification MAJ demandée');
+      console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
+      
+      // SIMPLE: Si force_update est true, on force la MAJ
+      if (UPDATE_CONFIG.force_update) {
+        console.log('⚠️ MAJ FORCÉE activée - Envoi réponse MAJ requise');
+        ws.send(JSON.stringify({
+          type: 'check_update_response',
+          needs_update: true,
+          message: "Mise à jour requise",
+          min_version: UPDATE_CONFIG.min_version,
+          latest_version: UPDATE_CONFIG.latest_version,
+          update_url: UPDATE_CONFIG.update_url
+        }));
+      } else {
+        console.log('✅ Pas de MAJ requise - Version à jour');
+        ws.send(JSON.stringify({
+          type: 'check_update_response',
+          needs_update: false,
+          message: "Version à jour"
+        }));
+      }
+    },
+
     authenticate: async () => {
       const user = await db.getUserByNumber(message.number);
       if (user && user.password === message.password) {
@@ -1462,6 +1496,26 @@ app.get('/health', (req, res) => {
   });
 });
 
+// AJOUTEZ CETTE ROUTE POUR CHANGER LA CONFIG MAJ FACILEMENT
+app.get('/update-config/:status', (req, res) => {
+  const status = req.params.status;
+  UPDATE_CONFIG.force_update = (status === 'true' || status === '1' || status === 'yes');
+  console.log('✅ Configuration MAJ changée: force_update =', UPDATE_CONFIG.force_update);
+  res.json({ 
+    success: true, 
+    force_update: UPDATE_CONFIG.force_update,
+    message: `MAJ ${UPDATE_CONFIG.force_update ? 'activée' : 'désactivée'}`
+  });
+});
+
+// ROUTE POUR VOIR LA CONFIG ACTUELLE
+app.get('/update-config', (req, res) => {
+  res.json({
+    success: true,
+    config: UPDATE_CONFIG
+  });
+});
+
 async function startServer() {
   try {
     await initializeDatabase();
@@ -1477,6 +1531,11 @@ async function startServer() {
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`Serveur sur port ${PORT}`);
       console.log(`${BOTS.length} bots disponibles`);
+      console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
+      console.log('🔧 Pour activer/désactiver MAJ:');
+      console.log('   - MAJ activée:   GET /update-config/true');
+      console.log('   - MAJ désactivée: GET /update-config/false');
+      console.log('   - Voir config:    GET /update-config');
     });
   } catch (error) {
     console.error('Erreur démarrage:', error);
@@ -1498,33 +1557,4 @@ process.on('SIGINT', () => {
   });
 });
 
-// AJOUTEZ CES LIGNES dans votre serveur, après les autres routes mais avant startServer()
-
-// CONFIG SIMPLE - MODIFIEZ ICI POUR ACTIVER/DÉSACTIVER LA MAJ
-const UPDATE_REQUIRED = true;  // true = MAJ requise, false = pas de MAJ
-
-// Route simple pour vérifier la MAJ
-app.get('/check-update', (req, res) => {
-  console.log('📱 Vérification MAJ demandée');
-  console.log('📱 UPDATE_REQUIRED =', UPDATE_REQUIRED);
-  
-  res.json({
-    needs_update: UPDATE_REQUIRED,
-    message: UPDATE_REQUIRED ? "Mise à jour requise" : "Version à jour",
-    update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
-  });
-});
-
-// Route pour changer l'état (simple, pas de sécurité pour test)
-app.get('/set-update/:status', (req, res) => {
-  const status = req.params.status === 'true';
-  UPDATE_REQUIRED = status;
-  console.log('✅ MAJ changée à:', UPDATE_REQUIRED);
-  res.json({ success: true, needs_update: UPDATE_REQUIRED });
-});
-
 startServer();
-
-
-
-
