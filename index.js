@@ -1513,7 +1513,7 @@ const APP_CONFIG = {
   latest_version: "1.2.0",
   
   // Lien Play Store (à personnaliser)
-  update_url: "https://play.google.com/store/apps/details?id=votre.app.id"
+  update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
 };
 
 // Route pour vérifier la mise à jour (AJOUTEZ CETTE ROUTE)
@@ -1621,5 +1621,6 @@ app.get('/admin/get-update-config', (req, res) => {
 // ==============================================================
 
 startServer();
+
 
 
