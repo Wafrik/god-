@@ -1498,129 +1498,33 @@ process.on('SIGINT', () => {
   });
 });
 
-// AJOUTEZ CETTE PARTIE DANS VOTRE SERVEUR (vers la fin du fichier)
-// ==============================================================
+// AJOUTEZ CES LIGNES dans votre serveur, après les autres routes mais avant startServer()
 
-// CONFIGURATION SIMPLE DE MISE À JOUR
-const APP_CONFIG = {
-  // Mettez "true" pour forcer la mise à jour, "false" pour laisser passer
-  force_update: true,
-  
-  // Version minimale requise (à adapter)
-  min_version: "1.1.0",
-  
-  // Version actuelle disponible
-  latest_version: "1.2.0",
-  
-  // Lien Play Store (à personnaliser)
-  update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
-};
+// CONFIG SIMPLE - MODIFIEZ ICI POUR ACTIVER/DÉSACTIVER LA MAJ
+const UPDATE_REQUIRED = true;  // true = MAJ requise, false = pas de MAJ
 
-// Route pour vérifier la mise à jour (AJOUTEZ CETTE ROUTE)
-app.post('/check-update', express.json(), async (req, res) => {
-  try {
-    const { app_version } = req.body;
-    
-    console.log(`📱 Vérification MAJ: version client = ${app_version}`);
-    console.log(`📱 Configuration: force_update = ${APP_CONFIG.force_update}`);
-    
-    // Si force_update est à true, on force la mise à jour
-    if (APP_CONFIG.force_update) {
-      console.log('⚠️ MAJ FORCÉE activée');
-      return res.json({
-        needs_update: true,
-        message: "Mise à jour requise",
-        min_version: APP_CONFIG.min_version,
-        latest_version: APP_CONFIG.latest_version,
-        update_url: APP_CONFIG.update_url
-      });
-    }
-    
-    // Sinon, comparaison simple des versions
-    let needs_update = false;
-    
-    if (app_version && APP_CONFIG.min_version) {
-      // Convertir en nombres pour comparaison simple (1.0.0 -> 100)
-      const clientNum = parseInt(app_version.replace(/\./g, ''));
-      const minNum = parseInt(APP_CONFIG.min_version.replace(/\./g, ''));
-      
-      if (clientNum < minNum) {
-        needs_update = true;
-      }
-    }
-    
-    console.log(`📱 Résultat: needs_update = ${needs_update}`);
-    
-    res.json({
-      needs_update: needs_update,
-      message: needs_update ? "Mise à jour requise" : "Version à jour",
-      min_version: APP_CONFIG.min_version,
-      latest_version: APP_CONFIG.latest_version,
-      update_url: APP_CONFIG.update_url
-    });
-    
-  } catch (error) {
-    console.error('Erreur vérification MAJ:', error);
-    res.status(500).json({
-      needs_update: false,
-      message: "Erreur vérification"
-    });
-  }
-});
-
-// Route pour modifier la configuration (optionnel - protégée par clé admin)
-app.post('/admin/set-update-config', express.json(), async (req, res) => {
-  try {
-    const { admin_key, force_update, min_version, latest_version, update_url } = req.body;
-    
-    if (admin_key !== ADMIN_KEY) {
-      return res.status(403).json({ success: false, message: "Clé admin invalide" });
-    }
-    
-    // Mettre à jour la configuration
-    if (force_update !== undefined) {
-      APP_CONFIG.force_update = force_update === true;
-    }
-    if (min_version) {
-      APP_CONFIG.min_version = min_version;
-    }
-    if (latest_version) {
-      APP_CONFIG.latest_version = latest_version;
-    }
-    if (update_url) {
-      APP_CONFIG.update_url = update_url;
-    }
-    
-    console.log('✅ Configuration MAJ mise à jour:', APP_CONFIG);
-    
-    res.json({
-      success: true,
-      message: "Configuration mise à jour",
-      config: APP_CONFIG
-    });
-    
-  } catch (error) {
-    console.error('Erreur mise à jour config:', error);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// Route pour voir la config actuelle (optionnel)
-app.get('/admin/get-update-config', (req, res) => {
-  const { admin_key } = req.query;
-  
-  if (admin_key !== ADMIN_KEY) {
-    return res.status(403).json({ success: false, message: "Clé admin invalide" });
-  }
+// Route simple pour vérifier la MAJ
+app.get('/check-update', (req, res) => {
+  console.log('📱 Vérification MAJ demandée');
+  console.log('📱 UPDATE_REQUIRED =', UPDATE_REQUIRED);
   
   res.json({
-    success: true,
-    config: APP_CONFIG
+    needs_update: UPDATE_REQUIRED,
+    message: UPDATE_REQUIRED ? "Mise à jour requise" : "Version à jour",
+    update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
   });
 });
-// ==============================================================
+
+// Route pour changer l'état (simple, pas de sécurité pour test)
+app.get('/set-update/:status', (req, res) => {
+  const status = req.params.status === 'true';
+  UPDATE_REQUIRED = status;
+  console.log('✅ MAJ changée à:', UPDATE_REQUIRED);
+  res.json({ success: true, needs_update: UPDATE_REQUIRED });
+});
 
 startServer();
+
 
 
 
