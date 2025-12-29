@@ -1504,7 +1504,7 @@ process.on('SIGINT', () => {
 // CONFIGURATION SIMPLE DE MISE À JOUR
 const APP_CONFIG = {
   // Mettez "true" pour forcer la mise à jour, "false" pour laisser passer
-  force_update: false,
+  force_update: true,
   
   // Version minimale requise (à adapter)
   min_version: "1.1.0",
@@ -1621,4 +1621,5 @@ app.get('/admin/get-update-config', (req, res) => {
 // ==============================================================
 
 startServer();
+
 
