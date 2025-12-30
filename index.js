@@ -25,7 +25,7 @@ const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 
 // CONFIGURATION MAJ - MODIFIEZ ICI
 const UPDATE_CONFIG = {
-  force_update: false,  // true = MAJ requise, false = pas de MAJ
+  force_update: true,  // true = MAJ requise, false = pas de MAJ
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
@@ -1558,4 +1558,5 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
