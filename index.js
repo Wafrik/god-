@@ -31,6 +31,10 @@ const UPDATE_CONFIG = {
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
 };
 
+// TIMER ANTI-TRICHE POUR BOTS
+const BOT_MATCH_TIMERS = new Map(); // Map: playerNumber -> { timeout, botId, startTime }
+const BOT_MATCH_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
 const ADMIN_CONNECTIONS = new Map();
@@ -97,6 +101,58 @@ function getRandomBot() {
   const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
   const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
   return { ...randomBot, score: botScore, is_bot: true };
+}
+
+// FONCTION POUR LANCER UN TIMER ANTI-TRICHE
+function startBotMatchTimer(playerNumber, botId) {
+  // Nettoyer tout timer existant pour ce joueur
+  if (BOT_MATCH_TIMERS.has(playerNumber)) {
+    clearTimeout(BOT_MATCH_TIMERS.get(playerNumber).timeout);
+  }
+  
+  const startTime = Date.now();
+  const timeout = setTimeout(async () => {
+    console.log(`⏰ TIMER ANTI-TRICHE déclenché pour ${playerNumber} contre ${botId}`);
+    
+    try {
+      // Appliquer pénalité de -250 points
+      const player = await db.getUserByNumber(playerNumber);
+      if (player) {
+        const newScore = Math.max(0, player.score - 250);
+        await db.updateUserScore(playerNumber, newScore);
+        
+        console.log(`⚡ Pénalité appliquée: ${player.username} (-250 points) pour déconnexion vs bot`);
+        console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+        
+        // Envoyer notification si joueur reconnecté
+        const ws = PLAYER_CONNECTIONS.get(playerNumber);
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'cheat_penalty',
+            message: 'Pénalité de -250 points pour déconnexion pendant match contre bot',
+            new_score: newScore
+          }));
+        }
+      }
+    } catch (error) {
+      console.error('Erreur application pénalité anti-triche:', error);
+    } finally {
+      BOT_MATCH_TIMERS.delete(playerNumber);
+    }
+  }, BOT_MATCH_TIMEOUT);
+  
+  BOT_MATCH_TIMERS.set(playerNumber, { timeout, botId, startTime });
+  console.log(`⏰ Timer anti-triche démarré pour ${playerNumber} (5 minutes)`);
+}
+
+// FONCTION POUR ARRÊTER LE TIMER QUAND LA PARTIE EST FINIE
+function stopBotMatchTimer(playerNumber) {
+  if (BOT_MATCH_TIMERS.has(playerNumber)) {
+    const timerInfo = BOT_MATCH_TIMERS.get(playerNumber);
+    clearTimeout(timerInfo.timeout);
+    BOT_MATCH_TIMERS.delete(playerNumber);
+    console.log(`✅ Timer anti-triche arrêté pour ${playerNumber}`);
+  }
 }
 
 async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
@@ -1424,6 +1480,9 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
+    // ARRÊTER LE TIMER ANTI-TRICHE CAR LA PARTIE EST FINIE
+    stopBotMatchTimer(playerNumber);
+    
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
     
@@ -1453,6 +1512,60 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
         is_draw: true
       });
     }
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// NOUVELLE ROUTE POUR DÉMARRER UN MATCH CONTRE BOT
+app.post('/start-bot-match', express.json(), async (req, res) => {
+  try {
+    const { playerNumber, botId } = req.body;
+    
+    if (!playerNumber || !botId) {
+      return res.status(400).json({ success: false, message: "Données manquantes" });
+    }
+    
+    // DÉMARRER LE TIMER ANTI-TRICHE
+    startBotMatchTimer(playerNumber, botId);
+    
+    res.json({ 
+      success: true, 
+      message: "Match contre bot démarré - Timer anti-triche activé"
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// ROUTE POUR VÉRIFIER LES TIMERS ACTIFS (ADMIN)
+app.get('/active-bot-timers', (req, res) => {
+  try {
+    const activeTimers = [];
+    const now = Date.now();
+    
+    for (const [playerNumber, timerInfo] of BOT_MATCH_TIMERS.entries()) {
+      const elapsed = now - timerInfo.startTime;
+      const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
+      const remainingMinutes = Math.floor(remaining / 60000);
+      const remainingSeconds = Math.floor((remaining % 60000) / 1000);
+      
+      activeTimers.push({
+        playerNumber,
+        botId: timerInfo.botId,
+        startTime: new Date(timerInfo.startTime).toISOString(),
+        elapsedMs: elapsed,
+        remainingMs: remaining,
+        remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`
+      });
+    }
+    
+    res.json({
+      success: true,
+      activeTimers: activeTimers,
+      count: activeTimers.length,
+      timeoutDuration: BOT_MATCH_TIMEOUT
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
@@ -1492,6 +1605,8 @@ app.get('/health', (req, res) => {
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
     high_score_threshold: HIGH_SCORE_THRESHOLD,
+    active_bot_timers: BOT_MATCH_TIMERS.size,
+    bot_match_timeout: BOT_MATCH_TIMEOUT,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1531,11 +1646,13 @@ async function startServer() {
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`Serveur sur port ${PORT}`);
       console.log(`${BOTS.length} bots disponibles`);
+      console.log('⏰ Système anti-triche activé: -250 points pour déconnexion vs bot (5 min timeout)');
       console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
       console.log('🔧 Pour activer/désactiver MAJ:');
       console.log('   - MAJ activée:   GET /update-config/true');
       console.log('   - MAJ désactivée: GET /update-config/false');
       console.log('   - Voir config:    GET /update-config');
+      console.log('🔍 Voir timers anti-triche: GET /active-bot-timers');
     });
   } catch (error) {
     console.error('Erreur démarrage:', error);
@@ -1545,6 +1662,13 @@ async function startServer() {
 
 process.on('SIGTERM', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
+  
+  // Nettoyer tous les timers anti-triche
+  for (const timerInfo of BOT_MATCH_TIMERS.values()) {
+    clearTimeout(timerInfo.timeout);
+  }
+  BOT_MATCH_TIMERS.clear();
+  
   server.close(() => {
     process.exit(0);
   });
@@ -1552,12 +1676,16 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
+  
+  // Nettoyer tous les timers anti-triche
+  for (const timerInfo of BOT_MATCH_TIMERS.values()) {
+    clearTimeout(timerInfo.timeout);
+  }
+  BOT_MATCH_TIMERS.clear();
+  
   server.close(() => {
     process.exit(0);
   });
 });
 
 startServer();
-
-
-
