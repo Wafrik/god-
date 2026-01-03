@@ -22,9 +22,17 @@ const PORT = process.env.PORT || 8000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
-const DISCONNECT_PENALTY = 250; // Pénalité pour abandon vs bot
+const DISCONNECT_PENALTY = 250;
 
-// CONFIGURATION MAJ
+// SYSTEME D'INACTIVITE
+const HEARTBEAT_TIMEOUT = 30 * 1000; // 30 secondes d'inactivité
+const HEARTBEAT_CHECK_INTERVAL = 10 * 1000; // Vérifier toutes les 10 secondes
+const INACTIVITY_PENALTY = 250; // Pénalité pour inactivité
+
+// Suivi des heartbeats
+const PLAYER_HEARTBEATS = new Map();
+let heartbeatCheckInterval = null;
+
 const UPDATE_CONFIG = {
   force_update: false,
   min_version: "1.1.0",
@@ -93,6 +101,77 @@ const generateDeviceKey = (ip, deviceId) => {
   }
   return `${ip}_${deviceId}`;
 };
+
+// FONCTIONS HEARTBEAT
+function recordHeartbeat(playerNumber) {
+    PLAYER_HEARTBEATS.set(playerNumber, Date.now());
+}
+
+function checkInactivePlayers() {
+    const now = Date.now();
+    
+    for (const [playerNumber, lastHeartbeat] of PLAYER_HEARTBEATS.entries()) {
+        const inactiveTime = now - lastHeartbeat;
+        
+        if (inactiveTime > HEARTBEAT_TIMEOUT) {
+            console.log(`⚠️ Joueur ${playerNumber} inactif depuis ${Math.round(inactiveTime/1000)}s - Pénalité d'inactivité`);
+            
+            penalizeInactivePlayer(playerNumber);
+            
+            PLAYER_HEARTBEATS.delete(playerNumber);
+        }
+    }
+}
+
+async function penalizeInactivePlayer(playerNumber) {
+    try {
+        const player = await db.getUserByNumber(playerNumber);
+        if (!player) return;
+        
+        const newScore = Math.max(0, player.score - INACTIVITY_PENALTY);
+        await db.updateUserScore(playerNumber, newScore);
+        
+        console.log(`⚡ Pénalité inactivité: ${player.username} (-${INACTIVITY_PENALTY} points)`);
+        console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+        
+        const gameId = PLAYER_TO_GAME.get(playerNumber);
+        if (gameId) {
+            const game = ACTIVE_GAMES.get(gameId);
+            if (game) {
+                const playerObj = game.getPlayerByNumber(playerNumber);
+                if (playerObj) {
+                    game.broadcast({ 
+                        type: 'player_inactive', 
+                        message: `${player.username} a été déclaré perdant pour inactivité` 
+                    });
+                    
+                    const opponent = game.players.find(p => p.number !== playerNumber);
+                    if (opponent) {
+                        game.broadcast({ 
+                            type: 'game_end', 
+                            data: { 
+                                scores: game.scores, 
+                                winner: opponent.role,
+                                reason: 'inactivity'
+                            } 
+                        });
+                        
+                        setTimeout(() => game.cleanup(), 3000);
+                    }
+                }
+            }
+        }
+        
+        PLAYER_CONNECTIONS.delete(playerNumber);
+        PLAYER_QUEUE.delete(playerNumber);
+        PLAYER_TO_GAME.delete(playerNumber);
+        
+        return { success: true, newScore };
+    } catch (error) {
+        console.error('Erreur pénalité inactivité:', error);
+        return { success: false };
+    }
+}
 
 function getRandomBot() {
   const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
@@ -876,7 +955,10 @@ class Game {
 
   cleanup() {
     if (this.timerInterval) clearInterval(this.timerInterval);
-    this.players.forEach(p => PLAYER_TO_GAME.delete(p.number));
+    this.players.forEach(p => {
+      PLAYER_TO_GAME.delete(p.number);
+      PLAYER_HEARTBEATS.delete(p.number);
+    });
     ACTIVE_GAMES.delete(this.id);
   }
 
@@ -927,6 +1009,7 @@ wss.on('connection', (ws, req) => {
         if (disconnectedNumber) {
           PLAYER_CONNECTIONS.delete(disconnectedNumber);
           PLAYER_QUEUE.delete(disconnectedNumber);
+          PLAYER_HEARTBEATS.delete(disconnectedNumber);
           
           await db.setUserOnlineStatus(disconnectedNumber, false);
           
@@ -1169,8 +1252,23 @@ async function handleAdminMessage(ws, message, adminId) {
 
 async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
+  const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+  
+  if (playerNumber && message.type !== 'heartbeat') {
+      recordHeartbeat(playerNumber);
+  }
   
   const handlers = {
+    heartbeat: async () => {
+      if (playerNumber) {
+          recordHeartbeat(playerNumber);
+          ws.send(JSON.stringify({ 
+              type: 'heartbeat_ack',
+              timestamp: Date.now()
+          }));
+      }
+    },
+
     check_update: async () => {
       console.log('📱 Vérification MAJ demandée');
       console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
@@ -1210,6 +1308,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         PLAYER_CONNECTIONS.set(message.number, ws);
         await db.setUserOnlineStatus(message.number, true);
         
+        recordHeartbeat(message.number);
+        
         ws.send(JSON.stringify({ 
           type: 'auth_success', 
           username: user.username, 
@@ -1240,6 +1340,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         PLAYER_CONNECTIONS.set(number, ws);
         
+        recordHeartbeat(number);
+        
         ws.send(JSON.stringify({ 
           type: 'register_success', 
           message: "Inscription réussie", 
@@ -1259,6 +1361,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         PLAYER_CONNECTIONS.delete(playerNumber);
         PLAYER_QUEUE.delete(playerNumber);
+        PLAYER_HEARTBEATS.delete(playerNumber);
         
         await db.setUserOnlineStatus(playerNumber, false);
         
@@ -1286,6 +1389,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             TRUSTED_DEVICES.set(deviceKey, user.number);
             await db.createTrustedDevice(deviceKey, user.number);
           }
+          
+          recordHeartbeat(user.number);
           
           ws.send(JSON.stringify({ 
             type: 'auto_login_success', 
@@ -1321,6 +1426,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             await db.updateUserToken(user.number, newToken);
             user.token = newToken;
           }
+          
+          recordHeartbeat(trustedNumber);
           
           ws.send(JSON.stringify({ 
             type: 'auto_login_success', 
@@ -1398,6 +1505,8 @@ function handleGameAction(ws, message, deviceKey) {
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
   if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non identifié' }));
   
+  recordHeartbeat(playerNumber);
+  
   const game = ACTIVE_GAMES.get(PLAYER_TO_GAME.get(playerNumber));
   if (!game) return ws.send(JSON.stringify({ type: 'error', message: 'Aucune partie active' }));
   
@@ -1466,7 +1575,6 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
   }
 });
 
-// NOUVELLE ROUTE : Envoyer défaite par abandon
 app.post('/report-disconnect', express.json(), async (req, res) => {
   try {
     const { playerNumber, botId } = req.body;
@@ -1477,7 +1585,6 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
     
     console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre bot ${botId || 'inconnu'}`);
     
-    // Appliquer la pénalité d'abandon
     const penaltyResult = await db.applyDisconnectPenalty(playerNumber);
     
     if (penaltyResult.success) {
@@ -1530,6 +1637,7 @@ app.get('/health', (req, res) => {
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
     disconnect_penalty: DISCONNECT_PENALTY,
+    heartbeat_timeout: HEARTBEAT_TIMEOUT,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1558,6 +1666,7 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
+    heartbeatCheckInterval = setInterval(checkInactivePlayers, HEARTBEAT_CHECK_INTERVAL);
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
     setTimeout(() => {
@@ -1568,10 +1677,8 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`=========================================`);
-      console.log(`🎯 Système simplifié activé`);
-      console.log(`📍 Pénalité abandon vs bot: -${DISCONNECT_PENALTY} points`);
-      console.log(`📍 Route abandon: POST /report-disconnect`);
+      console.log(`💓 Système heartbeat activé (${HEARTBEAT_TIMEOUT/1000}s timeout)`);
+      console.log(`📍 Pénalité inactivité: -${INACTIVITY_PENALTY} points`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -1581,6 +1688,7 @@ async function startServer() {
 }
 
 process.on('SIGTERM', () => {
+  if (heartbeatCheckInterval) clearInterval(heartbeatCheckInterval);
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
@@ -1588,6 +1696,7 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
+  if (heartbeatCheckInterval) clearInterval(heartbeatCheckInterval);
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
