@@ -25,19 +25,19 @@ const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 
 // CONFIGURATION MAJ - MODIFIEZ ICI
 const UPDATE_CONFIG = {
-  force_update: false,  // true = MAJ requise, false = pas de MAJ
+  force_update: false,
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
 };
 
-// SYSTÈME ANTI-TRICHE SIMPLIFIÉ
-const BOT_MATCH_TIMERS = new Map(); // Map: playerNumber -> { timeout, botId, startTime }
+// SYSTÈME ANTI-TRICHE AMÉLIORÉ
+const BOT_MATCH_TRACKER = new Map(); // Map: matchId -> { playerNumber, botId, startTime, timeout, status }
 const BOT_MATCH_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+const CHEAT_PENALTY = 250; // Points à retirer
 
-// MAP POUR SUIVRE LES BOTS ATTRIBUÉS
-const PLAYER_CURRENT_BOT = new Map(); // Map: playerNumber -> botId
-
+// MAPS POUR LES RELATIONS
+const PLAYER_TO_MATCH = new Map(); // playerNumber -> matchId (pour retrouver rapidement)
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
 const ADMIN_CONNECTIONS = new Map();
@@ -106,86 +106,155 @@ function getRandomBot() {
   return { ...randomBot, score: botScore, is_bot: true };
 }
 
-// FONCTION SIMPLIFIÉE POUR LANCER UN TIMER ANTI-TRICHE
-function startBotMatchTimer(playerNumber, botId) {
-  // Nettoyer tout timer existant pour ce joueur
-  if (BOT_MATCH_TIMERS.has(playerNumber)) {
-    clearTimeout(BOT_MATCH_TIMERS.get(playerNumber).timeout);
-    console.log(`⏰ [ANTI-TRICHE] Ancien timer supprimé pour ${playerNumber}`);
-  }
-  
+// CRÉER UN NOUVEAU MATCH CONTRE BOT AVEC TRACKING
+function createBotMatch(playerNumber) {
+  const bot = getRandomBot();
+  const matchId = `bot_match_${generateId()}`;
   const startTime = Date.now();
-  console.log(`⏰ [ANTI-TRICHE] Nouveau timer démarré pour ${playerNumber} contre ${botId}`);
+  
+  console.log(`🎮 [BOT MATCH] Création match ${matchId}`);
+  console.log(`   Joueur: ${playerNumber}, Bot: ${bot.username} (${bot.id})`);
   
   const timeout = setTimeout(async () => {
-    console.log(`⏰ [ANTI-TRICHE] Timer déclenché pour ${playerNumber} (5 minutes écoulées)`);
+    console.log(`⏰ [ANTI-TRICHE] Timer expiré pour ${matchId}`);
     
     try {
-      // Appliquer pénalité de -250 points
+      const match = BOT_MATCH_TRACKER.get(matchId);
+      if (!match || match.status !== 'active') {
+        console.log(`[ANTI-TRICHE] Match ${matchId} déjà traité`);
+        return;
+      }
+      
+      // Marquer comme expiré
+      match.status = 'expired';
+      
       const player = await db.getUserByNumber(playerNumber);
       if (player) {
-        const newScore = Math.max(0, player.score - 250);
+        const newScore = Math.max(0, player.score - CHEAT_PENALTY);
         await db.updateUserScore(playerNumber, newScore);
         
-        console.log(`⚡ [PÉNALITÉ] ${player.username} (-250 points) - Aucun résultat reçu dans les 5 minutes`);
+        console.log(`⚡ [PÉNALITÉ] ${player.username} (-${CHEAT_PENALTY} points)`);
         console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+        console.log(`   Raison: Aucun résultat reçu pour match vs ${match.botId}`);
         
-        // Envoyer notification si joueur est connecté
+        // Envoyer notification si joueur connecté
         const ws = PLAYER_CONNECTIONS.get(playerNumber);
         if (ws?.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: 'cheat_penalty',
-            message: 'Pénalité de -250 points pour non-envoi des résultats dans les 5 minutes',
-            new_score: newScore
+            message: `Pénalité de -${CHEAT_PENALTY} points - Match vs bot non terminé`,
+            new_score: newScore,
+            match_id: matchId
           }));
         }
-        
-        // Nettoyer la référence au bot
-        PLAYER_CURRENT_BOT.delete(playerNumber);
       } else {
-        console.log(`[ANTI-TRICHE] Joueur ${playerNumber} non trouvé en base`);
+        console.log(`[ANTI-TRICHE] Joueur ${playerNumber} non trouvé`);
       }
     } catch (error) {
-      console.error('[ANTI-TRICHE] Erreur application pénalité:', error);
+      console.error('[ANTI-TRICHE] Erreur:', error);
     } finally {
-      BOT_MATCH_TIMERS.delete(playerNumber);
+      // Nettoyer après traitement
+      cleanupBotMatch(matchId);
     }
   }, BOT_MATCH_TIMEOUT);
   
-  BOT_MATCH_TIMERS.set(playerNumber, { timeout, botId, startTime });
-  // Stocker le bot attribué au joueur
-  PLAYER_CURRENT_BOT.set(playerNumber, botId);
+  // Stocker les informations du match
+  const matchInfo = {
+    matchId,
+    playerNumber,
+    botId: bot.id,
+    botUsername: bot.username,
+    startTime,
+    timeout,
+    status: 'active',
+    penaltyApplied: false
+  };
+  
+  BOT_MATCH_TRACKER.set(matchId, matchInfo);
+  PLAYER_TO_MATCH.set(playerNumber, matchId);
+  
+  console.log(`✅ [BOT MATCH] Match ${matchId} créé avec timer de 5 minutes`);
+  
+  return {
+    matchId,
+    bot,
+    warning: `Vous avez 5 minutes pour terminer le match. Pénalité: -${CHEAT_PENALTY} points si abandon.`
+  };
 }
 
-// FONCTION POUR ARRÊTER LE TIMER QUAND LES RÉSULTATS SONT REÇUS
-function stopBotMatchTimer(playerNumber) {
-  if (BOT_MATCH_TIMERS.has(playerNumber)) {
-    const timerInfo = BOT_MATCH_TIMERS.get(playerNumber);
-    clearTimeout(timerInfo.timeout);
-    BOT_MATCH_TIMERS.delete(playerNumber);
-    PLAYER_CURRENT_BOT.delete(playerNumber);
-    console.log(`✅ [ANTI-TRICHE] Timer arrêté pour ${playerNumber} - Résultats reçus`);
+// TERMINER UN MATCH CONTRE BOT (quand les résultats arrivent)
+function completeBotMatch(playerNumber, botId) {
+  const matchId = PLAYER_TO_MATCH.get(playerNumber);
+  
+  if (!matchId) {
+    console.log(`[BOT MATCH] Aucun match actif trouvé pour ${playerNumber}`);
+    return false;
+  }
+  
+  const match = BOT_MATCH_TRACKER.get(matchId);
+  if (!match) {
+    console.log(`[BOT MATCH] Match ${matchId} non trouvé`);
+    PLAYER_TO_MATCH.delete(playerNumber);
+    return false;
+  }
+  
+  // Vérifier que c'est le bon bot
+  if (match.botId !== botId) {
+    console.log(`[BOT MATCH] Bot mismatch: ${botId} vs ${match.botId}`);
+    return false;
+  }
+  
+  // Annuler le timer
+  clearTimeout(match.timeout);
+  match.status = 'completed';
+  match.completedAt = Date.now();
+  
+  console.log(`✅ [BOT MATCH] Match ${matchId} terminé avec succès`);
+  console.log(`   Joueur: ${playerNumber}, Bot: ${match.botUsername}`);
+  console.log(`   Durée: ${Math.round((match.completedAt - match.startTime) / 1000)} secondes`);
+  
+  // Nettoyer
+  cleanupBotMatch(matchId);
+  
+  return true;
+}
+
+// NETTOYER UN MATCH
+function cleanupBotMatch(matchId) {
+  const match = BOT_MATCH_TRACKER.get(matchId);
+  if (match) {
+    // Retirer la référence joueur->match
+    PLAYER_TO_MATCH.delete(match.playerNumber);
+    // Retirer le match du tracker
+    BOT_MATCH_TRACKER.delete(matchId);
+    console.log(`🧹 [BOT MATCH] Match ${matchId} nettoyé`);
   }
 }
 
-// VÉRIFIER SI UN TIMER EST ACTIF POUR UN JOUEUR
-function hasActiveBotTimer(playerNumber) {
-  return BOT_MATCH_TIMERS.has(playerNumber);
+// NETTOYER LES ANCIENS MATCHS (pour maintenance)
+function cleanupExpiredMatches() {
+  const now = Date.now();
+  let cleaned = 0;
+  
+  for (const [matchId, match] of BOT_MATCH_TRACKER.entries()) {
+    if (match.status === 'expired' || (now - match.startTime > BOT_MATCH_TIMEOUT + 60000)) {
+      cleanupBotMatch(matchId);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`🧹 [MAINTENANCE] ${cleaned} anciens matchs nettoyés`);
+  }
 }
 
-// MODIFIÉ : Fonction qui renvoie un bot et démarre automatiquement le timer
-function getRandomBotForPlayer(playerNumber) {
-  const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
-  const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
-  const bot = { ...randomBot, score: botScore, is_bot: true };
+// VÉRIFIER SI UN JOUEUR A UN MATCH ACTIF
+function hasActiveBotMatch(playerNumber) {
+  const matchId = PLAYER_TO_MATCH.get(playerNumber);
+  if (!matchId) return false;
   
-  // DÉMARRER LE TIMER ANTI-TRICHE AUTOMATIQUEMENT
-  startBotMatchTimer(playerNumber, bot.id);
-  
-  console.log(`🤖 [BOT] Bot ${bot.username} (${bot.id}) attribué à ${playerNumber}`);
-  console.log(`⏰ [ANTI-TRICHE] Timer automatiquement démarré (5 minutes)`);
-  
-  return bot;
+  const match = BOT_MATCH_TRACKER.get(matchId);
+  return match && match.status === 'active';
 }
 
 async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
@@ -303,9 +372,6 @@ const db = {
 
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
     try {
-      // ARRÊTER LE TIMER ANTI-TRICHE CAR LES RÉSULTATS SONT REÇUS
-      stopBotMatchTimer(playerNumber);
-      
       // Si c'est un match nul, aucun changement de score
       if (isDraw) {
         console.log(`[BOT MATCH] Match nul - Aucun changement de score pour ${playerNumber}`);
@@ -1499,7 +1565,7 @@ function handleGameAction(ws, message, deviceKey) {
   actions[message.type]?.();
 }
 
-// MODIFIÉ : Route qui renvoie un bot et démarre automatiquement le timer anti-triche
+// ROUTE PRINCIPALE POUR DEMANDER UN BOT (avec tracking automatique)
 app.get('/get-bot/:playerNumber', (req, res) => {
   try {
     const { playerNumber } = req.params;
@@ -1511,28 +1577,25 @@ app.get('/get-bot/:playerNumber', (req, res) => {
       });
     }
     
-    // Vérifier si le joueur existe
-    db.getUserByNumber(playerNumber).then(user => {
-      if (!user) {
-        return res.status(404).json({ 
-          success: false, 
-          message: "Joueur non trouvé" 
-        });
-      }
-      
-      // Récupérer un bot et démarrer le timer automatiquement
-      const bot = getRandomBotForPlayer(playerNumber);
-      
-      res.json({ 
-        success: true, 
-        bot: bot,
-        warning: "Timer anti-triche activé - Vous avez 5 minutes pour envoyer les résultats",
-        timer_duration: "5 minutes",
-        penalty: "-250 points si aucun résultat reçu"
+    // Vérifier si le joueur a déjà un match actif
+    if (hasActiveBotMatch(playerNumber)) {
+      return res.status(400).json({
+        success: false,
+        message: "Vous avez déjà un match contre bot en cours",
+        warning: "Terminez votre match actuel avant d'en commencer un nouveau"
       });
-    }).catch(error => {
-      console.error('Erreur vérification joueur:', error);
-      res.status(500).json({ success: false, message: "Erreur serveur" });
+    }
+    
+    // Créer un nouveau match avec tracking
+    const match = createBotMatch(playerNumber);
+    
+    res.json({ 
+      success: true, 
+      bot: match.bot,
+      matchId: match.matchId,
+      warning: match.warning,
+      timer_duration: "5 minutes",
+      penalty: `-${CHEAT_PENALTY} points si abandon`
     });
     
   } catch (error) {
@@ -1541,20 +1604,21 @@ app.get('/get-bot/:playerNumber', (req, res) => {
   }
 });
 
-// Ancienne route (conservée pour compatibilité)
+// Ancienne route (sans tracking)
 app.get('/get-bot', (req, res) => {
   try {
     const bot = getRandomBot();
     res.json({ 
       success: true, 
       bot: bot,
-      note: "Utilisez /get-bot/:playerNumber pour activer le timer anti-triche"
+      warning: "Utilisez /get-bot/:playerNumber pour activer le système anti-triche"
     });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
 
+// ROUTE POUR ENVOYER LES RÉSULTATS D'UN MATCH CONTRE BOT
 app.post('/update-bot-match', express.json(), async (req, res) => {
   try {
     const { playerNumber, botId, playerScore, botScore, isPlayerWin } = req.body;
@@ -1563,15 +1627,21 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    console.log(`[BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
+    console.log(`🎯 [BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
     console.log(`   Score joueur: ${playerScore}, Score bot: ${botScore}, Victoire joueur: ${isPlayerWin}`);
     
-    // ARRÊTER LE TIMER ANTI-TRICHE CAR LES RÉSULTATS SONT REÇUS
-    stopBotMatchTimer(playerNumber);
+    // TERMINER LE MATCH DANS LE TRACKER (arrêter le timer)
+    const matchCompleted = completeBotMatch(playerNumber, botId);
+    
+    if (!matchCompleted) {
+      console.log(`[BOT MATCH] Aucun match actif trouvé pour ${playerNumber} vs ${botId}`);
+      // Continuer quand même avec la mise à jour des scores
+    }
     
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
     
+    // Mettre à jour le score du joueur
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin, isDraw);
     
     // Si c'est un match nul, le bot ne gagne ni ne perd de points
@@ -1585,7 +1655,8 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
         res.json({ 
           success: true, 
           message: "Scores mis à jour",
-          is_draw: isDraw
+          is_draw: isDraw,
+          penalty_avoided: matchCompleted ? "OUI - Match correctement terminé" : "NON - Match non tracké"
         });
       } else {
         res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
@@ -1595,7 +1666,8 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       res.json({ 
         success: true, 
         message: "Match nul - Aucun changement de score",
-        is_draw: true
+        is_draw: true,
+        penalty_avoided: matchCompleted ? "OUI" : "NON"
       });
     }
   } catch (error) {
@@ -1603,36 +1675,141 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
   }
 });
 
-// ROUTE POUR VÉRIFIER LES TIMERS ACTIFS (ADMIN)
-app.get('/active-bot-timers', (req, res) => {
+// ROUTE POUR VÉRIFIER LES MATCHS ACTIFS (ADMIN)
+app.get('/active-bot-matches', (req, res) => {
   try {
-    const activeTimers = [];
+    const activeMatches = [];
     const now = Date.now();
     
-    for (const [playerNumber, timerInfo] of BOT_MATCH_TIMERS.entries()) {
-      const elapsed = now - timerInfo.startTime;
+    for (const [matchId, match] of BOT_MATCH_TRACKER.entries()) {
+      const elapsed = now - match.startTime;
       const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
       const remainingMinutes = Math.floor(remaining / 60000);
       const remainingSeconds = Math.floor((remaining % 60000) / 1000);
       
-      activeTimers.push({
-        playerNumber,
-        botId: timerInfo.botId,
-        startTime: new Date(timerInfo.startTime).toISOString(),
+      activeMatches.push({
+        matchId,
+        playerNumber: match.playerNumber,
+        botId: match.botId,
+        botUsername: match.botUsername,
+        startTime: new Date(match.startTime).toISOString(),
         elapsedMs: elapsed,
         remainingMs: remaining,
         remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
-        status: remaining > 0 ? "Actif" : "Expiré",
-        penalty_pending: remaining <= 0 ? "OUI (-250 points)" : "Non"
+        status: match.status,
+        penalty_pending: match.status === 'active' && remaining <= 0 ? "OUI (-250 points)" : "Non"
       });
     }
     
     res.json({
       success: true,
-      activeTimers: activeTimers,
-      count: activeTimers.length,
+      activeMatches: activeMatches,
+      count: activeMatches.length,
       timeoutDuration: BOT_MATCH_TIMEOUT,
-      message: `${activeTimers.length} timers anti-triche actifs`
+      penalty_amount: CHEAT_PENALTY,
+      message: `${activeMatches.length} matchs contre bots trackés`
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// ROUTE POUR VÉRIFIER UN JOUEUR SPÉCIFIQUE
+app.get('/check-player-match/:playerNumber', async (req, res) => {
+  try {
+    const { playerNumber } = req.params;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const hasActiveMatch = hasActiveBotMatch(playerNumber);
+    let matchInfo = null;
+    
+    if (hasActiveMatch) {
+      const matchId = PLAYER_TO_MATCH.get(playerNumber);
+      const match = BOT_MATCH_TRACKER.get(matchId);
+      
+      if (match) {
+        const now = Date.now();
+        const elapsed = now - match.startTime;
+        const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
+        const remainingMinutes = Math.floor(remaining / 60000);
+        const remainingSeconds = Math.floor((remaining % 60000) / 1000);
+        
+        matchInfo = {
+          matchId: match.matchId,
+          botId: match.botId,
+          botUsername: match.botUsername,
+          startTime: new Date(match.startTime).toISOString(),
+          elapsedMs: elapsed,
+          remainingMs: remaining,
+          remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
+          status: match.status,
+          penalty_warning: remaining <= 0 ? `IMMINENT: -${CHEAT_PENALTY} points` : `Si expire: -${CHEAT_PENALTY} points`
+        };
+      }
+    }
+    
+    res.json({
+      success: true,
+      playerNumber: playerNumber,
+      hasActiveMatch: hasActiveMatch,
+      matchInfo: matchInfo,
+      message: hasActiveMatch ? 
+        `Match actif contre ${matchInfo.botUsername} - ${matchInfo.remainingFormatted} restant` : 
+        "Aucun match actif"
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// ROUTE POUR FORCER LA PÉNALITÉ (ADMIN)
+app.post('/force-penalty/:playerNumber', express.json(), async (req, res) => {
+  try {
+    const { playerNumber } = req.params;
+    const { admin_key, reason } = req.body;
+    
+    if (admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const player = await db.getUserByNumber(playerNumber);
+    if (!player) {
+      return res.status(404).json({ success: false, message: "Joueur non trouvé" });
+    }
+    
+    const newScore = Math.max(0, player.score - CHEAT_PENALTY);
+    await db.updateUserScore(playerNumber, newScore);
+    
+    // Nettoyer tout match actif
+    const matchId = PLAYER_TO_MATCH.get(playerNumber);
+    if (matchId) {
+      const match = BOT_MATCH_TRACKER.get(matchId);
+      if (match && match.timeout) {
+        clearTimeout(match.timeout);
+      }
+      cleanupBotMatch(matchId);
+    }
+    
+    console.log(`⚡ [ADMIN] Pénalité forcée pour ${player.username}: -${CHEAT_PENALTY} points`);
+    console.log(`   Raison: ${reason || "Administrateur"}`);
+    console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+    
+    res.json({
+      success: true,
+      player: player.username,
+      playerNumber: playerNumber,
+      old_score: player.score,
+      new_score: newScore,
+      penalty: CHEAT_PENALTY,
+      reason: reason || "Administrateur",
+      message: `Pénalité appliquée: -${CHEAT_PENALTY} points`
     });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
@@ -1668,109 +1845,14 @@ app.post('/force-bot-increment', express.json(), async (req, res) => {
   }
 });
 
-// ROUTE POUR VÉRIFIER SI UN JOUEUR A UN TIMER ACTIF
-app.get('/check-bot-timer/:playerNumber', async (req, res) => {
-  try {
-    const { playerNumber } = req.params;
-    
-    if (!playerNumber) {
-      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
-    }
-    
-    const hasTimer = hasActiveBotTimer(playerNumber);
-    let timerInfo = null;
-    
-    if (hasTimer) {
-      const timer = BOT_MATCH_TIMERS.get(playerNumber);
-      const now = Date.now();
-      const elapsed = now - timer.startTime;
-      const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
-      const remainingMinutes = Math.floor(remaining / 60000);
-      const remainingSeconds = Math.floor((remaining % 60000) / 1000);
-      
-      timerInfo = {
-        botId: timer.botId,
-        startTime: new Date(timer.startTime).toISOString(),
-        elapsedMs: elapsed,
-        remainingMs: remaining,
-        remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
-        penalty_warning: "Si timer expire: -250 points"
-      };
-    }
-    
-    res.json({
-      success: true,
-      hasActiveTimer: hasTimer,
-      timerInfo: timerInfo,
-      message: hasTimer ? `Timer actif - ${timerInfo.remainingFormatted} restant` : "Aucun timer actif"
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// ROUTE POUR VOIR LE BOT ACTUEL D'UN JOUEUR
-app.get('/current-bot/:playerNumber', (req, res) => {
-  try {
-    const { playerNumber } = req.params;
-    
-    if (!playerNumber) {
-      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
-    }
-    
-    const botId = PLAYER_CURRENT_BOT.get(playerNumber);
-    const hasTimer = BOT_MATCH_TIMERS.has(playerNumber);
-    
-    if (botId) {
-      const bot = BOTS.find(b => b.id === botId) || { id: botId, username: "Bot inconnu" };
-      const timerInfo = BOT_MATCH_TIMERS.get(playerNumber);
-      
-      let timerData = null;
-      if (timerInfo) {
-        const now = Date.now();
-        const elapsed = now - timerInfo.startTime;
-        const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
-        const remainingMinutes = Math.floor(remaining / 60000);
-        const remainingSeconds = Math.floor((remaining % 60000) / 1000);
-        
-        timerData = {
-          remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
-          elapsedMs: elapsed,
-          remainingMs: remaining
-        };
-      }
-      
-      res.json({
-        success: true,
-        playerNumber: playerNumber,
-        currentBot: bot,
-        hasActiveTimer: hasTimer,
-        timerInfo: timerData,
-        message: `Joueur en match contre ${bot.username}`
-      });
-    } else {
-      res.json({
-        success: true,
-        playerNumber: playerNumber,
-        currentBot: null,
-        hasActiveTimer: false,
-        message: "Aucun match contre bot en cours"
-      });
-    }
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
-    high_score_threshold: HIGH_SCORE_THRESHOLD,
-    active_bot_timers: BOT_MATCH_TIMERS.size,
-    active_bot_matches: PLAYER_CURRENT_BOT.size,
+    active_bot_matches: BOT_MATCH_TRACKER.size,
     bot_match_timeout: BOT_MATCH_TIMEOUT,
+    cheat_penalty: CHEAT_PENALTY,
     anti_cheat_enabled: true,
     timestamp: new Date().toISOString() 
   });
@@ -1804,29 +1886,30 @@ async function startServer() {
     
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
+    // Nettoyer les anciens matchs toutes les 10 minutes
+    setInterval(cleanupExpiredMatches, 10 * 60 * 1000);
+    
     setTimeout(() => {
       incrementBotScoresAutomatically();
     }, 60 * 1000);
     
     server.listen(PORT, '0.0.0.0', () => {
-      console.log(`=========================================`);
+      console.log(`=================================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`=========================================`);
-      console.log(`⏰ SYSTÈME ANTI-TRICHE AUTOMATIQUE ACTIVÉ`);
-      console.log(`   📍 Fonctionnement:`);
-      console.log(`   1. GET /get-bot/:playerNumber → Bot + Timer auto`);
-      console.log(`   2. Timer 5 minutes démarre automatiquement`);
-      console.log(`   3. POST /update-bot-match → Résultats reçus`);
-      console.log(`   4. Si aucun résultat en 5 min → -250 points`);
-      console.log(`=========================================`);
-      console.log(`📱 Configuration MAJ:`, UPDATE_CONFIG.force_update ? 'MAJ FORCÉE' : 'NORMAL');
-      console.log(`🔧 Commandes utiles:`);
-      console.log(`   - Voir timers: GET /active-bot-timers`);
-      console.log(`   - Vérifier joueur: GET /check-bot-timer/:playerNumber`);
-      console.log(`   - Bot actuel: GET /current-bot/:playerNumber`);
-      console.log(`   - MAJ: GET /update-config/true ou /false`);
-      console.log(`=========================================`);
+      console.log(`=================================================`);
+      console.log(`🎯 SYSTÈME ANTI-TRICHE ULTIME ACTIVÉ`);
+      console.log(`📍 Fonctionnement:`);
+      console.log(`   1. GET /get-bot/:playerNumber → Crée match + Timer`);
+      console.log(`   2. Timer 5 minutes démarre IMMÉDIATEMENT`);
+      console.log(`   3. POST /update-bot-match → Arrête timer`);
+      console.log(`   4. Si AUCUN résultat en 5 min → -${CHEAT_PENALTY} points AUTOMATIQUE`);
+      console.log(`=================================================`);
+      console.log(`🔍 Monitoring:`);
+      console.log(`   - Voir matchs: GET /active-bot-matches`);
+      console.log(`   - Vérifier joueur: GET /check-player-match/:playerNumber`);
+      console.log(`   - Forcer pénalité: POST /force-penalty/:playerNumber (admin)`);
+      console.log(`=================================================`);
     });
   } catch (error) {
     console.error('❌ Erreur démarrage:', error);
@@ -1837,12 +1920,12 @@ async function startServer() {
 process.on('SIGTERM', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   
-  // Nettoyer tous les timers anti-triche
-  for (const timerInfo of BOT_MATCH_TIMERS.values()) {
-    clearTimeout(timerInfo.timeout);
+  // Nettoyer tous les timers
+  for (const match of BOT_MATCH_TRACKER.values()) {
+    if (match.timeout) clearTimeout(match.timeout);
   }
-  BOT_MATCH_TIMERS.clear();
-  PLAYER_CURRENT_BOT.clear();
+  BOT_MATCH_TRACKER.clear();
+  PLAYER_TO_MATCH.clear();
   
   server.close(() => {
     process.exit(0);
@@ -1852,12 +1935,12 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   
-  // Nettoyer tous les timers anti-triche
-  for (const timerInfo of BOT_MATCH_TIMERS.values()) {
-    clearTimeout(timerInfo.timeout);
+  // Nettoyer tous les timers
+  for (const match of BOT_MATCH_TRACKER.values()) {
+    if (match.timeout) clearTimeout(match.timeout);
   }
-  BOT_MATCH_TIMERS.clear();
-  PLAYER_CURRENT_BOT.clear();
+  BOT_MATCH_TRACKER.clear();
+  PLAYER_TO_MATCH.clear();
   
   server.close(() => {
     process.exit(0);
