@@ -22,8 +22,9 @@ const PORT = process.env.PORT || 8000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
+const DISCONNECT_PENALTY = 250; // Pénalité pour abandon vs bot
 
-// CONFIGURATION MAJ - MODIFIEZ ICI
+// CONFIGURATION MAJ
 const UPDATE_CONFIG = {
   force_update: false,
   min_version: "1.1.0",
@@ -31,13 +32,6 @@ const UPDATE_CONFIG = {
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
 };
 
-// SYSTÈME ANTI-TRICHE AMÉLIORÉ
-const BOT_MATCH_TRACKER = new Map(); // Map: matchId -> { playerNumber, botId, startTime, timeout, status }
-const BOT_MATCH_TIMEOUT = 5 * 60 * 1000; // 5 minutes
-const CHEAT_PENALTY = 250; // Points à retirer
-
-// MAPS POUR LES RELATIONS
-const PLAYER_TO_MATCH = new Map(); // playerNumber -> matchId (pour retrouver rapidement)
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
 const ADMIN_CONNECTIONS = new Map();
@@ -104,157 +98,6 @@ function getRandomBot() {
   const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
   const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
   return { ...randomBot, score: botScore, is_bot: true };
-}
-
-// CRÉER UN NOUVEAU MATCH CONTRE BOT AVEC TRACKING
-function createBotMatch(playerNumber) {
-  const bot = getRandomBot();
-  const matchId = `bot_match_${generateId()}`;
-  const startTime = Date.now();
-  
-  console.log(`🎮 [BOT MATCH] Création match ${matchId}`);
-  console.log(`   Joueur: ${playerNumber}, Bot: ${bot.username} (${bot.id})`);
-  
-  const timeout = setTimeout(async () => {
-    console.log(`⏰ [ANTI-TRICHE] Timer expiré pour ${matchId}`);
-    
-    try {
-      const match = BOT_MATCH_TRACKER.get(matchId);
-      if (!match || match.status !== 'active') {
-        console.log(`[ANTI-TRICHE] Match ${matchId} déjà traité`);
-        return;
-      }
-      
-      // Marquer comme expiré
-      match.status = 'expired';
-      
-      const player = await db.getUserByNumber(playerNumber);
-      if (player) {
-        const newScore = Math.max(0, player.score - CHEAT_PENALTY);
-        await db.updateUserScore(playerNumber, newScore);
-        
-        console.log(`⚡ [PÉNALITÉ] ${player.username} (-${CHEAT_PENALTY} points)`);
-        console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
-        console.log(`   Raison: Aucun résultat reçu pour match vs ${match.botId}`);
-        
-        // Envoyer notification si joueur connecté
-        const ws = PLAYER_CONNECTIONS.get(playerNumber);
-        if (ws?.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: 'cheat_penalty',
-            message: `Pénalité de -${CHEAT_PENALTY} points - Match vs bot non terminé`,
-            new_score: newScore,
-            match_id: matchId
-          }));
-        }
-      } else {
-        console.log(`[ANTI-TRICHE] Joueur ${playerNumber} non trouvé`);
-      }
-    } catch (error) {
-      console.error('[ANTI-TRICHE] Erreur:', error);
-    } finally {
-      // Nettoyer après traitement
-      cleanupBotMatch(matchId);
-    }
-  }, BOT_MATCH_TIMEOUT);
-  
-  // Stocker les informations du match
-  const matchInfo = {
-    matchId,
-    playerNumber,
-    botId: bot.id,
-    botUsername: bot.username,
-    startTime,
-    timeout,
-    status: 'active',
-    penaltyApplied: false
-  };
-  
-  BOT_MATCH_TRACKER.set(matchId, matchInfo);
-  PLAYER_TO_MATCH.set(playerNumber, matchId);
-  
-  console.log(`✅ [BOT MATCH] Match ${matchId} créé avec timer de 5 minutes`);
-  
-  return {
-    matchId,
-    bot,
-    warning: `Vous avez 5 minutes pour terminer le match. Pénalité: -${CHEAT_PENALTY} points si abandon.`
-  };
-}
-
-// TERMINER UN MATCH CONTRE BOT (quand les résultats arrivent)
-function completeBotMatch(playerNumber, botId) {
-  const matchId = PLAYER_TO_MATCH.get(playerNumber);
-  
-  if (!matchId) {
-    console.log(`[BOT MATCH] Aucun match actif trouvé pour ${playerNumber}`);
-    return false;
-  }
-  
-  const match = BOT_MATCH_TRACKER.get(matchId);
-  if (!match) {
-    console.log(`[BOT MATCH] Match ${matchId} non trouvé`);
-    PLAYER_TO_MATCH.delete(playerNumber);
-    return false;
-  }
-  
-  // Vérifier que c'est le bon bot
-  if (match.botId !== botId) {
-    console.log(`[BOT MATCH] Bot mismatch: ${botId} vs ${match.botId}`);
-    return false;
-  }
-  
-  // Annuler le timer
-  clearTimeout(match.timeout);
-  match.status = 'completed';
-  match.completedAt = Date.now();
-  
-  console.log(`✅ [BOT MATCH] Match ${matchId} terminé avec succès`);
-  console.log(`   Joueur: ${playerNumber}, Bot: ${match.botUsername}`);
-  console.log(`   Durée: ${Math.round((match.completedAt - match.startTime) / 1000)} secondes`);
-  
-  // Nettoyer
-  cleanupBotMatch(matchId);
-  
-  return true;
-}
-
-// NETTOYER UN MATCH
-function cleanupBotMatch(matchId) {
-  const match = BOT_MATCH_TRACKER.get(matchId);
-  if (match) {
-    // Retirer la référence joueur->match
-    PLAYER_TO_MATCH.delete(match.playerNumber);
-    // Retirer le match du tracker
-    BOT_MATCH_TRACKER.delete(matchId);
-    console.log(`🧹 [BOT MATCH] Match ${matchId} nettoyé`);
-  }
-}
-
-// NETTOYER LES ANCIENS MATCHS (pour maintenance)
-function cleanupExpiredMatches() {
-  const now = Date.now();
-  let cleaned = 0;
-  
-  for (const [matchId, match] of BOT_MATCH_TRACKER.entries()) {
-    if (match.status === 'expired' || (now - match.startTime > BOT_MATCH_TIMEOUT + 60000)) {
-      cleanupBotMatch(matchId);
-      cleaned++;
-    }
-  }
-  
-  if (cleaned > 0) {
-    console.log(`🧹 [MAINTENANCE] ${cleaned} anciens matchs nettoyés`);
-  }
-}
-
-// VÉRIFIER SI UN JOUEUR A UN MATCH ACTIF
-function hasActiveBotMatch(playerNumber) {
-  const matchId = PLAYER_TO_MATCH.get(playerNumber);
-  if (!matchId) return false;
-  
-  const match = BOT_MATCH_TRACKER.get(matchId);
-  return match && match.status === 'active';
 }
 
 async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
@@ -356,6 +199,23 @@ const db = {
     );
   },
 
+  async applyDisconnectPenalty(number) {
+    try {
+      const player = await this.getUserByNumber(number);
+      if (player) {
+        const newScore = Math.max(0, player.score - DISCONNECT_PENALTY);
+        await this.updateUserScore(number, newScore);
+        console.log(`⚡ Pénalité abandon: ${player.username} (-${DISCONNECT_PENALTY} points)`);
+        console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+        return { success: true, newScore };
+      }
+      return { success: false };
+    } catch (error) {
+      console.error('Erreur pénalité abandon:', error);
+      return { success: false };
+    }
+  },
+
   async setUserOnlineStatus(number, online) {
     await pool.query(
       'UPDATE users SET online = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
@@ -372,7 +232,6 @@ const db = {
 
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
     try {
-      // Si c'est un match nul, aucun changement de score
       if (isDraw) {
         console.log(`[BOT MATCH] Match nul - Aucun changement de score pour ${playerNumber}`);
         return true;
@@ -570,7 +429,6 @@ const db = {
 
   async getFullListWithBots() {
     try {
-      // Récupérer tous les joueurs
       const playersResult = await pool.query(`
         SELECT number as id, username, score, age, number, 
                created_at, online, false as is_bot,
@@ -579,7 +437,6 @@ const db = {
         WHERE score >= 0 
       `);
       
-      // Récupérer tous les bots
       const botsResult = await pool.query(`
         SELECT bs.bot_id as id, b.username, bs.score, 
                'bot' as number, 0 as age, 
@@ -590,10 +447,8 @@ const db = {
         LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
       `).catch(() => ({ rows: [] }));
       
-      // Combiner les résultats
       const combinedList = [];
       
-      // Ajouter les joueurs
       playersResult.rows.forEach(player => {
         combinedList.push({
           id: player.id,
@@ -608,7 +463,6 @@ const db = {
         });
       });
       
-      // Ajouter les bots
       botsResult.rows.forEach(bot => {
         combinedList.push({
           id: bot.id,
@@ -623,10 +477,8 @@ const db = {
         });
       });
       
-      // Trier par score décroissant
       combinedList.sort((a, b) => b.score - a.score);
       
-      // Réassigner les rangs après le tri combiné
       combinedList.forEach((item, index) => {
         item.rank = index + 1;
       });
@@ -661,7 +513,6 @@ const db = {
         [newScore, botId]
       );
       
-      // Mettre à jour en mémoire
       BOT_SCORES.set(botId, newScore);
       
       return { 
@@ -990,7 +841,6 @@ class Game {
 
   async _updatePlayerScores(winner) {
     try {
-      // Si match nul, aucun changement de score
       if (winner === 'draw') {
         console.log('Match nul - Aucun changement de score');
         return;
@@ -1321,12 +1171,10 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   
   const handlers = {
-    // AJOUTEZ CE HANDLER POUR LA MAJ
     check_update: async () => {
       console.log('📱 Vérification MAJ demandée');
       console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
       
-      // SIMPLE: Si force_update est true, on force la MAJ
       if (UPDATE_CONFIG.force_update) {
         console.log('⚠️ MAJ FORCÉE activée - Envoi réponse MAJ requise');
         ws.send(JSON.stringify({
@@ -1565,60 +1413,16 @@ function handleGameAction(ws, message, deviceKey) {
   actions[message.type]?.();
 }
 
-// ROUTE PRINCIPALE POUR DEMANDER UN BOT (avec tracking automatique)
-app.get('/get-bot/:playerNumber', (req, res) => {
-  try {
-    const { playerNumber } = req.params;
-    
-    if (!playerNumber) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Numéro joueur manquant" 
-      });
-    }
-    
-    // Vérifier si le joueur a déjà un match actif
-    if (hasActiveBotMatch(playerNumber)) {
-      return res.status(400).json({
-        success: false,
-        message: "Vous avez déjà un match contre bot en cours",
-        warning: "Terminez votre match actuel avant d'en commencer un nouveau"
-      });
-    }
-    
-    // Créer un nouveau match avec tracking
-    const match = createBotMatch(playerNumber);
-    
-    res.json({ 
-      success: true, 
-      bot: match.bot,
-      matchId: match.matchId,
-      warning: match.warning,
-      timer_duration: "5 minutes",
-      penalty: `-${CHEAT_PENALTY} points si abandon`
-    });
-    
-  } catch (error) {
-    console.error('Erreur route get-bot:', error);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// Ancienne route (sans tracking)
+// ROUTES API
 app.get('/get-bot', (req, res) => {
   try {
     const bot = getRandomBot();
-    res.json({ 
-      success: true, 
-      bot: bot,
-      warning: "Utilisez /get-bot/:playerNumber pour activer le système anti-triche"
-    });
+    res.json({ success: true, bot: bot });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
 
-// ROUTE POUR ENVOYER LES RÉSULTATS D'UN MATCH CONTRE BOT
 app.post('/update-bot-match', express.json(), async (req, res) => {
   try {
     const { playerNumber, botId, playerScore, botScore, isPlayerWin } = req.body;
@@ -1627,24 +1431,14 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    console.log(`🎯 [BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
+    console.log(`[BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
     console.log(`   Score joueur: ${playerScore}, Score bot: ${botScore}, Victoire joueur: ${isPlayerWin}`);
-    
-    // TERMINER LE MATCH DANS LE TRACKER (arrêter le timer)
-    const matchCompleted = completeBotMatch(playerNumber, botId);
-    
-    if (!matchCompleted) {
-      console.log(`[BOT MATCH] Aucun match actif trouvé pour ${playerNumber} vs ${botId}`);
-      // Continuer quand même avec la mise à jour des scores
-    }
     
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
     
-    // Mettre à jour le score du joueur
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin, isDraw);
     
-    // Si c'est un match nul, le bot ne gagne ni ne perd de points
     if (!isDraw) {
       const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
       const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
@@ -1655,19 +1449,16 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
         res.json({ 
           success: true, 
           message: "Scores mis à jour",
-          is_draw: isDraw,
-          penalty_avoided: matchCompleted ? "OUI - Match correctement terminé" : "NON - Match non tracké"
+          is_draw: isDraw
         });
       } else {
         res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
       }
     } else {
-      // Match nul - aucun changement de score
       res.json({ 
         success: true, 
         message: "Match nul - Aucun changement de score",
-        is_draw: true,
-        penalty_avoided: matchCompleted ? "OUI" : "NON"
+        is_draw: true
       });
     }
   } catch (error) {
@@ -1675,142 +1466,30 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
   }
 });
 
-// ROUTE POUR VÉRIFIER LES MATCHS ACTIFS (ADMIN)
-app.get('/active-bot-matches', (req, res) => {
+// NOUVELLE ROUTE : Envoyer défaite par abandon
+app.post('/report-disconnect', express.json(), async (req, res) => {
   try {
-    const activeMatches = [];
-    const now = Date.now();
+    const { playerNumber, botId } = req.body;
     
-    for (const [matchId, match] of BOT_MATCH_TRACKER.entries()) {
-      const elapsed = now - match.startTime;
-      const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
-      const remainingMinutes = Math.floor(remaining / 60000);
-      const remainingSeconds = Math.floor((remaining % 60000) / 1000);
-      
-      activeMatches.push({
-        matchId,
-        playerNumber: match.playerNumber,
-        botId: match.botId,
-        botUsername: match.botUsername,
-        startTime: new Date(match.startTime).toISOString(),
-        elapsedMs: elapsed,
-        remainingMs: remaining,
-        remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
-        status: match.status,
-        penalty_pending: match.status === 'active' && remaining <= 0 ? "OUI (-250 points)" : "Non"
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre bot ${botId || 'inconnu'}`);
+    
+    // Appliquer la pénalité d'abandon
+    const penaltyResult = await db.applyDisconnectPenalty(playerNumber);
+    
+    if (penaltyResult.success) {
+      res.json({ 
+        success: true, 
+        message: `Pénalité appliquée: -${DISCONNECT_PENALTY} points`,
+        penalty: DISCONNECT_PENALTY,
+        new_score: penaltyResult.newScore
       });
+    } else {
+      res.status(500).json({ success: false, message: "Erreur application pénalité" });
     }
-    
-    res.json({
-      success: true,
-      activeMatches: activeMatches,
-      count: activeMatches.length,
-      timeoutDuration: BOT_MATCH_TIMEOUT,
-      penalty_amount: CHEAT_PENALTY,
-      message: `${activeMatches.length} matchs contre bots trackés`
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// ROUTE POUR VÉRIFIER UN JOUEUR SPÉCIFIQUE
-app.get('/check-player-match/:playerNumber', async (req, res) => {
-  try {
-    const { playerNumber } = req.params;
-    
-    if (!playerNumber) {
-      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
-    }
-    
-    const hasActiveMatch = hasActiveBotMatch(playerNumber);
-    let matchInfo = null;
-    
-    if (hasActiveMatch) {
-      const matchId = PLAYER_TO_MATCH.get(playerNumber);
-      const match = BOT_MATCH_TRACKER.get(matchId);
-      
-      if (match) {
-        const now = Date.now();
-        const elapsed = now - match.startTime;
-        const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
-        const remainingMinutes = Math.floor(remaining / 60000);
-        const remainingSeconds = Math.floor((remaining % 60000) / 1000);
-        
-        matchInfo = {
-          matchId: match.matchId,
-          botId: match.botId,
-          botUsername: match.botUsername,
-          startTime: new Date(match.startTime).toISOString(),
-          elapsedMs: elapsed,
-          remainingMs: remaining,
-          remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
-          status: match.status,
-          penalty_warning: remaining <= 0 ? `IMMINENT: -${CHEAT_PENALTY} points` : `Si expire: -${CHEAT_PENALTY} points`
-        };
-      }
-    }
-    
-    res.json({
-      success: true,
-      playerNumber: playerNumber,
-      hasActiveMatch: hasActiveMatch,
-      matchInfo: matchInfo,
-      message: hasActiveMatch ? 
-        `Match actif contre ${matchInfo.botUsername} - ${matchInfo.remainingFormatted} restant` : 
-        "Aucun match actif"
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// ROUTE POUR FORCER LA PÉNALITÉ (ADMIN)
-app.post('/force-penalty/:playerNumber', express.json(), async (req, res) => {
-  try {
-    const { playerNumber } = req.params;
-    const { admin_key, reason } = req.body;
-    
-    if (admin_key !== ADMIN_KEY) {
-      return res.status(403).json({ success: false, message: "Clé admin invalide" });
-    }
-    
-    if (!playerNumber) {
-      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
-    }
-    
-    const player = await db.getUserByNumber(playerNumber);
-    if (!player) {
-      return res.status(404).json({ success: false, message: "Joueur non trouvé" });
-    }
-    
-    const newScore = Math.max(0, player.score - CHEAT_PENALTY);
-    await db.updateUserScore(playerNumber, newScore);
-    
-    // Nettoyer tout match actif
-    const matchId = PLAYER_TO_MATCH.get(playerNumber);
-    if (matchId) {
-      const match = BOT_MATCH_TRACKER.get(matchId);
-      if (match && match.timeout) {
-        clearTimeout(match.timeout);
-      }
-      cleanupBotMatch(matchId);
-    }
-    
-    console.log(`⚡ [ADMIN] Pénalité forcée pour ${player.username}: -${CHEAT_PENALTY} points`);
-    console.log(`   Raison: ${reason || "Administrateur"}`);
-    console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
-    
-    res.json({
-      success: true,
-      player: player.username,
-      playerNumber: playerNumber,
-      old_score: player.score,
-      new_score: newScore,
-      penalty: CHEAT_PENALTY,
-      reason: reason || "Administrateur",
-      message: `Pénalité appliquée: -${CHEAT_PENALTY} points`
-    });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
@@ -1850,15 +1529,11 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
-    active_bot_matches: BOT_MATCH_TRACKER.size,
-    bot_match_timeout: BOT_MATCH_TIMEOUT,
-    cheat_penalty: CHEAT_PENALTY,
-    anti_cheat_enabled: true,
+    disconnect_penalty: DISCONNECT_PENALTY,
     timestamp: new Date().toISOString() 
   });
 });
 
-// AJOUTEZ CETTE ROUTE POUR CHANGER LA CONFIG MAJ FACILEMENT
 app.get('/update-config/:status', (req, res) => {
   const status = req.params.status;
   UPDATE_CONFIG.force_update = (status === 'true' || status === '1' || status === 'yes');
@@ -1870,7 +1545,6 @@ app.get('/update-config/:status', (req, res) => {
   });
 });
 
-// ROUTE POUR VOIR LA CONFIG ACTUELLE
 app.get('/update-config', (req, res) => {
   res.json({
     success: true,
@@ -1886,30 +1560,19 @@ async function startServer() {
     
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
-    // Nettoyer les anciens matchs toutes les 10 minutes
-    setInterval(cleanupExpiredMatches, 10 * 60 * 1000);
-    
     setTimeout(() => {
       incrementBotScoresAutomatically();
     }, 60 * 1000);
     
     server.listen(PORT, '0.0.0.0', () => {
-      console.log(`=================================================`);
+      console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`=================================================`);
-      console.log(`🎯 SYSTÈME ANTI-TRICHE ULTIME ACTIVÉ`);
-      console.log(`📍 Fonctionnement:`);
-      console.log(`   1. GET /get-bot/:playerNumber → Crée match + Timer`);
-      console.log(`   2. Timer 5 minutes démarre IMMÉDIATEMENT`);
-      console.log(`   3. POST /update-bot-match → Arrête timer`);
-      console.log(`   4. Si AUCUN résultat en 5 min → -${CHEAT_PENALTY} points AUTOMATIQUE`);
-      console.log(`=================================================`);
-      console.log(`🔍 Monitoring:`);
-      console.log(`   - Voir matchs: GET /active-bot-matches`);
-      console.log(`   - Vérifier joueur: GET /check-player-match/:playerNumber`);
-      console.log(`   - Forcer pénalité: POST /force-penalty/:playerNumber (admin)`);
-      console.log(`=================================================`);
+      console.log(`=========================================`);
+      console.log(`🎯 Système simplifié activé`);
+      console.log(`📍 Pénalité abandon vs bot: -${DISCONNECT_PENALTY} points`);
+      console.log(`📍 Route abandon: POST /report-disconnect`);
+      console.log(`=========================================`);
     });
   } catch (error) {
     console.error('❌ Erreur démarrage:', error);
@@ -1919,14 +1582,6 @@ async function startServer() {
 
 process.on('SIGTERM', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
-  
-  // Nettoyer tous les timers
-  for (const match of BOT_MATCH_TRACKER.values()) {
-    if (match.timeout) clearTimeout(match.timeout);
-  }
-  BOT_MATCH_TRACKER.clear();
-  PLAYER_TO_MATCH.clear();
-  
   server.close(() => {
     process.exit(0);
   });
@@ -1934,14 +1589,6 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
-  
-  // Nettoyer tous les timers
-  for (const match of BOT_MATCH_TRACKER.values()) {
-    if (match.timeout) clearTimeout(match.timeout);
-  }
-  BOT_MATCH_TRACKER.clear();
-  PLAYER_TO_MATCH.clear();
-  
   server.close(() => {
     process.exit(0);
   });
