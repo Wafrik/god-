@@ -31,9 +31,12 @@ const UPDATE_CONFIG = {
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
 };
 
-// TIMER ANTI-TRICHE POUR BOTS
+// SYSTÈME ANTI-TRICHE SIMPLIFIÉ
 const BOT_MATCH_TIMERS = new Map(); // Map: playerNumber -> { timeout, botId, startTime }
 const BOT_MATCH_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+// MAP POUR SUIVRE LES BOTS ATTRIBUÉS
+const PLAYER_CURRENT_BOT = new Map(); // Map: playerNumber -> botId
 
 const TRUSTED_DEVICES = new Map();
 const PLAYER_CONNECTIONS = new Map();
@@ -103,16 +106,19 @@ function getRandomBot() {
   return { ...randomBot, score: botScore, is_bot: true };
 }
 
-// FONCTION POUR LANCER UN TIMER ANTI-TRICHE
+// FONCTION SIMPLIFIÉE POUR LANCER UN TIMER ANTI-TRICHE
 function startBotMatchTimer(playerNumber, botId) {
   // Nettoyer tout timer existant pour ce joueur
   if (BOT_MATCH_TIMERS.has(playerNumber)) {
     clearTimeout(BOT_MATCH_TIMERS.get(playerNumber).timeout);
+    console.log(`⏰ [ANTI-TRICHE] Ancien timer supprimé pour ${playerNumber}`);
   }
   
   const startTime = Date.now();
+  console.log(`⏰ [ANTI-TRICHE] Nouveau timer démarré pour ${playerNumber} contre ${botId}`);
+  
   const timeout = setTimeout(async () => {
-    console.log(`⏰ TIMER ANTI-TRICHE déclenché pour ${playerNumber} contre ${botId}`);
+    console.log(`⏰ [ANTI-TRICHE] Timer déclenché pour ${playerNumber} (5 minutes écoulées)`);
     
     try {
       // Appliquer pénalité de -250 points
@@ -121,38 +127,65 @@ function startBotMatchTimer(playerNumber, botId) {
         const newScore = Math.max(0, player.score - 250);
         await db.updateUserScore(playerNumber, newScore);
         
-        console.log(`⚡ Pénalité appliquée: ${player.username} (-250 points) pour déconnexion vs bot`);
+        console.log(`⚡ [PÉNALITÉ] ${player.username} (-250 points) - Aucun résultat reçu dans les 5 minutes`);
         console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
         
-        // Envoyer notification si joueur reconnecté
+        // Envoyer notification si joueur est connecté
         const ws = PLAYER_CONNECTIONS.get(playerNumber);
         if (ws?.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: 'cheat_penalty',
-            message: 'Pénalité de -250 points pour déconnexion pendant match contre bot',
+            message: 'Pénalité de -250 points pour non-envoi des résultats dans les 5 minutes',
             new_score: newScore
           }));
         }
+        
+        // Nettoyer la référence au bot
+        PLAYER_CURRENT_BOT.delete(playerNumber);
+      } else {
+        console.log(`[ANTI-TRICHE] Joueur ${playerNumber} non trouvé en base`);
       }
     } catch (error) {
-      console.error('Erreur application pénalité anti-triche:', error);
+      console.error('[ANTI-TRICHE] Erreur application pénalité:', error);
     } finally {
       BOT_MATCH_TIMERS.delete(playerNumber);
     }
   }, BOT_MATCH_TIMEOUT);
   
   BOT_MATCH_TIMERS.set(playerNumber, { timeout, botId, startTime });
-  console.log(`⏰ Timer anti-triche démarré pour ${playerNumber} (5 minutes)`);
+  // Stocker le bot attribué au joueur
+  PLAYER_CURRENT_BOT.set(playerNumber, botId);
 }
 
-// FONCTION POUR ARRÊTER LE TIMER QUAND LA PARTIE EST FINIE
+// FONCTION POUR ARRÊTER LE TIMER QUAND LES RÉSULTATS SONT REÇUS
 function stopBotMatchTimer(playerNumber) {
   if (BOT_MATCH_TIMERS.has(playerNumber)) {
     const timerInfo = BOT_MATCH_TIMERS.get(playerNumber);
     clearTimeout(timerInfo.timeout);
     BOT_MATCH_TIMERS.delete(playerNumber);
-    console.log(`✅ Timer anti-triche arrêté pour ${playerNumber}`);
+    PLAYER_CURRENT_BOT.delete(playerNumber);
+    console.log(`✅ [ANTI-TRICHE] Timer arrêté pour ${playerNumber} - Résultats reçus`);
   }
+}
+
+// VÉRIFIER SI UN TIMER EST ACTIF POUR UN JOUEUR
+function hasActiveBotTimer(playerNumber) {
+  return BOT_MATCH_TIMERS.has(playerNumber);
+}
+
+// MODIFIÉ : Fonction qui renvoie un bot et démarre automatiquement le timer
+function getRandomBotForPlayer(playerNumber) {
+  const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
+  const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
+  const bot = { ...randomBot, score: botScore, is_bot: true };
+  
+  // DÉMARRER LE TIMER ANTI-TRICHE AUTOMATIQUEMENT
+  startBotMatchTimer(playerNumber, bot.id);
+  
+  console.log(`🤖 [BOT] Bot ${bot.username} (${bot.id}) attribué à ${playerNumber}`);
+  console.log(`⏰ [ANTI-TRICHE] Timer automatiquement démarré (5 minutes)`);
+  
+  return bot;
 }
 
 async function updateBotScore(botId, currentBotScore, isWin = false, gameScore = 0) {
@@ -270,9 +303,12 @@ const db = {
 
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
     try {
+      // ARRÊTER LE TIMER ANTI-TRICHE CAR LES RÉSULTATS SONT REÇUS
+      stopBotMatchTimer(playerNumber);
+      
       // Si c'est un match nul, aucun changement de score
       if (isDraw) {
-        console.log(`Match nul - Aucun changement de score pour ${playerNumber}`);
+        console.log(`[BOT MATCH] Match nul - Aucun changement de score pour ${playerNumber}`);
         return true;
       }
       
@@ -284,14 +320,14 @@ const db = {
       
       if (isWin) {
         newScore = currentScore + playerGameScore + 200;
-        console.log(`🏆 Victoire ${playerNumber}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
+        console.log(`🏆 [BOT MATCH] Victoire ${playerNumber}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
-          console.log(`🔥 Défaite (≥10k) ${playerNumber}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
+          console.log(`🔥 [BOT MATCH] Défaite (≥10k) ${playerNumber}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
         } else {
           newScore = Math.max(0, currentScore - playerGameScore);
-          console.log(`😢 Défaite (<10k) ${playerNumber}: ${currentScore} - ${playerGameScore} = ${newScore}`);
+          console.log(`😢 [BOT MATCH] Défaite (<10k) ${playerNumber}: ${currentScore} - ${playerGameScore} = ${newScore}`);
         }
       }
       
@@ -515,7 +551,7 @@ const db = {
           rank: bot.rank,
           age: bot.age,
           number: bot.number,
-          created_at: bot.created_at,
+          created_at: bot.createdated_at,
           online: bot.online,
           is_bot: true
         });
@@ -1463,10 +1499,57 @@ function handleGameAction(ws, message, deviceKey) {
   actions[message.type]?.();
 }
 
+// MODIFIÉ : Route qui renvoie un bot et démarre automatiquement le timer anti-triche
+app.get('/get-bot/:playerNumber', (req, res) => {
+  try {
+    const { playerNumber } = req.params;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Numéro joueur manquant" 
+      });
+    }
+    
+    // Vérifier si le joueur existe
+    db.getUserByNumber(playerNumber).then(user => {
+      if (!user) {
+        return res.status(404).json({ 
+          success: false, 
+          message: "Joueur non trouvé" 
+        });
+      }
+      
+      // Récupérer un bot et démarrer le timer automatiquement
+      const bot = getRandomBotForPlayer(playerNumber);
+      
+      res.json({ 
+        success: true, 
+        bot: bot,
+        warning: "Timer anti-triche activé - Vous avez 5 minutes pour envoyer les résultats",
+        timer_duration: "5 minutes",
+        penalty: "-250 points si aucun résultat reçu"
+      });
+    }).catch(error => {
+      console.error('Erreur vérification joueur:', error);
+      res.status(500).json({ success: false, message: "Erreur serveur" });
+    });
+    
+  } catch (error) {
+    console.error('Erreur route get-bot:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// Ancienne route (conservée pour compatibilité)
 app.get('/get-bot', (req, res) => {
   try {
     const bot = getRandomBot();
-    res.json({ success: true, bot: bot });
+    res.json({ 
+      success: true, 
+      bot: bot,
+      note: "Utilisez /get-bot/:playerNumber pour activer le timer anti-triche"
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
@@ -1480,7 +1563,10 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    // ARRÊTER LE TIMER ANTI-TRICHE CAR LA PARTIE EST FINIE
+    console.log(`[BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
+    console.log(`   Score joueur: ${playerScore}, Score bot: ${botScore}, Victoire joueur: ${isPlayerWin}`);
+    
+    // ARRÊTER LE TIMER ANTI-TRICHE CAR LES RÉSULTATS SONT REÇUS
     stopBotMatchTimer(playerNumber);
     
     const isBotWin = !isPlayerWin;
@@ -1517,27 +1603,6 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
   }
 });
 
-// NOUVELLE ROUTE POUR DÉMARRER UN MATCH CONTRE BOT
-app.post('/start-bot-match', express.json(), async (req, res) => {
-  try {
-    const { playerNumber, botId } = req.body;
-    
-    if (!playerNumber || !botId) {
-      return res.status(400).json({ success: false, message: "Données manquantes" });
-    }
-    
-    // DÉMARRER LE TIMER ANTI-TRICHE
-    startBotMatchTimer(playerNumber, botId);
-    
-    res.json({ 
-      success: true, 
-      message: "Match contre bot démarré - Timer anti-triche activé"
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
 // ROUTE POUR VÉRIFIER LES TIMERS ACTIFS (ADMIN)
 app.get('/active-bot-timers', (req, res) => {
   try {
@@ -1556,7 +1621,9 @@ app.get('/active-bot-timers', (req, res) => {
         startTime: new Date(timerInfo.startTime).toISOString(),
         elapsedMs: elapsed,
         remainingMs: remaining,
-        remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`
+        remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
+        status: remaining > 0 ? "Actif" : "Expiré",
+        penalty_pending: remaining <= 0 ? "OUI (-250 points)" : "Non"
       });
     }
     
@@ -1564,7 +1631,8 @@ app.get('/active-bot-timers', (req, res) => {
       success: true,
       activeTimers: activeTimers,
       count: activeTimers.length,
-      timeoutDuration: BOT_MATCH_TIMEOUT
+      timeoutDuration: BOT_MATCH_TIMEOUT,
+      message: `${activeTimers.length} timers anti-triche actifs`
     });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
@@ -1595,6 +1663,101 @@ app.post('/force-bot-increment', express.json(), async (req, res) => {
       message: "Incrément bots effectué"
     });
   } catch (error) {
+    console.error('Erreur force bot increment:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// ROUTE POUR VÉRIFIER SI UN JOUEUR A UN TIMER ACTIF
+app.get('/check-bot-timer/:playerNumber', async (req, res) => {
+  try {
+    const { playerNumber } = req.params;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const hasTimer = hasActiveBotTimer(playerNumber);
+    let timerInfo = null;
+    
+    if (hasTimer) {
+      const timer = BOT_MATCH_TIMERS.get(playerNumber);
+      const now = Date.now();
+      const elapsed = now - timer.startTime;
+      const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
+      const remainingMinutes = Math.floor(remaining / 60000);
+      const remainingSeconds = Math.floor((remaining % 60000) / 1000);
+      
+      timerInfo = {
+        botId: timer.botId,
+        startTime: new Date(timer.startTime).toISOString(),
+        elapsedMs: elapsed,
+        remainingMs: remaining,
+        remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
+        penalty_warning: "Si timer expire: -250 points"
+      };
+    }
+    
+    res.json({
+      success: true,
+      hasActiveTimer: hasTimer,
+      timerInfo: timerInfo,
+      message: hasTimer ? `Timer actif - ${timerInfo.remainingFormatted} restant` : "Aucun timer actif"
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// ROUTE POUR VOIR LE BOT ACTUEL D'UN JOUEUR
+app.get('/current-bot/:playerNumber', (req, res) => {
+  try {
+    const { playerNumber } = req.params;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const botId = PLAYER_CURRENT_BOT.get(playerNumber);
+    const hasTimer = BOT_MATCH_TIMERS.has(playerNumber);
+    
+    if (botId) {
+      const bot = BOTS.find(b => b.id === botId) || { id: botId, username: "Bot inconnu" };
+      const timerInfo = BOT_MATCH_TIMERS.get(playerNumber);
+      
+      let timerData = null;
+      if (timerInfo) {
+        const now = Date.now();
+        const elapsed = now - timerInfo.startTime;
+        const remaining = Math.max(0, BOT_MATCH_TIMEOUT - elapsed);
+        const remainingMinutes = Math.floor(remaining / 60000);
+        const remainingSeconds = Math.floor((remaining % 60000) / 1000);
+        
+        timerData = {
+          remainingFormatted: `${remainingMinutes}m ${remainingSeconds}s`,
+          elapsedMs: elapsed,
+          remainingMs: remaining
+        };
+      }
+      
+      res.json({
+        success: true,
+        playerNumber: playerNumber,
+        currentBot: bot,
+        hasActiveTimer: hasTimer,
+        timerInfo: timerData,
+        message: `Joueur en match contre ${bot.username}`
+      });
+    } else {
+      res.json({
+        success: true,
+        playerNumber: playerNumber,
+        currentBot: null,
+        hasActiveTimer: false,
+        message: "Aucun match contre bot en cours"
+      });
+    }
+  } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1606,7 +1769,9 @@ app.get('/health', (req, res) => {
     total_bots: BOTS.length,
     high_score_threshold: HIGH_SCORE_THRESHOLD,
     active_bot_timers: BOT_MATCH_TIMERS.size,
+    active_bot_matches: PLAYER_CURRENT_BOT.size,
     bot_match_timeout: BOT_MATCH_TIMEOUT,
+    anti_cheat_enabled: true,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1644,18 +1809,27 @@ async function startServer() {
     }, 60 * 1000);
     
     server.listen(PORT, '0.0.0.0', () => {
-      console.log(`Serveur sur port ${PORT}`);
-      console.log(`${BOTS.length} bots disponibles`);
-      console.log('⏰ Système anti-triche activé: -250 points pour déconnexion vs bot (5 min timeout)');
-      console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
-      console.log('🔧 Pour activer/désactiver MAJ:');
-      console.log('   - MAJ activée:   GET /update-config/true');
-      console.log('   - MAJ désactivée: GET /update-config/false');
-      console.log('   - Voir config:    GET /update-config');
-      console.log('🔍 Voir timers anti-triche: GET /active-bot-timers');
+      console.log(`=========================================`);
+      console.log(`✅ Serveur démarré sur port ${PORT}`);
+      console.log(`🤖 ${BOTS.length} bots disponibles`);
+      console.log(`=========================================`);
+      console.log(`⏰ SYSTÈME ANTI-TRICHE AUTOMATIQUE ACTIVÉ`);
+      console.log(`   📍 Fonctionnement:`);
+      console.log(`   1. GET /get-bot/:playerNumber → Bot + Timer auto`);
+      console.log(`   2. Timer 5 minutes démarre automatiquement`);
+      console.log(`   3. POST /update-bot-match → Résultats reçus`);
+      console.log(`   4. Si aucun résultat en 5 min → -250 points`);
+      console.log(`=========================================`);
+      console.log(`📱 Configuration MAJ:`, UPDATE_CONFIG.force_update ? 'MAJ FORCÉE' : 'NORMAL');
+      console.log(`🔧 Commandes utiles:`);
+      console.log(`   - Voir timers: GET /active-bot-timers`);
+      console.log(`   - Vérifier joueur: GET /check-bot-timer/:playerNumber`);
+      console.log(`   - Bot actuel: GET /current-bot/:playerNumber`);
+      console.log(`   - MAJ: GET /update-config/true ou /false`);
+      console.log(`=========================================`);
     });
   } catch (error) {
-    console.error('Erreur démarrage:', error);
+    console.error('❌ Erreur démarrage:', error);
     process.exit(1);
   }
 }
@@ -1668,6 +1842,7 @@ process.on('SIGTERM', () => {
     clearTimeout(timerInfo.timeout);
   }
   BOT_MATCH_TIMERS.clear();
+  PLAYER_CURRENT_BOT.clear();
   
   server.close(() => {
     process.exit(0);
@@ -1682,6 +1857,7 @@ process.on('SIGINT', () => {
     clearTimeout(timerInfo.timeout);
   }
   BOT_MATCH_TIMERS.clear();
+  PLAYER_CURRENT_BOT.clear();
   
   server.close(() => {
     process.exit(0);
