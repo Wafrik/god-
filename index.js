@@ -24,10 +24,9 @@ const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const DISCONNECT_PENALTY = 250;
 
-// SYSTEME D'INACTIVITE
+// SYSTEME D'INACTIVITE (gardé pour détection mais sans pénalité)
 const HEARTBEAT_TIMEOUT = 30 * 1000; // 30 secondes d'inactivité
 const HEARTBEAT_CHECK_INTERVAL = 10 * 1000; // Vérifier toutes les 10 secondes
-const INACTIVITY_PENALTY = 250; // Pénalité pour inactivité
 
 // Suivi des heartbeats
 const PLAYER_HEARTBEATS = new Map();
@@ -102,7 +101,7 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// FONCTIONS HEARTBEAT
+// FONCTIONS HEARTBEAT (gardées pour détection mais sans pénalité)
 function recordHeartbeat(playerNumber) {
     PLAYER_HEARTBEATS.set(playerNumber, Date.now());
 }
@@ -114,25 +113,21 @@ function checkInactivePlayers() {
         const inactiveTime = now - lastHeartbeat;
         
         if (inactiveTime > HEARTBEAT_TIMEOUT) {
-            console.log(`⚠️ Joueur ${playerNumber} inactif depuis ${Math.round(inactiveTime/1000)}s - Pénalité d'inactivité`);
+            console.log(`⚠️ Joueur ${playerNumber} inactif depuis ${Math.round(inactiveTime/1000)}s - Déconnexion seulement`);
             
-            penalizeInactivePlayer(playerNumber);
+            handleInactivePlayerDisconnect(playerNumber);
             
             PLAYER_HEARTBEATS.delete(playerNumber);
         }
     }
 }
 
-async function penalizeInactivePlayer(playerNumber) {
+async function handleInactivePlayerDisconnect(playerNumber) {
     try {
         const player = await db.getUserByNumber(playerNumber);
         if (!player) return;
         
-        const newScore = Math.max(0, player.score - INACTIVITY_PENALTY);
-        await db.updateUserScore(playerNumber, newScore);
-        
-        console.log(`⚡ Pénalité inactivité: ${player.username} (-${INACTIVITY_PENALTY} points)`);
-        console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+        console.log(`🔌 Déconnexion inactivité: ${player.username}`);
         
         const gameId = PLAYER_TO_GAME.get(playerNumber);
         if (gameId) {
@@ -142,7 +137,7 @@ async function penalizeInactivePlayer(playerNumber) {
                 if (playerObj) {
                     game.broadcast({ 
                         type: 'player_inactive', 
-                        message: `${player.username} a été déclaré perdant pour inactivité` 
+                        message: `${player.username} a été déconnecté pour inactivité` 
                     });
                     
                     const opponent = game.players.find(p => p.number !== playerNumber);
@@ -166,9 +161,11 @@ async function penalizeInactivePlayer(playerNumber) {
         PLAYER_QUEUE.delete(playerNumber);
         PLAYER_TO_GAME.delete(playerNumber);
         
-        return { success: true, newScore };
+        await db.setUserOnlineStatus(playerNumber, false);
+        
+        return { success: true };
     } catch (error) {
-        console.error('Erreur pénalité inactivité:', error);
+        console.error('Erreur gestion inactivité:', error);
         return { success: false };
     }
 }
@@ -1678,7 +1675,8 @@ async function startServer() {
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
       console.log(`💓 Système heartbeat activé (${HEARTBEAT_TIMEOUT/1000}s timeout)`);
-      console.log(`📍 Pénalité inactivité: -${INACTIVITY_PENALTY} points`);
+      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points`);
+      console.log(`📍 Aucune pénalité pour inactivité - déconnexion seulement`);
       console.log(`=========================================`);
     });
   } catch (error) {
