@@ -24,9 +24,10 @@ const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const DISCONNECT_PENALTY = 250;
 
-// SYSTEME D'INACTIVITE (gardé pour détection mais sans pénalité)
+// SYSTEME D'INACTIVITE (détection seulement)
 const HEARTBEAT_TIMEOUT = 30 * 1000; // 30 secondes d'inactivité
 const HEARTBEAT_CHECK_INTERVAL = 10 * 1000; // Vérifier toutes les 10 secondes
+const RECONNECTION_GRACE_PERIOD = 5 * 1000; // Délai réduit à 5 secondes
 
 // Suivi des heartbeats
 const PLAYER_HEARTBEATS = new Map();
@@ -101,7 +102,7 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// FONCTIONS HEARTBEAT (gardées pour détection mais sans pénalité)
+// FONCTIONS HEARTBEAT (détection seulement, pas de pénalité)
 function recordHeartbeat(playerNumber) {
     PLAYER_HEARTBEATS.set(playerNumber, Date.now());
 }
@@ -845,39 +846,58 @@ class Game {
   }
 
   async handlePlayerDisconnect(disconnectedPlayer) {
+    console.log(`🔴 Joueur ${disconnectedPlayer.number} déconnecté pendant la partie ${this.id}`);
+    
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
+    
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
-      remainingPlayer.ws.send(JSON.stringify({ type: 'opponent_left', message: 'Adversaire a quitté la partie' }));
-      setTimeout(() => this._endGameByDisconnect(disconnectedPlayer, remainingPlayer), 10000);
+      console.log(`📢 Annonce à ${remainingPlayer.number} que l'adversaire a quitté`);
+      remainingPlayer.ws.send(JSON.stringify({ 
+        type: 'opponent_left', 
+        message: 'Adversaire a quitté la partie',
+        opponent: disconnectedPlayer.username || disconnectedPlayer.number
+      }));
+      
+      // Appliquer la pénalité immédiatement après 5 secondes (délai déjà géré par le timeout externe)
+      await this._endGameByDisconnect(disconnectedPlayer, remainingPlayer);
     } else {
+      console.log(`🗑️ Nettoyage partie ${this.id} - aucun joueur restant`);
       this.cleanup();
     }
   }
 
   async _endGameByDisconnect(disconnectedPlayer, remainingPlayer) {
-    await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
-    this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
-    setTimeout(() => this.cleanup(), 5000);
-  }
-
-  async _applyDisconnectPenalties(disconnectedPlayer, remainingPlayer) {
-    try {
-      const disconnectedUser = await db.getUserByNumber(disconnectedPlayer.number);
-      const remainingUser = await db.getUserByNumber(remainingPlayer.number);
-      
-      if (disconnectedUser && remainingUser) {
-        const disconnectedScore = this.scores[disconnectedPlayer.role];
-        const remainingScore = this.scores[remainingPlayer.role];
-        
-        const newDisconnectedScore = Math.max(0, disconnectedUser.score - (disconnectedScore > 15 ? disconnectedScore : 15));
-        const newRemainingScore = remainingUser.score + (remainingScore < 15 ? 15 : remainingScore);
-        
-        await db.updateUserScore(disconnectedPlayer.number, newDisconnectedScore);
-        await db.updateUserScore(remainingPlayer.number, newRemainingScore);
+    console.log(`⚡ Application pénalité abandon pour ${disconnectedPlayer.number}`);
+    
+    // Appliquer la pénalité d'abandon standard
+    await db.applyDisconnectPenalty(disconnectedPlayer.number);
+    
+    // Si c'est un match PvP, donner des points au joueur restant
+    if (!disconnectedPlayer.is_bot && !remainingPlayer.is_bot) {
+      try {
+        const remainingUser = await db.getUserByNumber(remainingPlayer.number);
+        if (remainingUser) {
+          const bonus = 100; // Bonus pour victoire par abandon
+          const newScore = remainingUser.score + bonus;
+          await db.updateUserScore(remainingPlayer.number, newScore);
+          console.log(`🎁 Bonus ${bonus} points pour ${remainingPlayer.number} (victoire par abandon)`);
+        }
+      } catch (error) {
+        console.error('Erreur bonus abandon:', error);
       }
-    } catch (error) {
-      console.error('Erreur pénalités déconnexion:', error);
     }
+    
+    this.broadcast({ 
+      type: 'game_end', 
+      data: { 
+        scores: this.scores, 
+        winner: remainingPlayer.role,
+        reason: 'disconnect',
+        disconnectedPlayer: disconnectedPlayer.role
+      } 
+    });
+    
+    setTimeout(() => this.cleanup(), 5000);
   }
 
   endTurn() {
@@ -957,6 +977,7 @@ class Game {
       PLAYER_HEARTBEATS.delete(p.number);
     });
     ACTIVE_GAMES.delete(this.id);
+    console.log(`🧹 Partie ${this.id} nettoyée`);
   }
 
   getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
@@ -996,14 +1017,20 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', async () => {
+    console.log(`🔌 Connexion WebSocket fermée (${deviceId})`);
+    
     if (isAdminConnection && adminId) {
+      console.log(`🔧 Déconnexion admin ${adminId}`);
       ADMIN_CONNECTIONS.delete(adminId);
     } else {
+      // Délai réduit à 5 secondes pour permettre la reconnexion rapide
       setTimeout(async () => {
         const deviceKey = generateDeviceKey(ip, deviceId);
         const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
         
         if (disconnectedNumber) {
+          console.log(`👤 Déconnexion détectée pour joueur ${disconnectedNumber} (après ${RECONNECTION_GRACE_PERIOD/1000}s)`);
+          
           PLAYER_CONNECTIONS.delete(disconnectedNumber);
           PLAYER_QUEUE.delete(disconnectedNumber);
           PLAYER_HEARTBEATS.delete(disconnectedNumber);
@@ -1011,12 +1038,25 @@ wss.on('connection', (ws, req) => {
           await db.setUserOnlineStatus(disconnectedNumber, false);
           
           const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
-          const game = ACTIVE_GAMES.get(gameId);
-          const player = game?.getPlayerByNumber(disconnectedNumber);
-          if (player) await game.handlePlayerDisconnect(player);
+          if (gameId) {
+            console.log(`🎮 Joueur ${disconnectedNumber} était en partie ${gameId}`);
+            const game = ACTIVE_GAMES.get(gameId);
+            if (game) {
+              const player = game.getPlayerByNumber(disconnectedNumber);
+              if (player) {
+                console.log(`⚡ Traitement déconnexion pour partie ${gameId}`);
+                await game.handlePlayerDisconnect(player);
+              }
+            }
+          } else {
+            console.log(`ℹ️ Joueur ${disconnectedNumber} n'était pas en partie`);
+          }
+          
           PLAYER_TO_GAME.delete(disconnectedNumber);
+        } else {
+          console.log(`ℹ️ Aucun joueur associé à ${deviceKey}`);
         }
-      }, 10000);
+      }, RECONNECTION_GRACE_PERIOD); // 5 secondes
     }
   });
 });
@@ -1353,6 +1393,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     logout: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (playerNumber) {
+        console.log(`🚪 Logout manuel pour ${playerNumber}`);
         TRUSTED_DEVICES.delete(deviceKey);
         await db.deleteTrustedDevice(deviceKey);
         
@@ -1634,7 +1675,7 @@ app.get('/health', (req, res) => {
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
     disconnect_penalty: DISCONNECT_PENALTY,
-    heartbeat_timeout: HEARTBEAT_TIMEOUT,
+    reconnect_grace_period: `${RECONNECTION_GRACE_PERIOD/1000} secondes`,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1675,8 +1716,9 @@ async function startServer() {
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
       console.log(`💓 Système heartbeat activé (${HEARTBEAT_TIMEOUT/1000}s timeout)`);
-      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points`);
-      console.log(`📍 Aucune pénalité pour inactivité - déconnexion seulement`);
+      console.log(`⚡ Délai reconnexion: ${RECONNECTION_GRACE_PERIOD/1000}s`);
+      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points (automatique)`);
+      console.log(`📍 Aucune pénalité pour inactivité`);
       console.log(`=========================================`);
     });
   } catch (error) {
