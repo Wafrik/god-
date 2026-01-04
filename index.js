@@ -24,6 +24,15 @@ const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const DISCONNECT_PENALTY = 250;
 
+// SYSTEME HEARTBEAT UNIQUEMENT POUR DÉTECTION DE DÉCONNEXION (SANS PÉNALITÉ D'INACTIVITÉ)
+const HEARTBEAT_TIMEOUT = 60 * 1000; // 60 secondes - juste pour nettoyer les connexions mortes
+const HEARTBEAT_CHECK_INTERVAL = 30 * 1000; // Vérifier toutes les 30 secondes
+// RETIRÉ: const INACTIVITY_PENALTY = 250; // PAS DE PÉNALITÉ POUR INACTIVITÉ
+
+// Suivi des heartbeats (uniquement pour nettoyage, pas pour pénalité)
+const PLAYER_HEARTBEATS = new Map();
+let heartbeatCheckInterval = null;
+
 const UPDATE_CONFIG = {
   force_update: false,
   min_version: "1.1.0",
@@ -92,6 +101,44 @@ const generateDeviceKey = (ip, deviceId) => {
   }
   return `${ip}_${deviceId}`;
 };
+
+// FONCTIONS HEARTBEAT - UNIQUEMENT POUR NETTOYAGE, PAS DE PÉNALITÉ
+function recordHeartbeat(playerNumber) {
+    PLAYER_HEARTBEATS.set(playerNumber, Date.now());
+}
+
+function checkInactiveConnections() {
+    const now = Date.now();
+    
+    for (const [playerNumber, lastHeartbeat] of PLAYER_HEARTBEATS.entries()) {
+        const inactiveTime = now - lastHeartbeat;
+        
+        if (inactiveTime > HEARTBEAT_TIMEOUT) {
+            console.log(`⚠️ Connexion morte détectée pour ${playerNumber} (${Math.round(inactiveTime/1000)}s) - Nettoyage`);
+            
+            // JUSTE NETTOYER LA CONNEXION, PAS DE PÉNALITÉ
+            PLAYER_CONNECTIONS.delete(playerNumber);
+            PLAYER_QUEUE.delete(playerNumber);
+            PLAYER_HEARTBEATS.delete(playerNumber);
+            
+            const gameId = PLAYER_TO_GAME.get(playerNumber);
+            if (gameId) {
+                const game = ACTIVE_GAMES.get(gameId);
+                if (game) {
+                    const player = game.getPlayerByNumber(playerNumber);
+                    if (player) {
+                        // NE PAS APPLIQUER DE PÉNALITÉ, JUSTE NETTOYER
+                        game.cleanup();
+                    }
+                }
+                PLAYER_TO_GAME.delete(playerNumber);
+            }
+            
+            // Mettre le joueur offline dans la DB
+            db.setUserOnlineStatus(playerNumber, false).catch(console.error);
+        }
+    }
+}
 
 function getRandomBot() {
   const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
@@ -771,7 +818,9 @@ class Game {
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
       remainingPlayer.ws.send(JSON.stringify({ type: 'opponent_left', message: 'Adversaire a quitté la partie' }));
-      // APPLIQUER IMMÉDIATEMENT LES PÉNALITÉS
+      
+      // APPLIQUER LA PÉNALITÉ D'ABANDON IMMÉDIATEMENT
+      await db.applyDisconnectPenalty(disconnectedPlayer.number);
       await this._endGameByDisconnect(disconnectedPlayer, remainingPlayer);
     } else {
       this.cleanup();
@@ -779,7 +828,6 @@ class Game {
   }
 
   async _endGameByDisconnect(disconnectedPlayer, remainingPlayer) {
-    // APPLIQUER LES PÉNALITÉS IMMÉDIATEMENT
     await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
     this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
     setTimeout(() => this.cleanup(), 5000);
@@ -923,25 +971,30 @@ wss.on('connection', (ws, req) => {
     if (isAdminConnection && adminId) {
       ADMIN_CONNECTIONS.delete(adminId);
     } else {
-      // PAS DE TIMEOUT - APPLIQUER IMMÉDIATEMENT
+      // APPLIQUER LA PÉNALITÉ D'ABANDON IMMÉDIATEMENT QUAND LA CONNEXION SE FERME
       const deviceKey = generateDeviceKey(ip, deviceId);
       const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
       
       if (disconnectedNumber) {
         PLAYER_CONNECTIONS.delete(disconnectedNumber);
         PLAYER_QUEUE.delete(disconnectedNumber);
+        PLAYER_HEARTBEATS.delete(disconnectedNumber);
         
         await db.setUserOnlineStatus(disconnectedNumber, false);
         
         const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
-        const game = ACTIVE_GAMES.get(gameId);
-        const player = game?.getPlayerByNumber(disconnectedNumber);
-        if (player) {
-          // APPLIQUER LA PÉNALITÉ D'ABANDON IMMÉDIATEMENT
-          await db.applyDisconnectPenalty(disconnectedNumber);
-          await game.handlePlayerDisconnect(player);
+        if (gameId) {
+          const game = ACTIVE_GAMES.get(gameId);
+          if (game) {
+            const player = game.getPlayerByNumber(disconnectedNumber);
+            if (player) {
+              // APPLIQUER LA PÉNALITÉ D'ABANDON
+              await db.applyDisconnectPenalty(disconnectedNumber);
+              await game.handlePlayerDisconnect(player);
+            }
+          }
+          PLAYER_TO_GAME.delete(disconnectedNumber);
         }
-        PLAYER_TO_GAME.delete(disconnectedNumber);
       }
     }
   });
@@ -1177,13 +1230,20 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
   
+  // ENREGISTRER LE HEARTBEAT POUR TOUS LES MESSAGES (même pendant les parties)
+  if (playerNumber) {
+      recordHeartbeat(playerNumber);
+  }
+  
   const handlers = {
     heartbeat: async () => {
-      // Heartbeat gardé uniquement pour maintenir la connexion, sans pénalité
-      ws.send(JSON.stringify({ 
-        type: 'heartbeat_ack',
-        timestamp: Date.now()
-      }));
+      if (playerNumber) {
+          recordHeartbeat(playerNumber);
+          ws.send(JSON.stringify({ 
+              type: 'heartbeat_ack',
+              timestamp: Date.now()
+          }));
+      }
     },
 
     check_update: async () => {
@@ -1225,6 +1285,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         PLAYER_CONNECTIONS.set(message.number, ws);
         await db.setUserOnlineStatus(message.number, true);
         
+        recordHeartbeat(message.number);
+        
         ws.send(JSON.stringify({ 
           type: 'auth_success', 
           username: user.username, 
@@ -1255,6 +1317,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         PLAYER_CONNECTIONS.set(number, ws);
         
+        recordHeartbeat(number);
+        
         ws.send(JSON.stringify({ 
           type: 'register_success', 
           message: "Inscription réussie", 
@@ -1274,6 +1338,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         PLAYER_CONNECTIONS.delete(playerNumber);
         PLAYER_QUEUE.delete(playerNumber);
+        PLAYER_HEARTBEATS.delete(playerNumber);
         
         await db.setUserOnlineStatus(playerNumber, false);
         
@@ -1305,6 +1370,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             TRUSTED_DEVICES.set(deviceKey, user.number);
             await db.createTrustedDevice(deviceKey, user.number);
           }
+          
+          recordHeartbeat(user.number);
           
           ws.send(JSON.stringify({ 
             type: 'auto_login_success', 
@@ -1340,6 +1407,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             await db.updateUserToken(user.number, newToken);
             user.token = newToken;
           }
+          
+          recordHeartbeat(trustedNumber);
           
           ws.send(JSON.stringify({ 
             type: 'auto_login_success', 
@@ -1416,6 +1485,9 @@ async function createGameLobby(playerNumbers) {
 function handleGameAction(ws, message, deviceKey) {
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
   if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non identifié' }));
+  
+  // ENREGISTRER LE HEARTBEAT POUR LES ACTIONS DE JEU AUSSI
+  recordHeartbeat(playerNumber);
   
   const game = ACTIVE_GAMES.get(PLAYER_TO_GAME.get(playerNumber));
   if (!game) return ws.send(JSON.stringify({ type: 'error', message: 'Aucune partie active' }));
@@ -1575,10 +1647,10 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
-    // Démarrage de l'incrémentation automatique des bots (3 heures)
+    // Heartbeat uniquement pour nettoyer les connexions mortes (pas de pénalité)
+    heartbeatCheckInterval = setInterval(checkInactiveConnections, HEARTBEAT_CHECK_INTERVAL);
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
-    // Premier incrément après 1 minute
     setTimeout(() => {
       incrementBotScoresAutomatically();
     }, 60 * 1000);
@@ -1587,9 +1659,9 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points (appliquée immédiatement)`);
-      console.log(`💡 Note: Les pénalités d'inactivité côté serveur ont été retirées`);
-      console.log(`💡 Les pénalités d'abandon sont appliquées immédiatement`);
+      console.log(`⚡ Système de pénalité: Abandon uniquement (-${DISCONNECT_PENALTY} points)`);
+      console.log(`💡 PAS de pénalité pour inactivité pendant les parties`);
+      console.log(`💡 Pénalité appliquée immédiatement quand connexion fermée`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -1599,6 +1671,7 @@ async function startServer() {
 }
 
 process.on('SIGTERM', () => {
+  if (heartbeatCheckInterval) clearInterval(heartbeatCheckInterval);
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
@@ -1606,6 +1679,7 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
+  if (heartbeatCheckInterval) clearInterval(heartbeatCheckInterval);
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
