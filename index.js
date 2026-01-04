@@ -105,54 +105,87 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// FONCTIONS GESTION LISTE TEMPORAIRE BOTS
+// FONCTIONS GESTION LISTE TEMPORAIRE BOTS avec logs détaillés
 function addPlayerWithBot(playerNumber, botId) {
   PLAYERS_WITH_BOTS.set(playerNumber, {
     botId: botId,
     timestamp: Date.now(),
-    penalized: false
+    penalized: false,
+    addedAt: new Date().toISOString()
   });
-  console.log(`📋 Joueur ${playerNumber} ajouté à la liste bots (contre ${botId})`);
+  console.log(`📋 [LISTE] Joueur ${playerNumber} AJOUTÉ à la liste bots (contre ${botId})`);
+  console.log(`   📊 Liste actuelle: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`);
 }
 
 function removePlayerWithBot(playerNumber) {
   if (PLAYERS_WITH_BOTS.has(playerNumber)) {
+    const playerData = PLAYERS_WITH_BOTS.get(playerNumber);
+    console.log(`✅ [LISTE] Joueur ${playerNumber} RETIRÉ de la liste bots`);
+    console.log(`   📅 Temps dans liste: ${Math.round((Date.now() - playerData.timestamp)/1000)}s`);
+    console.log(`   ❌ Pénalisé: ${playerData.penalized ? 'OUI' : 'NON'}`);
     PLAYERS_WITH_BOTS.delete(playerNumber);
-    console.log(`✅ Joueur ${playerNumber} retiré de la liste bots`);
+    console.log(`   📊 Liste après retrait: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`);
+    return true;
+  } else {
+    console.log(`ℹ️ [LISTE] Joueur ${playerNumber} n'était PAS dans la liste`);
+    return false;
   }
 }
 
+function checkPlayerInBotList(playerNumber) {
+  const inList = PLAYERS_WITH_BOTS.has(playerNumber);
+  const status = inList ? 'OUI' : 'NON';
+  console.log(`🔍 [LISTE] Vérification ${playerNumber}: Listevst = ${status}`);
+  if (inList) {
+    const data = PLAYERS_WITH_BOTS.get(playerNumber);
+    console.log(`   🤖 Bot: ${data.botId}, Pénalisé: ${data.penalized ? 'OUI' : 'NON'}`);
+  }
+  return inList;
+}
+
 async function penalizePlayerIfInBotList(playerNumber) {
+  console.log(`⚡ [PÉNALITÉ] Vérification pour ${playerNumber}...`);
+  
   if (PLAYERS_WITH_BOTS.has(playerNumber)) {
     const playerData = PLAYERS_WITH_BOTS.get(playerNumber);
     
     // Éviter de pénaliser deux fois
     if (playerData.penalized) {
-      console.log(`ℹ️ Joueur ${playerNumber} déjà pénalisé`);
+      console.log(`ℹ️ [PÉNALITÉ] Joueur ${playerNumber} DÉJÀ pénalisé précédemment`);
+      console.log(`   📝 Pénalité = NO (déjà appliquée)`);
       return false;
     }
     
-    console.log(`⚡ Pénalité abandon contre bot pour ${playerNumber}`);
+    console.log(`⚡ [PÉNALITÉ] Joueur ${playerNumber} DANS la liste - Application pénalité`);
+    console.log(`   📝 Pénalité = -${DISCONNECT_PENALTY} points`);
     
     // Marquer comme pénalisé
     playerData.penalized = true;
+    playerData.penalizedAt = new Date().toISOString();
     PLAYERS_WITH_BOTS.set(playerNumber, playerData);
     
     // Appliquer la pénalité
     const penaltyResult = await db.applyDisconnectPenalty(playerNumber);
     
     if (penaltyResult.success) {
-      console.log(`✅ Pénalité -${DISCONNECT_PENALTY} points appliquée à ${playerNumber}`);
+      console.log(`✅ [PÉNALITÉ] Pénalité appliquée avec succès à ${playerNumber}`);
+      console.log(`   💰 Ancien score: ${penaltyResult.oldScore}, Nouveau score: ${penaltyResult.newScore}`);
+      
       // Retirer de la liste après pénalité
       setTimeout(() => {
-        PLAYERS_WITH_BOTS.delete(playerNumber);
-        console.log(`🧹 Joueur ${playerNumber} retiré de la liste bots après pénalité`);
+        removePlayerWithBot(playerNumber);
       }, 3000);
+      
+      return true;
+    } else {
+      console.log(`❌ [PÉNALITÉ] Échec application pénalité pour ${playerNumber}`);
+      return false;
     }
-    
-    return penaltyResult.success;
+  } else {
+    console.log(`ℹ️ [PÉNALITÉ] Joueur ${playerNumber} PAS dans la liste bots`);
+    console.log(`   📝 Pénalité = NO (pas dans liste)`);
+    return false;
   }
-  return false;
 }
 
 // FONCTIONS HEARTBEAT (détection seulement, pas de pénalité)
@@ -167,7 +200,7 @@ function checkInactivePlayers() {
         const inactiveTime = now - lastHeartbeat;
         
         if (inactiveTime > HEARTBEAT_TIMEOUT) {
-            console.log(`⚠️ Joueur ${playerNumber} inactif depuis ${Math.round(inactiveTime/1000)}s - Déconnexion seulement`);
+            console.log(`⚠️ [INACTIVITÉ] Joueur ${playerNumber} inactif depuis ${Math.round(inactiveTime/1000)}s`);
             
             handleInactivePlayerDisconnect(playerNumber);
             
@@ -181,10 +214,13 @@ async function handleInactivePlayerDisconnect(playerNumber) {
         const player = await db.getUserByNumber(playerNumber);
         if (!player) return;
         
-        console.log(`🔌 Déconnexion inactivité: ${player.username}`);
+        console.log(`🔌 [INACTIVITÉ] Déconnexion: ${player.username} (${playerNumber})`);
         
         // Vérifier s'il est dans la liste bots
-        await penalizePlayerIfInBotList(playerNumber);
+        const inList = checkPlayerInBotList(playerNumber);
+        if (inList) {
+            await penalizePlayerIfInBotList(playerNumber);
+        }
         
         const gameId = PLAYER_TO_GAME.get(playerNumber);
         if (gameId) {
@@ -326,21 +362,26 @@ const db = {
   },
 
   async updateUserScore(number, newScore) {
+    const user = await this.getUserByNumber(number);
+    const oldScore = user ? user.score : 0;
+    
     await pool.query(
       'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
       [newScore, number]
     );
+    
+    return { oldScore, newScore };
   },
 
   async applyDisconnectPenalty(number) {
     try {
       const player = await this.getUserByNumber(number);
       if (player) {
+        const oldScore = player.score;
         const newScore = Math.max(0, player.score - DISCONNECT_PENALTY);
-        await this.updateUserScore(number, newScore);
-        console.log(`⚡ Pénalité abandon: ${player.username} (-${DISCONNECT_PENALTY} points)`);
-        console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
-        return { success: true, newScore };
+        const result = await this.updateUserScore(number, newScore);
+        console.log(`⚡ [PÉNALITÉ DB] ${player.username}: ${oldScore} - ${DISCONNECT_PENALTY} = ${newScore}`);
+        return { success: true, newScore, oldScore };
       }
       return { success: false };
     } catch (error) {
@@ -902,15 +943,18 @@ class Game {
   }
 
   async handlePlayerDisconnect(disconnectedPlayer) {
-    console.log(`🔴 Joueur ${disconnectedPlayer.number} déconnecté pendant la partie ${this.id}`);
+    console.log(`🔴 [DÉCONNEXION PARTIE] Joueur ${disconnectedPlayer.number} déconnecté pendant la partie ${this.id}`);
     
     // Vérifier s'il est dans la liste bots
-    await penalizePlayerIfInBotList(disconnectedPlayer.number);
+    const inList = checkPlayerInBotList(disconnectedPlayer.number);
+    if (inList) {
+      await penalizePlayerIfInBotList(disconnectedPlayer.number);
+    }
     
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
     
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
-      console.log(`📢 Annonce à ${remainingPlayer.number} que l'adversaire a quitté`);
+      console.log(`📢 [PARTIE] Annonce à ${remainingPlayer.number} que l'adversaire a quitté`);
       remainingPlayer.ws.send(JSON.stringify({ 
         type: 'opponent_left', 
         message: 'Adversaire a quitté la partie',
@@ -920,13 +964,13 @@ class Game {
       // Appliquer la pénalité
       await this._endGameByDisconnect(disconnectedPlayer, remainingPlayer);
     } else {
-      console.log(`🗑️ Nettoyage partie ${this.id} - aucun joueur restant`);
+      console.log(`🗑️ [PARTIE] Nettoyage partie ${this.id} - aucun joueur restant`);
       this.cleanup();
     }
   }
 
   async _endGameByDisconnect(disconnectedPlayer, remainingPlayer) {
-    console.log(`⚡ Application pénalité abandon pour ${disconnectedPlayer.number}`);
+    console.log(`⚡ [PARTIE] Application pénalité abandon pour ${disconnectedPlayer.number}`);
     
     // Appliquer la pénalité d'abandon standard
     await db.applyDisconnectPenalty(disconnectedPlayer.number);
@@ -939,7 +983,7 @@ class Game {
           const bonus = 100; // Bonus pour victoire par abandon
           const newScore = remainingUser.score + bonus;
           await db.updateUserScore(remainingPlayer.number, newScore);
-          console.log(`🎁 Bonus ${bonus} points pour ${remainingPlayer.number} (victoire par abandon)`);
+          console.log(`🎁 [PARTIE] Bonus ${bonus} points pour ${remainingPlayer.number} (victoire par abandon)`);
         }
       } catch (error) {
         console.error('Erreur bonus abandon:', error);
@@ -1076,10 +1120,10 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', async () => {
-    console.log(`🔌 Connexion WebSocket fermée (${deviceId})`);
+    console.log(`🔌 [WEBSOCKET] Connexion fermée (${deviceId})`);
     
     if (isAdminConnection && adminId) {
-      console.log(`🔧 Déconnexion admin ${adminId}`);
+      console.log(`🔧 [ADMIN] Déconnexion admin ${adminId}`);
       ADMIN_CONNECTIONS.delete(adminId);
     } else {
       // Délai réduit à 5 secondes pour permettre la reconnexion rapide
@@ -1088,10 +1132,20 @@ wss.on('connection', (ws, req) => {
         const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
         
         if (disconnectedNumber) {
-          console.log(`👤 Déconnexion détectée pour joueur ${disconnectedNumber} (après ${RECONNECTION_GRACE_PERIOD/1000}s)`);
+          console.log(`👤 [WEBSOCKET] Déconnexion détectée pour joueur ${disconnectedNumber}`);
+          console.log(`   ⏱️ Attente ${RECONNECTION_GRACE_PERIOD/1000}s avant traitement...`);
           
           // VÉRIFIER ET PÉNALISER SI LE JOUEUR EST DANS LA LISTE BOTS
-          await penalizePlayerIfInBotList(disconnectedNumber);
+          console.log(`🔍 [WEBSOCKET] Vérification liste bots pour ${disconnectedNumber}...`);
+          const inList = checkPlayerInBotList(disconnectedNumber);
+          
+          if (inList) {
+            console.log(`⚡ [WEBSOCKET] Joueur ${disconnectedNumber} DANS la liste - Application pénalité`);
+            await penalizePlayerIfInBotList(disconnectedNumber);
+          } else {
+            console.log(`ℹ️ [WEBSOCKET] Joueur ${disconnectedNumber} PAS dans la liste bots`);
+            console.log(`   📝 Pénalité = NO (pas dans liste)`);
+          }
           
           PLAYER_CONNECTIONS.delete(disconnectedNumber);
           PLAYER_QUEUE.delete(disconnectedNumber);
@@ -1101,22 +1155,22 @@ wss.on('connection', (ws, req) => {
           
           const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
           if (gameId) {
-            console.log(`🎮 Joueur ${disconnectedNumber} était en partie ${gameId}`);
+            console.log(`🎮 [WEBSOCKET] Joueur ${disconnectedNumber} était en partie ${gameId}`);
             const game = ACTIVE_GAMES.get(gameId);
             if (game) {
               const player = game.getPlayerByNumber(disconnectedNumber);
               if (player) {
-                console.log(`⚡ Traitement déconnexion pour partie ${gameId}`);
+                console.log(`⚡ [WEBSOCKET] Traitement déconnexion pour partie ${gameId}`);
                 await game.handlePlayerDisconnect(player);
               }
             }
           } else {
-            console.log(`ℹ️ Joueur ${disconnectedNumber} n'était pas en partie`);
+            console.log(`ℹ️ [WEBSOCKET] Joueur ${disconnectedNumber} n'était pas en partie PvP`);
           }
           
           PLAYER_TO_GAME.delete(disconnectedNumber);
         } else {
-          console.log(`ℹ️ Aucun joueur associé à ${deviceKey}`);
+          console.log(`ℹ️ [WEBSOCKET] Aucun joueur associé à ${deviceKey}`);
         }
       }, RECONNECTION_GRACE_PERIOD); // 5 secondes
     }
@@ -1455,10 +1509,13 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     logout: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (playerNumber) {
-        console.log(`🚪 Logout manuel pour ${playerNumber}`);
+        console.log(`🚪 [LOGOUT] Logout manuel pour ${playerNumber}`);
         
         // VÉRIFIER ET PÉNALISER SI LE JOUEUR EST DANS LA LISTE BOTS
-        await penalizePlayerIfInBotList(playerNumber);
+        const inList = checkPlayerInBotList(playerNumber);
+        if (inList) {
+          await penalizePlayerIfInBotList(playerNumber);
+        }
         
         TRUSTED_DEVICES.delete(deviceKey);
         await db.deleteTrustedDevice(deviceKey);
@@ -1636,10 +1693,14 @@ app.get('/get-bot', (req, res) => {
     
     if (playerNumber) {
       // Ajouter le joueur à la liste temporaire des bots
+      console.log(`🎯 [GET-BOT] Demande de bot reçue pour joueur ${playerNumber}`);
       addPlayerWithBot(playerNumber, bot.id);
-      console.log(`🤖 Bot ${bot.id} assigné à ${playerNumber} (liste mise à jour)`);
+      console.log(`🤖 [GET-BOT] Bot ${bot.id} assigné à ${playerNumber}`);
+      console.log(`📊 [GET-BOT] Liste bots mise à jour: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`);
     } else {
-      console.log(`🤖 Bot ${bot.id} assigné mais playerNumber manquant`);
+      console.log(`⚠️ [GET-BOT] Bot ${bot.id} assigné mais playerNumber manquant!`);
+      console.log(`   Headers: ${JSON.stringify(req.headers)}`);
+      console.log(`   Query: ${JSON.stringify(req.query)}`);
     }
     
     res.json({ success: true, bot: bot });
@@ -1656,11 +1717,20 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    console.log(`[BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
-    console.log(`   Score joueur: ${playerScore}, Score bot: ${botScore}, Victoire joueur: ${isPlayerWin}`);
+    console.log(`🎮 [UPDATE-BOT-MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
+    console.log(`   📊 Score joueur: ${playerScore}, Score bot: ${botScore}`);
+    console.log(`   🏆 Victoire joueur: ${isPlayerWin ? 'OUI' : 'NON'}`);
+    
+    // VÉRIFIER SI LE JOUEUR EST DANS LA LISTE
+    const inList = checkPlayerInBotList(playerNumber);
     
     // RETIRER LE JOUEUR DE LA LISTE TEMPORAIRE (il a terminé sa partie)
-    removePlayerWithBot(playerNumber);
+    if (inList) {
+      console.log(`✅ [UPDATE-BOT-MATCH] Joueur ${playerNumber} terminé sa partie - Retrait liste`);
+      removePlayerWithBot(playerNumber);
+    } else {
+      console.log(`ℹ️ [UPDATE-BOT-MATCH] Joueur ${playerNumber} n'était pas dans la liste`);
+    }
     
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
@@ -1690,6 +1760,7 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       });
     }
   } catch (error) {
+    console.error('Erreur update-bot-match:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1702,16 +1773,25 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
     }
     
-    console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre bot ${botId || 'inconnu'}`);
+    console.log(`📞 [REPORT-DISCONNECT] Signalement abandon pour ${playerNumber} contre ${botId || 'inconnu'}`);
     
     // Vérifier et pénaliser le joueur s'il est dans la liste
-    const penalized = await penalizePlayerIfInBotList(playerNumber);
+    const inList = checkPlayerInBotList(playerNumber);
+    let penalized = false;
+    
+    if (inList) {
+      console.log(`⚡ [REPORT-DISCONNECT] Application pénalité via liste`);
+      penalized = await penalizePlayerIfInBotList(playerNumber);
+    } else {
+      console.log(`ℹ️ [REPORT-DISCONNECT] Joueur pas dans liste - pénalité standard`);
+    }
     
     if (penalized) {
       res.json({ 
         success: true, 
         message: `Pénalité appliquée: -${DISCONNECT_PENALTY} points`,
-        penalty: DISCONNECT_PENALTY
+        penalty: DISCONNECT_PENALTY,
+        via_list: true
       });
     } else {
       // Si pas dans la liste, appliquer quand même la pénalité
@@ -1722,13 +1802,15 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
           success: true, 
           message: `Pénalité appliquée: -${DISCONNECT_PENALTY} points`,
           penalty: DISCONNECT_PENALTY,
-          new_score: penaltyResult.newScore
+          new_score: penaltyResult.newScore,
+          via_list: false
         });
       } else {
         res.status(500).json({ success: false, message: "Erreur application pénalité" });
       }
     }
   } catch (error) {
+    console.error('Erreur report-disconnect:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1738,28 +1820,74 @@ app.get('/bot-players-list', (req, res) => {
   const list = Array.from(PLAYERS_WITH_BOTS.entries()).map(([playerNumber, data]) => ({
     playerNumber,
     botId: data.botId,
-    timestamp: new Date(data.timestamp).toISOString(),
+    addedAt: data.addedAt,
     penalized: data.penalized,
+    penalizedAt: data.penalizedAt || 'N/A',
     duration: Math.round((Date.now() - data.timestamp) / 1000) + 's'
   }));
+  
+  console.log(`📋 [DEBUG] Liste bots actuelle: ${PLAYERS_WITH_BOTS.size} joueurs`);
   
   res.json({
     success: true,
     count: PLAYERS_WITH_BOTS.size,
-    players: list
+    players: list,
+    debug: `Total: ${PLAYERS_WITH_BOTS.size}, Liste: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`
   });
+});
+
+// Route debug pour forcer l'ajout/retrait d'un joueur
+app.get('/debug-bot-list/:action/:playerNumber/:botId?', (req, res) => {
+  const { action, playerNumber, botId } = req.params;
+  
+  switch(action) {
+    case 'add':
+      if (botId) {
+        addPlayerWithBot(playerNumber, botId);
+        res.json({ success: true, message: `Joueur ${playerNumber} ajouté avec bot ${botId}` });
+      } else {
+        res.json({ success: false, message: "botId requis" });
+      }
+      break;
+      
+    case 'remove':
+      const removed = removePlayerWithBot(playerNumber);
+      res.json({ success: removed, message: removed ? `Joueur ${playerNumber} retiré` : `Joueur ${playerNumber} non trouvé` });
+      break;
+      
+    case 'check':
+      const inList = checkPlayerInBotList(playerNumber);
+      res.json({ success: true, inList, message: `Joueur ${playerNumber}: ${inList ? 'DANS la liste' : 'PAS dans la liste'}` });
+      break;
+      
+    case 'clear':
+      const previousSize = PLAYERS_WITH_BOTS.size;
+      PLAYERS_WITH_BOTS.clear();
+      console.log(`🧹 [DEBUG] Liste bots vidée (${previousSize} entrées supprimées)`);
+      res.json({ success: true, message: `Liste vidée (${previousSize} entrées)` });
+      break;
+      
+    default:
+      res.json({ success: false, message: "Action invalide" });
+  }
 });
 
 // Nettoyage automatique des anciennes entrées (24h max)
 setInterval(() => {
   const now = Date.now();
   const maxAge = 24 * 60 * 60 * 1000; // 24 heures
+  let cleaned = 0;
   
   for (const [playerNumber, data] of PLAYERS_WITH_BOTS.entries()) {
     if (now - data.timestamp > maxAge) {
-      console.log(`🧹 Nettoyage ancienne entrée pour ${playerNumber} (${data.botId})`);
+      console.log(`🧹 [NETTOYAGE] Ancienne entrée pour ${playerNumber} (${data.botId}) - ${Math.round((now - data.timestamp)/3600000)}h`);
       PLAYERS_WITH_BOTS.delete(playerNumber);
+      cleaned++;
     }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`🧹 [NETTOYAGE] ${cleaned} anciennes entrées nettoyées`);
   }
 }, 60 * 60 * 1000); // Vérifier toutes les heures
 
@@ -1839,11 +1967,14 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`📋 Système liste bots activé`);
+      console.log(`📋 Système liste bots avec logs détaillés ACTIVÉ`);
       console.log(`💓 Système heartbeat activé (${HEARTBEAT_TIMEOUT/1000}s timeout)`);
       console.log(`⚡ Délai reconnexion: ${RECONNECTION_GRACE_PERIOD/1000}s`);
       console.log(`📍 Pénalité abandon contre bot: -${DISCONNECT_PENALTY} points (automatique)`);
-      console.log(`📍 Aucune pénalité pour inactivité`);
+      console.log(`🔍 Routes debug:`);
+      console.log(`   - /bot-players-list : Voir la liste actuelle`);
+      console.log(`   - /debug-bot-list/add/PLAYER/BOT : Ajouter manuellement`);
+      console.log(`   - /debug-bot-list/check/PLAYER : Vérifier un joueur`);
       console.log(`=========================================`);
     });
   } catch (error) {
