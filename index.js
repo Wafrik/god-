@@ -771,13 +771,15 @@ class Game {
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
       remainingPlayer.ws.send(JSON.stringify({ type: 'opponent_left', message: 'Adversaire a quitté la partie' }));
-      setTimeout(() => this._endGameByDisconnect(disconnectedPlayer, remainingPlayer), 10000);
+      // APPLIQUER IMMÉDIATEMENT LES PÉNALITÉS
+      await this._endGameByDisconnect(disconnectedPlayer, remainingPlayer);
     } else {
       this.cleanup();
     }
   }
 
   async _endGameByDisconnect(disconnectedPlayer, remainingPlayer) {
+    // APPLIQUER LES PÉNALITÉS IMMÉDIATEMENT
     await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
     this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
     setTimeout(() => this.cleanup(), 5000);
@@ -921,23 +923,26 @@ wss.on('connection', (ws, req) => {
     if (isAdminConnection && adminId) {
       ADMIN_CONNECTIONS.delete(adminId);
     } else {
-      setTimeout(async () => {
-        const deviceKey = generateDeviceKey(ip, deviceId);
-        const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
+      // PAS DE TIMEOUT - APPLIQUER IMMÉDIATEMENT
+      const deviceKey = generateDeviceKey(ip, deviceId);
+      const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
+      
+      if (disconnectedNumber) {
+        PLAYER_CONNECTIONS.delete(disconnectedNumber);
+        PLAYER_QUEUE.delete(disconnectedNumber);
         
-        if (disconnectedNumber) {
-          PLAYER_CONNECTIONS.delete(disconnectedNumber);
-          PLAYER_QUEUE.delete(disconnectedNumber);
-          
-          await db.setUserOnlineStatus(disconnectedNumber, false);
-          
-          const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
-          const game = ACTIVE_GAMES.get(gameId);
-          const player = game?.getPlayerByNumber(disconnectedNumber);
-          if (player) await game.handlePlayerDisconnect(player);
-          PLAYER_TO_GAME.delete(disconnectedNumber);
+        await db.setUserOnlineStatus(disconnectedNumber, false);
+        
+        const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
+        const game = ACTIVE_GAMES.get(gameId);
+        const player = game?.getPlayerByNumber(disconnectedNumber);
+        if (player) {
+          // APPLIQUER LA PÉNALITÉ D'ABANDON IMMÉDIATEMENT
+          await db.applyDisconnectPenalty(disconnectedNumber);
+          await game.handlePlayerDisconnect(player);
         }
-      }, 10000);
+        PLAYER_TO_GAME.delete(disconnectedNumber);
+      }
     }
   });
 });
@@ -1275,7 +1280,11 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         const gameId = PLAYER_TO_GAME.get(playerNumber);
         const game = ACTIVE_GAMES.get(gameId);
         const player = game?.getPlayerByNumber(playerNumber);
-        if (player) await game.handlePlayerDisconnect(player);
+        if (player) {
+          // APPLIQUER LA PÉNALITÉ D'ABANDON POUR LOGOUT DURANT UNE PARTIE
+          await db.applyDisconnectPenalty(playerNumber);
+          await game.handlePlayerDisconnect(player);
+        }
         PLAYER_TO_GAME.delete(playerNumber);
         
         ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie' }));
@@ -1578,9 +1587,9 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points`);
+      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points (appliquée immédiatement)`);
       console.log(`💡 Note: Les pénalités d'inactivité côté serveur ont été retirées`);
-      console.log(`💡 Les pénalités sont maintenant gérées uniquement par le game manager`);
+      console.log(`💡 Les pénalités d'abandon sont appliquées immédiatement`);
       console.log(`=========================================`);
     });
   } catch (error) {
