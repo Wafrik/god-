@@ -1836,13 +1836,13 @@ app.get('/bot-players-list', (req, res) => {
   });
 });
 
-// Route debug pour forcer l'ajout/retrait d'un joueur
-app.get('/debug-bot-list/:action/:playerNumber/:botId?', (req, res) => {
+// Route debug pour forcer l'ajout/retrait d'un joueur - CORRIGÉE
+app.get('/debug-bot-list/:action/:playerNumber/:botId', (req, res) => {
   const { action, playerNumber, botId } = req.params;
   
   switch(action) {
     case 'add':
-      if (botId) {
+      if (botId && botId !== 'undefined') {
         addPlayerWithBot(playerNumber, botId);
         res.json({ success: true, message: `Joueur ${playerNumber} ajouté avec bot ${botId}` });
       } else {
@@ -1869,6 +1869,33 @@ app.get('/debug-bot-list/:action/:playerNumber/:botId?', (req, res) => {
       
     default:
       res.json({ success: false, message: "Action invalide" });
+  }
+});
+
+// Route pour les actions sans botId
+app.get('/debug-bot-list/:action/:playerNumber', (req, res) => {
+  const { action, playerNumber } = req.params;
+  
+  switch(action) {
+    case 'remove':
+      const removed = removePlayerWithBot(playerNumber);
+      res.json({ success: removed, message: removed ? `Joueur ${playerNumber} retiré` : `Joueur ${playerNumber} non trouvé` });
+      break;
+      
+    case 'check':
+      const inList = checkPlayerInBotList(playerNumber);
+      res.json({ success: true, inList, message: `Joueur ${playerNumber}: ${inList ? 'DANS la liste' : 'PAS dans la liste'}` });
+      break;
+      
+    case 'clear':
+      const previousSize = PLAYERS_WITH_BOTS.size;
+      PLAYERS_WITH_BOTS.clear();
+      console.log(`🧹 [DEBUG] Liste bots vidée (${previousSize} entrées supprimées)`);
+      res.json({ success: true, message: `Liste vidée (${previousSize} entrées)` });
+      break;
+      
+    default:
+      res.json({ success: false, message: "Action 'add' requiert un botId. Utilisez /debug-bot-list/add/:playerNumber/:botId" });
   }
 });
 
