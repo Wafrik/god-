@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -21,12 +22,9 @@ const PORT = process.env.PORT || 8000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
-const DISCONNECT_PENALTY = 250;
-const RECONNECTION_GRACE_PERIOD = 5 * 1000;
+const BOT_DEPOSIT = 250; // Caution de 250 points
 
-// Système de surveillance des bots
-const PLAYERS_WITH_BOTS = new Map();
-const BOT_REQUESTS = new Map();
+// Suppression du système d'inactivité et heartbeat
 
 const UPDATE_CONFIG = {
   force_update: false,
@@ -43,47 +41,50 @@ const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
 
+// Nouveau: Suivi des dépôts de caution
+const BOT_DEPOSITS = new Map(); // Map: playerNumber -> {botId, depositAmount, timestamp}
+
 const BOTS = [
-  { id: "bot_001", username: "Zaboule", score: 0 },
-  { id: "bot_002", username: "Ddk", score: 0 },
-  { id: "bot_003", username: "Zokou la panthère", score: 0 },
-  { id: "bot_004", username: "Atom", score: 0 },
-  { id: "bot_005", username: "Yven125", score: 0 },
-  { id: "bot_006", username: "Pataff4", score: 0 },
-  { id: "bot_007", username: "Afrocc", score: 0 },
-  { id: "bot_008", username: "Le babato deluxe", score: 0 },
-  { id: "bot_009", username: "Miello", score: 0 },
-  { id: "bot_010", username: "2418coto", score: 0 },
-  { id: "bot_011", username: "Yako2001", score: 0 },
-  { id: "bot_012", username: "Ziparotus", score: 0 },
-  { id: "bot_013", username: "Agapli", score: 0 },
-  { id: "bot_014", username: "Mireille68", score: 0 },
-  { id: "bot_015", username: "Pela8", score: 0 },
-  { id: "bot_016", username: "Sylivie", score: 0 },
-  { id: "bot_017", username: "Soeur cartie", score: 0 },
-  { id: "bot_018", username: "Zezeta23", score: 0 },
-  { id: "bot_019", username: "Timo", score: 0 },
-  { id: "bot_020", username: "Lina", score: 0 },
-  { id: "bot_021", username: "Lucas", score: 0 },
-  { id: "bot_022", username: "Thomas", score: 0 },
-  { id: "bot_023", username: "Alexandre", score: 0 },
-  { id: "bot_024", username: "Mathis", score: 0 },
-  { id: "bot_025", username: "Nathan", score: 0 },
-  { id: "bot_026", username: "Enzo", score: 0 },
-  { id: "bot_027", username: "Louis", score: 0 },
-  { id: "bot_028", username: "Gabriel", score: 0 },
-  { id: "bot_029", username: "Hugo", score: 0 },
-  { id: "bot_030", username: "Raphaël", score: 0 },
-  { id: "bot_031", username: "Emma", score: 0 },
-  { id: "bot_032", username: "Léa", score: 0 },
-  { id: "bot_033", username: "Manon", score: 0 },
-  { id: "bot_034", username: "Chloé", score: 0 },
-  { id: "bot_035", username: "Camille", score: 0 },
-  { id: "bot_036", username: "Sarah", score: 0 },
-  { id: "bot_037", username: "Julie", score: 0 },
-  { id: "bot_038", username: "Clara", score: 0 },
-  { id: "bot_039", username: "Inès", score: 0 },
-  { id: "bot_040", username: "Zoé", score: 0 }
+  { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 0 },
+  { id: "bot_m_002", username: "Thomas", gender: "M", baseScore: 0 },
+  { id: "bot_m_003", username: "Alexandre", gender: "M", baseScore: 0 },
+  { id: "bot_m_004", username: "Mathis", gender: "M", baseScore: 0 },
+  { id: "bot_m_005", username: "Nathan", gender: "M", baseScore: 0 },
+  { id: "bot_m_006", username: "Enzo", gender: "M", baseScore: 0 },
+  { id: "bot_m_007", username: "Louis", gender: "M", baseScore: 0 },
+  { id: "bot_m_008", username: "Gabriel", gender: "M", baseScore: 0 },
+  { id: "bot_m_009", username: "Hugo", gender: "M", baseScore: 0 },
+  { id: "bot_m_010", username: "Raphaël", gender: "M", baseScore: 0 },
+  { id: "bot_f_001", username: "Emma", gender: "F", baseScore: 0 },
+  { id: "bot_f_002", username: "Léa", gender: "F", baseScore: 0 },
+  { id: "bot_f_003", username: "Manon", gender: "F", baseScore: 0 },
+  { id: "bot_f_004", username: "Chloé", gender: "F", baseScore: 0 },
+  { id: "bot_f_005", username: "Camille", gender: "F", baseScore: 0 },
+  { id: "bot_f_006", username: "Sarah", gender: "F", baseScore: 0 },
+  { id: "bot_f_007", username: "Julie", gender: "F", baseScore: 0 },
+  { id: "bot_f_008", username: "Clara", gender: "F", baseScore: 0 },
+  { id: "bot_f_009", username: "Inès", gender: "F", baseScore: 0 },
+  { id: "bot_f_010", username: "Zoé", gender: "F", baseScore: 0 },
+  { id: "bot_001", username: "Zaboule", gender: "M", baseScore: 0 },
+  { id: "bot_002", username: "Ddk", gender: "M", baseScore: 0 },
+  { id: "bot_003", username: "Zokou la panthère", gender: "M", baseScore: 0 },
+  { id: "bot_004", username: "Atom", gender: "M", baseScore: 0 },
+  { id: "bot_005", username: "Yven125", gender: "M", baseScore: 0 },
+  { id: "bot_006", username: "Pataff4", gender: "M", baseScore: 0 },
+  { id: "bot_007", username: "Afrocc", gender: "M", baseScore: 0 },
+  { id: "bot_008", username: "Le babato deluxe", gender: "M", baseScore: 0 },
+  { id: "bot_009", username: "Miello", gender: "M", baseScore: 0 },
+  { id: "bot_010", username: "2418coto", gender: "M", baseScore: 0 },
+  { id: "bot_011", username: "Yako2001", gender: "M", baseScore: 0 },
+  { id: "bot_012", username: "Ziparotus", gender: "M", baseScore: 0 },
+  { id: "bot_013", username: "Agapli", gender: "F", baseScore: 0 },
+  { id: "bot_014", username: "Mireille68", gender: "F", baseScore: 0 },
+  { id: "bot_015", username: "Pela8", gender: "F", baseScore: 0 },
+  { id: "bot_016", username: "Sylivie", gender: "F", baseScore: 0 },
+  { id: "bot_017", username: "Soeur cartie", gender: "F", baseScore: 0 },
+  { id: "bot_018", username: "Zezeta23", gender: "F", baseScore: 0 },
+  { id: "bot_019", username: "Timo", gender: "M", baseScore: 0 },
+  { id: "bot_020", username: "Lina", gender: "F", baseScore: 0 }
 ];
 
 let botAutoIncrementInterval = null;
@@ -97,76 +98,9 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// Fonctions de surveillance des bots
-function addPlayerWithBot(playerNumber, botId) {
-  PLAYERS_WITH_BOTS.set(playerNumber, {
-    botId: botId,
-    timestamp: Date.now(),
-    penalized: false,
-    addedAt: new Date().toISOString()
-  });
-  console.log(`📋 ${playerNumber} ajouté liste bots (${botId})`);
-}
-
-function removePlayerWithBot(playerNumber) {
-  if (PLAYERS_WITH_BOTS.has(playerNumber)) {
-    const playerData = PLAYERS_WITH_BOTS.get(playerNumber);
-    console.log(`✅ ${playerNumber} retiré liste bots`);
-    console.log(`⏱️ Temps liste: ${Math.round((Date.now() - playerData.timestamp)/1000)}s`);
-    console.log(`❌ Pénalisé: ${playerData.penalized ? 'OUI' : 'NON'}`);
-    PLAYERS_WITH_BOTS.delete(playerNumber);
-    return true;
-  }
-  return false;
-}
-
-function checkPlayerInBotList(playerNumber) {
-  const inList = PLAYERS_WITH_BOTS.has(playerNumber);
-  console.log(`🔍 ${playerNumber}: Listevst = ${inList ? 'OUI' : 'NON'}`);
-  return inList;
-}
-
-async function penalizePlayerIfInBotList(playerNumber) {
-  if (PLAYERS_WITH_BOTS.has(playerNumber)) {
-    const playerData = PLAYERS_WITH_BOTS.get(playerNumber);
-    
-    if (playerData.penalized) {
-      console.log(`ℹ️ ${playerNumber} déjà pénalisé`);
-      return false;
-    }
-    
-    console.log(`⚡ ${playerNumber} DANS liste - Pénalité -${DISCONNECT_PENALTY}`);
-    
-    playerData.penalized = true;
-    playerData.penalizedAt = new Date().toISOString();
-    PLAYERS_WITH_BOTS.set(playerNumber, playerData);
-    
-    const penaltyResult = await db.applyDisconnectPenalty(playerNumber);
-    
-    if (penaltyResult.success) {
-      console.log(`✅ Pénalité appliquée ${playerNumber}`);
-      setTimeout(() => removePlayerWithBot(playerNumber), 3000);
-      return true;
-    }
-  }
-  console.log(`ℹ️ ${playerNumber} PAS dans liste bots`);
-  return false;
-}
-
-// Fonction pour trouver le joueur par IP
-function findPlayerByIp(ip) {
-  for (const [deviceKey, playerNumber] of TRUSTED_DEVICES.entries()) {
-    if (deviceKey.includes(ip)) {
-      console.log(`🔗 Trouvé ${playerNumber} pour IP ${ip}`);
-      return playerNumber;
-    }
-  }
-  return null;
-}
-
 function getRandomBot() {
   const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
-  const botScore = BOT_SCORES.get(randomBot.id) || randomBot.score;
+  const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
   return { ...randomBot, score: botScore, is_bot: true };
 }
 
@@ -263,31 +197,83 @@ const db = {
   },
 
   async updateUserScore(number, newScore) {
-    const user = await this.getUserByNumber(number);
-    const oldScore = user ? user.score : 0;
-    
     await pool.query(
       'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
       [newScore, number]
     );
-    
-    return { oldScore, newScore };
   },
 
-  async applyDisconnectPenalty(number) {
+  async applyBotDeposit(playerNumber) {
     try {
-      const player = await this.getUserByNumber(number);
-      if (player) {
-        const oldScore = player.score;
-        const newScore = Math.max(0, player.score - DISCONNECT_PENALTY);
-        const result = await this.updateUserScore(number, newScore);
-        console.log(`⚡ ${player.username}: ${oldScore} - ${DISCONNECT_PENALTY} = ${newScore}`);
-        return { success: true, newScore, oldScore };
+      const player = await this.getUserByNumber(playerNumber);
+      if (!player) {
+        return { success: false, message: "Joueur non trouvé" };
       }
-      return { success: false };
+      
+      // Vérifier si le joueur a déjà un dépôt en cours
+      if (BOT_DEPOSITS.has(playerNumber)) {
+        return { success: false, message: "Déjà un dépôt en cours" };
+      }
+      
+      // Vérifier si le joueur a assez de points
+      if (player.score < BOT_DEPOSIT) {
+        return { 
+          success: false, 
+          message: `Points insuffisants. Nécessaire: ${BOT_DEPOSIT}, Vous avez: ${player.score}` 
+        };
+      }
+      
+      // Retirer la caution
+      const newScore = player.score - BOT_DEPOSIT;
+      await this.updateUserScore(playerNumber, newScore);
+      
+      console.log(`💰 Dépôt caution: ${player.username} (-${BOT_DEPOSIT} points)`);
+      console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+      
+      return { 
+        success: true, 
+        newScore: newScore,
+        depositAmount: BOT_DEPOSIT
+      };
     } catch (error) {
-      console.error('Erreur pénalité abandon:', error);
-      return { success: false };
+      console.error('Erreur dépôt caution:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  async refundBotDeposit(playerNumber) {
+    try {
+      const deposit = BOT_DEPOSITS.get(playerNumber);
+      if (!deposit) {
+        return { success: false, message: "Aucun dépôt trouvé" };
+      }
+      
+      const player = await this.getUserByNumber(playerNumber);
+      if (!player) {
+        return { success: false, message: "Joueur non trouvé" };
+      }
+      
+      // Rendre la caution (sans bonus)
+      const refundAmount = BOT_DEPOSIT;
+      const newScore = player.score + refundAmount;
+      
+      // Mettre à jour le score
+      await this.updateUserScore(playerNumber, newScore);
+      
+      // Supprimer le dépôt
+      BOT_DEPOSITS.delete(playerNumber);
+      
+      console.log(`💰 Caution rendue: ${player.username} (+${refundAmount} points)`);
+      console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+      
+      return { 
+        success: true, 
+        refundAmount: refundAmount,
+        newScore: newScore
+      };
+    } catch (error) {
+      console.error('Erreur remboursement caution:', error);
+      return { success: false, message: "Erreur serveur" };
     }
   },
 
@@ -307,34 +293,45 @@ const db = {
 
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
     try {
+      const player = await this.getUserByNumber(playerNumber);
+      if (!player) return false;
+      
+      // Calcul du score selon l'ancien système
+      const currentScore = player.score;
+      const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
+      
+      let newScore = currentScore;
+      
       if (isDraw) {
-        console.log(`[BOT MATCH] Match nul ${playerNumber}`);
+        // Match nul: on rend juste la caution
+        await this.refundBotDeposit(playerNumber);
+        console.log(`🤝 Match nul - ${player.username} récupère sa caution`);
         return true;
       }
       
-      const playerResult = await pool.query('SELECT score FROM users WHERE number = $1', [playerNumber]);
-      const currentScore = playerResult.rows[0]?.score || 0;
-      const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
-      
-      let newScore;
-      
       if (isWin) {
+        // Victoire: score normal + 200
         newScore = currentScore + playerGameScore + 200;
-        console.log(`🏆 ${playerNumber} gagne: +${playerGameScore}+200`);
+        console.log(`🏆 [BOT MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
+        // Défaite
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
-          console.log(`🔥 ${playerNumber} perd (≥10k): -${playerGameScore}-200`);
+          console.log(`🔥 [BOT MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
         } else {
           newScore = Math.max(0, currentScore - playerGameScore);
-          console.log(`😢 ${playerNumber} perd: -${playerGameScore}`);
+          console.log(`😢 [BOT MATCH] Défaite (<10k) ${player.username}: ${currentScore} - ${playerGameScore} = ${newScore}`);
         }
       }
       
+      // Mettre à jour le score
       await pool.query(
         'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
         [newScore, playerNumber]
       );
+      
+      // Rendre la caution (que le joueur gagne ou perde, s'il termine la partie)
+      await this.refundBotDeposit(playerNumber);
       
       return true;
     } catch (error) {
@@ -388,7 +385,7 @@ const db = {
         leaderboard.push({
           username: bot.username || `Bot_${bot.bot_id}`,
           score: bot.score,
-          is_bot: false
+          is_bot: true
         });
       });
       
@@ -426,8 +423,11 @@ const db = {
       `);
       
       for (const bot of BOTS) {
-        BOT_SCORES.set(bot.id, bot.score);
+        BOT_SCORES.set(bot.id, bot.baseScore);
       }
+      
+      // Vider les dépôts
+      BOT_DEPOSITS.clear();
       
       return { 
         playersReset: playersReset.rowCount,
@@ -634,7 +634,8 @@ async function initializeDatabase() {
       CREATE TABLE IF NOT EXISTS bot_profiles (
         id VARCHAR(50) PRIMARY KEY,
         username VARCHAR(50) NOT NULL,
-        base_score INTEGER DEFAULT 0,
+        gender VARCHAR(1) NOT NULL,
+        base_score INTEGER DEFAULT 100,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -652,18 +653,19 @@ async function initializeDatabase() {
 
     for (const bot of BOTS) {
       await pool.query(`
-        INSERT INTO bot_profiles (id, username, base_score) 
-        VALUES ($1, $2, $3)
+        INSERT INTO bot_profiles (id, username, gender, base_score) 
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (id) DO UPDATE SET
           username = EXCLUDED.username,
+          gender = EXCLUDED.gender,
           base_score = EXCLUDED.base_score
-      `, [bot.id, bot.username, bot.score]);
+      `, [bot.id, bot.username, bot.gender, bot.baseScore]);
       
       await pool.query(`
         INSERT INTO bot_scores (bot_id, score) 
         VALUES ($1, $2)
         ON CONFLICT (bot_id) DO NOTHING
-      `, [bot.id, bot.score]);
+      `, [bot.id, bot.baseScore]);
     }
 
   } catch (error) {
@@ -842,58 +844,39 @@ class Game {
   }
 
   async handlePlayerDisconnect(disconnectedPlayer) {
-    console.log(`🔴 ${disconnectedPlayer.number} déconnecté partie ${this.id}`);
-    
-    const inList = checkPlayerInBotList(disconnectedPlayer.number);
-    if (inList) {
-      await penalizePlayerIfInBotList(disconnectedPlayer.number);
-    }
-    
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
-    
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
-      remainingPlayer.ws.send(JSON.stringify({ 
-        type: 'opponent_left', 
-        message: 'Adversaire a quitté la partie',
-        opponent: disconnectedPlayer.username || disconnectedPlayer.number
-      }));
-      
-      await this._endGameByDisconnect(disconnectedPlayer, remainingPlayer);
+      remainingPlayer.ws.send(JSON.stringify({ type: 'opponent_left', message: 'Adversaire a quitté la partie' }));
+      setTimeout(() => this._endGameByDisconnect(disconnectedPlayer, remainingPlayer), 10000);
     } else {
       this.cleanup();
     }
   }
 
   async _endGameByDisconnect(disconnectedPlayer, remainingPlayer) {
-    console.log(`⚡ Pénalité abandon ${disconnectedPlayer.number}`);
-    
-    await db.applyDisconnectPenalty(disconnectedPlayer.number);
-    
-    if (!disconnectedPlayer.is_bot && !remainingPlayer.is_bot) {
-      try {
-        const remainingUser = await db.getUserByNumber(remainingPlayer.number);
-        if (remainingUser) {
-          const bonus = 100;
-          const newScore = remainingUser.score + bonus;
-          await db.updateUserScore(remainingPlayer.number, newScore);
-          console.log(`🎁 Bonus ${bonus} points ${remainingPlayer.number}`);
-        }
-      } catch (error) {
-        console.error('Erreur bonus abandon:', error);
-      }
-    }
-    
-    this.broadcast({ 
-      type: 'game_end', 
-      data: { 
-        scores: this.scores, 
-        winner: remainingPlayer.role,
-        reason: 'disconnect',
-        disconnectedPlayer: disconnectedPlayer.role
-      } 
-    });
-    
+    await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
+    this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
     setTimeout(() => this.cleanup(), 5000);
+  }
+
+  async _applyDisconnectPenalties(disconnectedPlayer, remainingPlayer) {
+    try {
+      const disconnectedUser = await db.getUserByNumber(disconnectedPlayer.number);
+      const remainingUser = await db.getUserByNumber(remainingPlayer.number);
+      
+      if (disconnectedUser && remainingUser) {
+        const disconnectedScore = this.scores[disconnectedPlayer.role];
+        const remainingScore = this.scores[remainingPlayer.role];
+        
+        const newDisconnectedScore = Math.max(0, disconnectedUser.score - (disconnectedScore > 15 ? disconnectedScore : 15));
+        const newRemainingScore = remainingUser.score + (remainingScore < 15 ? 15 : remainingScore);
+        
+        await db.updateUserScore(disconnectedPlayer.number, newDisconnectedScore);
+        await db.updateUserScore(remainingPlayer.number, newRemainingScore);
+      }
+    } catch (error) {
+      console.error('Erreur pénalités déconnexion:', error);
+    }
   }
 
   endTurn() {
@@ -934,7 +917,7 @@ class Game {
   async _updatePlayerScores(winner) {
     try {
       if (winner === 'draw') {
-        console.log('Match nul');
+        console.log('Match nul - Aucun changement de score');
         return;
       }
       
@@ -947,14 +930,14 @@ class Game {
           
           if (winner === player.role) {
             newScore = user.score + totalScore + 200;
-            console.log(`🏆 ${player.number} gagne: +${totalScore}+200`);
+            console.log(`🏆 ${player.number} gagne: ${user.score} + ${totalScore} + 200 = ${newScore}`);
           } else {
             if (isHighScore) {
               newScore = Math.max(0, user.score - totalScore - 200);
-              console.log(`🔥 ${player.number} perd: -${totalScore}-200`);
+              console.log(`🔥 ${player.number} perd (≥10k): ${user.score} - ${totalScore} - 200 = ${newScore}`);
             } else {
               newScore = Math.max(0, user.score - totalScore);
-              console.log(`😢 ${player.number} perd: -${totalScore}`);
+              console.log(`😢 ${player.number} perd (<10k): ${user.score} - ${totalScore} = ${newScore}`);
             }
           }
           
@@ -1019,36 +1002,18 @@ wss.on('connection', (ws, req) => {
         const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
         
         if (disconnectedNumber) {
-          console.log(`👤 Déconnexion ${disconnectedNumber}`);
-          
-          const inList = checkPlayerInBotList(disconnectedNumber);
-          
-          if (inList) {
-            console.log(`⚡ ${disconnectedNumber} DANS liste - Pénalité`);
-            await penalizePlayerIfInBotList(disconnectedNumber);
-          } else {
-            console.log(`ℹ️ ${disconnectedNumber} PAS dans liste bots`);
-          }
-          
           PLAYER_CONNECTIONS.delete(disconnectedNumber);
           PLAYER_QUEUE.delete(disconnectedNumber);
           
           await db.setUserOnlineStatus(disconnectedNumber, false);
           
           const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
-          if (gameId) {
-            const game = ACTIVE_GAMES.get(gameId);
-            if (game) {
-              const player = game.getPlayerByNumber(disconnectedNumber);
-              if (player) {
-                await game.handlePlayerDisconnect(player);
-              }
-            }
-          }
-          
+          const game = ACTIVE_GAMES.get(gameId);
+          const player = game?.getPlayerByNumber(disconnectedNumber);
+          if (player) await game.handlePlayerDisconnect(player);
           PLAYER_TO_GAME.delete(disconnectedNumber);
         }
-      }, RECONNECTION_GRACE_PERIOD);
+      }, 10000);
     }
   });
 });
@@ -1284,17 +1249,14 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
   
   const handlers = {
-    heartbeat: async () => {
-      if (playerNumber) {
-        ws.send(JSON.stringify({ 
-            type: 'heartbeat_ack',
-            timestamp: Date.now()
-        }));
-      }
-    },
+    // Supprimé: heartbeat
 
     check_update: async () => {
+      console.log('📱 Vérification MAJ demandée');
+      console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
+      
       if (UPDATE_CONFIG.force_update) {
+        console.log('⚠️ MAJ FORCÉE activée - Envoi réponse MAJ requise');
         ws.send(JSON.stringify({
           type: 'check_update_response',
           needs_update: true,
@@ -1304,6 +1266,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           update_url: UPDATE_CONFIG.update_url
         }));
       } else {
+        console.log('✅ Pas de MAJ requise - Version à jour');
         ws.send(JSON.stringify({
           type: 'check_update_response',
           needs_update: false,
@@ -1371,12 +1334,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     logout: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (playerNumber) {
-        
-        const inList = checkPlayerInBotList(playerNumber);
-        if (inList) {
-          await penalizePlayerIfInBotList(playerNumber);
-        }
-        
         TRUSTED_DEVICES.delete(deviceKey);
         await db.deleteTrustedDevice(deviceKey);
         
@@ -1487,6 +1444,49 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         ws.send(JSON.stringify({ type: 'queue_left', message: 'Recherche annulée' }));
       }
     },
+
+    // NOUVEAU: Demander un bot
+    request_bot: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      
+      if (PLAYER_TO_GAME.has(playerNumber)) {
+        return ws.send(JSON.stringify({ type: 'error', message: 'Déjà dans une partie' }));
+      }
+      
+      // Prélever la caution de 250 points
+      const depositResult = await db.applyBotDeposit(playerNumber);
+      if (!depositResult.success) {
+        return ws.send(JSON.stringify({ 
+          type: 'bot_request_failed', 
+          message: depositResult.message 
+        }));
+      }
+      
+      // Choisir un bot aléatoire
+      const bot = getRandomBot();
+      const botId = bot.id;
+      
+      // Enregistrer le dépôt
+      BOT_DEPOSITS.set(playerNumber, {
+        botId: botId,
+        depositAmount: BOT_DEPOSIT,
+        timestamp: Date.now()
+      });
+      
+      console.log(`🤖 Bot demandé par ${playerNumber}`);
+      console.log(`💰 Caution prélevée: -${BOT_DEPOSIT} points`);
+      console.log(`🤖 Bot assigné: ${bot.username} (${botId})`);
+      
+      // Envoyer le bot au joueur
+      ws.send(JSON.stringify({
+        type: 'bot_assigned',
+        bot: bot,
+        depositApplied: true,
+        depositAmount: BOT_DEPOSIT,
+        newScore: depositResult.newScore
+      }));
+    },
     
     player_move: () => handleGameAction(ws, message, deviceKey),
     dice_swap: () => handleGameAction(ws, message, deviceKey),
@@ -1540,42 +1540,8 @@ function handleGameAction(ws, message, deviceKey) {
 app.get('/get-bot', (req, res) => {
   try {
     const bot = getRandomBot();
-    
-    let playerNumber = req.query.playerNumber;
-    
-    if (!playerNumber) {
-      playerNumber = req.headers['player-number'];
-    }
-    
-    if (!playerNumber) {
-      const clientIp = req.headers['x-forwarded-for'] || req.headers['cf-connecting-ip'] || req.ip;
-      console.log(`🔍 Recherche joueur pour IP: ${clientIp}`);
-      
-      playerNumber = findPlayerByIp(clientIp);
-    }
-    
-    if (playerNumber) {
-      console.log(`🎯 /get-bot pour ${playerNumber}`);
-      addPlayerWithBot(playerNumber, bot.id);
-      console.log(`🤖 ${bot.id} assigné à ${playerNumber}`);
-      
-      res.json({ 
-        success: true, 
-        bot: bot,
-        player_identified: true 
-      });
-    } else {
-      console.log(`⚠️ ${bot.id} assigné - joueur NON IDENTIFIÉ`);
-      
-      res.json({ 
-        success: true, 
-        bot: bot,
-        player_identified: false,
-        warning: "Joueur non identifié"
-      });
-    }
+    res.json({ success: true, bot: bot });
   } catch (error) {
-    console.error('Erreur /get-bot:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1588,24 +1554,23 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    console.log(`🎮 Résultats ${playerNumber} vs ${botId}`);
-    console.log(`📊 Score: ${playerScore}-${botScore}, Victoire: ${isPlayerWin ? 'OUI' : 'NON'}`);
-    
-    const inList = checkPlayerInBotList(playerNumber);
-    
-    if (inList) {
-      console.log(`✅ ${playerNumber} terminé - Retrait liste`);
-      removePlayerWithBot(playerNumber);
-    }
+    console.log(`[BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
+    console.log(`   Score joueur: ${playerScore}, Score bot: ${botScore}, Victoire joueur: ${isPlayerWin}`);
     
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
+    
+    // Vérifier si le joueur a un dépôt enregistré
+    const deposit = BOT_DEPOSITS.get(playerNumber);
+    if (!deposit || deposit.botId !== botId) {
+      console.warn(`⚠️ Pas de dépôt trouvé pour ${playerNumber} contre ${botId}`);
+    }
     
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin, isDraw);
     
     if (!isDraw) {
       const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
-      const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.score || 0;
+      const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
       
       const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore);
       
@@ -1613,20 +1578,28 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
         res.json({ 
           success: true, 
           message: "Scores mis à jour",
-          is_draw: isDraw
+          is_draw: isDraw,
+          deposit_handled: !!deposit
         });
       } else {
         res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
       }
     } else {
+      // Pour un match nul, on rend juste la caution
+      if (deposit) {
+        const drawRefund = await db.refundBotDeposit(playerNumber);
+        console.log(`🤝 Match nul - ${playerNumber} récupère sa caution`);
+      }
+      
       res.json({ 
         success: true, 
-        message: "Match nul - Aucun changement de score",
-        is_draw: true
+        message: "Match nul - Caution rendue",
+        is_draw: true,
+        deposit_refunded: !!deposit
       });
     }
   } catch (error) {
-    console.error('Erreur update-bot-match:', error);
+    console.error('Erreur update bot match:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1639,79 +1612,32 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
     }
     
-    console.log(`📞 Abandon ${playerNumber} vs ${botId || 'inconnu'}`);
+    console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre bot ${botId || 'inconnu'}`);
     
-    const inList = checkPlayerInBotList(playerNumber);
-    let penalized = false;
-    
-    if (inList) {
-      console.log(`⚡ Pénalité via liste`);
-      penalized = await penalizePlayerIfInBotList(playerNumber);
-    }
-    
-    if (penalized) {
+    // Vérifier si le joueur avait un dépôt
+    const deposit = BOT_DEPOSITS.get(playerNumber);
+    if (deposit) {
+      console.log(`💰 Caution NON remboursée (abandon): ${BOT_DEPOSIT} points perdus`);
+      BOT_DEPOSITS.delete(playerNumber);
+      
+      // Le joueur perd sa caution (elle n'est pas rendue)
       res.json({ 
         success: true, 
-        message: `Pénalité appliquée: -${DISCONNECT_PENALTY} points`,
-        penalty: DISCONNECT_PENALTY,
-        via_list: true
+        message: `Abandon enregistré. Caution de ${BOT_DEPOSIT} points perdue.`,
+        deposit_lost: true,
+        penalty: BOT_DEPOSIT
       });
     } else {
-      const penaltyResult = await db.applyDisconnectPenalty(playerNumber);
-      
-      if (penaltyResult.success) {
-        res.json({ 
-          success: true, 
-          message: `Pénalité appliquée: -${DISCONNECT_PENALTY} points`,
-          penalty: DISCONNECT_PENALTY,
-          new_score: penaltyResult.newScore,
-          via_list: false
-        });
-      } else {
-        res.status(500).json({ success: false, message: "Erreur application pénalité" });
-      }
+      res.json({ 
+        success: true, 
+        message: `Abandon enregistré.`,
+        deposit_lost: false
+      });
     }
   } catch (error) {
-    console.error('Erreur report-disconnect:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
-
-// Route pour voir la liste des joueurs avec bots
-app.get('/bot-players-list', (req, res) => {
-  const list = Array.from(PLAYERS_WITH_BOTS.entries()).map(([playerNumber, data]) => ({
-    playerNumber,
-    botId: data.botId,
-    addedAt: data.addedAt,
-    penalized: data.penalized,
-    penalizedAt: data.penalizedAt || 'N/A',
-    duration: Math.round((Date.now() - data.timestamp) / 1000) + 's'
-  }));
-  
-  res.json({
-    success: true,
-    count: PLAYERS_WITH_BOTS.size,
-    players: list
-  });
-});
-
-// Nettoyage automatique
-setInterval(() => {
-  const now = Date.now();
-  const maxAge = 24 * 60 * 60 * 1000;
-  let cleaned = 0;
-  
-  for (const [playerNumber, data] of PLAYERS_WITH_BOTS.entries()) {
-    if (now - data.timestamp > maxAge) {
-      PLAYERS_WITH_BOTS.delete(playerNumber);
-      cleaned++;
-    }
-  }
-  
-  if (cleaned > 0) {
-    console.log(`🧹 ${cleaned} anciennes entrées nettoyées`);
-  }
-}, 60 * 60 * 1000);
 
 app.get('/leaderboard-with-bots', async (req, res) => {
   try {
@@ -1747,9 +1673,8 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
-    disconnect_penalty: DISCONNECT_PENALTY,
-    reconnect_grace_period: `${RECONNECTION_GRACE_PERIOD/1000}s`,
-    players_with_bots: PLAYERS_WITH_BOTS.size,
+    bot_deposit: BOT_DEPOSIT,
+    active_deposits: BOT_DEPOSITS.size,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1757,6 +1682,7 @@ app.get('/health', (req, res) => {
 app.get('/update-config/:status', (req, res) => {
   const status = req.params.status;
   UPDATE_CONFIG.force_update = (status === 'true' || status === '1' || status === 'yes');
+  console.log('✅ Configuration MAJ changée: force_update =', UPDATE_CONFIG.force_update);
   res.json({ 
     success: true, 
     force_update: UPDATE_CONFIG.force_update,
@@ -1777,6 +1703,7 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
+    // Supprimé: heartbeatCheckInterval
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
     setTimeout(() => {
@@ -1787,10 +1714,9 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`📋 Système surveillance bots ACTIVÉ`);
-      console.log(`⚡ Délai reconnexion: ${RECONNECTION_GRACE_PERIOD/1000}s`);
-      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points`);
-      console.log(`🔍 /bot-players-list : Voir la liste surveillance`);
+      console.log(`💰 Système caution: ${BOT_DEPOSIT} points (rendue si partie terminée)`);
+      console.log(`📱 Supprimé: Système heartbeat/inactivité`);
+      console.log(`🎯 Score système: Ancien système préservé à 100%`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -1800,6 +1726,7 @@ async function startServer() {
 }
 
 process.on('SIGTERM', () => {
+  // Supprimé: heartbeatCheckInterval
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
@@ -1807,6 +1734,7 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
+  // Supprimé: heartbeatCheckInterval
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
