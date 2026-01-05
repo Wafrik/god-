@@ -22,7 +22,7 @@ const PORT = process.env.PORT || 8000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
-const BOT_DEPOSIT = 250; // Caution de 250 points
+const BOT_DEPOSIT = 250; // Caution de référence de 250 points
 
 const UPDATE_CONFIG = {
   force_update: false,
@@ -213,25 +213,26 @@ const db = {
         return { success: false, message: "Déjà un dépôt en cours" };
       }
       
-      // Vérifier si le joueur a assez de points
-      if (player.score < BOT_DEPOSIT) {
-        return { 
-          success: false, 
-          message: `Points insuffisants. Nécessaire: ${BOT_DEPOSIT}, Vous avez: ${player.score}` 
-        };
+      // Calculer le dépôt réel (soit le score actuel, soit 250 max)
+      let depositAmount = Math.min(player.score, BOT_DEPOSIT);
+      
+      // Si le joueur a 0 points, on autorise quand même (dépôt de 0)
+      if (player.score === 0) {
+        depositAmount = 0;
       }
       
-      // Retirer la caution
-      const newScore = player.score - BOT_DEPOSIT;
+      // Retirer la caution (ou 0 si score=0)
+      const newScore = player.score - depositAmount;
       await this.updateUserScore(playerNumber, newScore);
       
-      console.log(`💰 Dépôt caution: ${player.username} (-${BOT_DEPOSIT} points)`);
-      console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+      console.log(`💰 Dépôt caution flexible: ${player.username} (-${depositAmount} points)`);
+      console.log(`   Score avant: ${player.score}, Score après: ${newScore}`);
       
       return { 
         success: true, 
         newScore: newScore,
-        depositAmount: BOT_DEPOSIT
+        depositAmount: depositAmount,
+        hadEnough: depositAmount > 0
       };
     } catch (error) {
       console.error('Erreur dépôt caution:', error);
@@ -251,8 +252,8 @@ const db = {
         return { success: false, message: "Joueur non trouvé" };
       }
       
-      // Rendre la caution (sans bonus)
-      const refundAmount = BOT_DEPOSIT;
+      // Rendre exactement le montant qui a été prélevé
+      const refundAmount = deposit.depositAmount;
       const newScore = player.score + refundAmount;
       
       // Mettre à jour le score
@@ -262,7 +263,7 @@ const db = {
       BOT_DEPOSITS.delete(playerNumber);
       
       console.log(`💰 Caution rendue: ${player.username} (+${refundAmount} points)`);
-      console.log(`   Ancien score: ${player.score}, Nouveau score: ${newScore}`);
+      console.log(`   Score avant: ${player.score}, Score après: ${newScore}`);
       
       return { 
         success: true, 
@@ -294,8 +295,12 @@ const db = {
       const player = await this.getUserByNumber(playerNumber);
       if (!player) return false;
       
-      // Calcul du score selon l'ancien système
-      const currentScore = player.score;
+      // Récupérer le dépôt
+      const deposit = BOT_DEPOSITS.get(playerNumber);
+      const depositAmount = deposit ? deposit.depositAmount : 0;
+      
+      // Calcul du score selon l'ancien système (mais avec le score actuel AVANT dépôt)
+      const currentScore = player.score + depositAmount; // Score avant dépôt
       const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
       
       let newScore = currentScore;
@@ -303,7 +308,7 @@ const db = {
       if (isDraw) {
         // Match nul: on rend juste la caution
         await this.refundBotDeposit(playerNumber);
-        console.log(`🤝 Match nul - ${player.username} récupère sa caution`);
+        console.log(`🤝 Match nul - ${player.username} récupère sa caution (${depositAmount} points)`);
         return true;
       }
       
@@ -322,14 +327,17 @@ const db = {
         }
       }
       
-      // Mettre à jour le score
+      // Mettre à jour le score final
       await pool.query(
         'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
         [newScore, playerNumber]
       );
       
-      // Rendre la caution (que le joueur gagne ou perde, s'il termine la partie)
-      await this.refundBotDeposit(playerNumber);
+      // Pas besoin de rendre la caution car le score a déjà été calculé avec
+      if (deposit) {
+        BOT_DEPOSITS.delete(playerNumber);
+        console.log(`💰 Dépôt de ${depositAmount} points intégré au calcul`);
+      }
       
       return true;
     } catch (error) {
@@ -1441,7 +1449,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }
     },
 
-    // NOUVEAU: Demander un bot via WebSocket (authentifié)
     request_bot: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
@@ -1450,7 +1457,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         return ws.send(JSON.stringify({ type: 'error', message: 'Déjà dans une partie' }));
       }
       
-      // Prélever la caution de 250 points
+      // Prélever la caution flexible (0 à 250 selon le score)
       const depositResult = await db.applyBotDeposit(playerNumber);
       if (!depositResult.success) {
         return ws.send(JSON.stringify({ 
@@ -1463,25 +1470,31 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       const bot = getRandomBot();
       const botId = bot.id;
       
-      // Enregistrer le dépôt
+      // Enregistrer le dépôt (même si 0)
       BOT_DEPOSITS.set(playerNumber, {
         botId: botId,
-        depositAmount: BOT_DEPOSIT,
+        depositAmount: depositResult.depositAmount,
         timestamp: Date.now()
       });
       
       console.log(`🤖 Bot demandé par ${playerNumber} via WebSocket`);
-      console.log(`💰 Caution prélevée: -${BOT_DEPOSIT} points`);
+      console.log(`💰 Caution flexible prélevée: -${depositResult.depositAmount} points`);
       console.log(`🤖 Bot assigné: ${bot.username} (${botId})`);
+      
+      // Message spécial si caution = 0
+      let depositMessage = "Caution flexible appliquée.";
+      if (depositResult.depositAmount === 0) {
+        depositMessage = "Vous jouez avec 0 points de caution. Si vous abandonnez, vous ne perdez rien.";
+      }
       
       // Envoyer le bot au joueur
       ws.send(JSON.stringify({
         type: 'bot_assigned',
         bot: bot,
-        depositApplied: true,
-        depositAmount: BOT_DEPOSIT,
+        depositApplied: depositResult.hadEnough,
+        depositAmount: depositResult.depositAmount,
         newScore: depositResult.newScore,
-        message: "Bot assigné. Si vous abandonnez, vous perdrez votre caution."
+        message: depositMessage
       }));
     },
     
@@ -1575,9 +1588,9 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
     
     // Vérifier si le joueur a un dépôt enregistré
     const deposit = BOT_DEPOSITS.get(playerNumber);
-    if (!deposit || deposit.botId !== botId) {
-      console.warn(`⚠️ Pas de dépôt trouvé pour ${playerNumber} contre ${botId}`);
-    }
+    const depositAmount = deposit ? deposit.depositAmount : 0;
+    
+    console.log(`💰 Dépôt enregistré pour ${playerNumber}: ${depositAmount} points`);
     
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin, isDraw);
     
@@ -1592,23 +1605,20 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
           success: true, 
           message: "Scores mis à jour",
           is_draw: isDraw,
-          deposit_handled: !!deposit
+          deposit_handled: !!deposit,
+          deposit_amount: depositAmount
         });
       } else {
         res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
       }
     } else {
-      // Pour un match nul, on rend juste la caution
-      if (deposit) {
-        const drawRefund = await db.refundBotDeposit(playerNumber);
-        console.log(`🤝 Match nul - ${playerNumber} récupère sa caution`);
-      }
-      
+      // Pour un match nul, le dépôt a déjà été rendu dans updateUserScoreAfterBotMatch
       res.json({ 
         success: true, 
         message: "Match nul - Caution rendue",
         is_draw: true,
-        deposit_refunded: !!deposit
+        deposit_refunded: !!deposit,
+        deposit_amount: depositAmount
       });
     }
   } catch (error) {
@@ -1630,15 +1640,16 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
     // Vérifier si le joueur avait un dépôt
     const deposit = BOT_DEPOSITS.get(playerNumber);
     if (deposit) {
-      console.log(`💰 Caution NON remboursée (abandon): ${BOT_DEPOSIT} points perdus`);
+      const depositAmount = deposit.depositAmount;
+      console.log(`💰 Caution NON remboursée (abandon): ${depositAmount} points perdus`);
       BOT_DEPOSITS.delete(playerNumber);
       
       // Le joueur perd sa caution (elle n'est pas rendue)
       res.json({ 
         success: true, 
-        message: `Abandon enregistré. Caution de ${BOT_DEPOSIT} points perdue.`,
+        message: `Abandon enregistré. Caution de ${depositAmount} points perdue.`,
         deposit_lost: true,
-        penalty: BOT_DEPOSIT
+        penalty: depositAmount
       });
     } else {
       res.json({ 
@@ -1726,7 +1737,10 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`💰 Système caution: ${BOT_DEPOSIT} points`);
+      console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
+      console.log(`   • Si score ≥ 250: prélève 250 points`);
+      console.log(`   • Si score < 250: prélève tout le score`);
+      console.log(`   • Si score = 0: caution de 0 points`);
       console.log(`🌐 Utilisez WebSocket "request_bot" pour système caution`);
       console.log(`=========================================`);
     });
@@ -1751,5 +1765,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
