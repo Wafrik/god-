@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { Pool } = require('pg');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -23,18 +22,11 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const DISCONNECT_PENALTY = 250;
+const RECONNECTION_GRACE_PERIOD = 5 * 1000;
 
-// SYSTEME D'INACTIVITE (détection seulement)
-const HEARTBEAT_TIMEOUT = 30 * 1000; // 30 secondes d'inactivité
-const HEARTBEAT_CHECK_INTERVAL = 10 * 1000; // Vérifier toutes les 10 secondes
-const RECONNECTION_GRACE_PERIOD = 5 * 1000; // Délai réduit à 5 secondes
-
-// Suivi des heartbeats
-const PLAYER_HEARTBEATS = new Map();
-let heartbeatCheckInterval = null;
-
-// LISTE TEMPORAIRE des joueurs qui ont reçu un bot
-const PLAYERS_WITH_BOTS = new Map(); // Format: { playerNumber: { botId, timestamp, penalized } }
+// Système de surveillance des bots
+const PLAYERS_WITH_BOTS = new Map();
+const BOT_REQUESTS = new Map();
 
 const UPDATE_CONFIG = {
   force_update: false,
@@ -52,46 +44,46 @@ const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
 
 const BOTS = [
-  { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 0 },
-  { id: "bot_m_002", username: "Thomas", gender: "M", baseScore: 0 },
-  { id: "bot_m_003", username: "Alexandre", gender: "M", baseScore: 0 },
-  { id: "bot_m_004", username: "Mathis", gender: "M", baseScore: 0 },
-  { id: "bot_m_005", username: "Nathan", gender: "M", baseScore: 0 },
-  { id: "bot_m_006", username: "Enzo", gender: "M", baseScore: 0 },
-  { id: "bot_m_007", username: "Louis", gender: "M", baseScore: 0 },
-  { id: "bot_m_008", username: "Gabriel", gender: "M", baseScore: 0 },
-  { id: "bot_m_009", username: "Hugo", gender: "M", baseScore: 0 },
-  { id: "bot_m_010", username: "Raphaël", gender: "M", baseScore: 0 },
-  { id: "bot_f_001", username: "Emma", gender: "F", baseScore: 0 },
-  { id: "bot_f_002", username: "Léa", gender: "F", baseScore: 0 },
-  { id: "bot_f_003", username: "Manon", gender: "F", baseScore: 0 },
-  { id: "bot_f_004", username: "Chloé", gender: "F", baseScore: 0 },
-  { id: "bot_f_005", username: "Camille", gender: "F", baseScore: 0 },
-  { id: "bot_f_006", username: "Sarah", gender: "F", baseScore: 0 },
-  { id: "bot_f_007", username: "Julie", gender: "F", baseScore: 0 },
-  { id: "bot_f_008", username: "Clara", gender: "F", baseScore: 0 },
-  { id: "bot_f_009", username: "Inès", gender: "F", baseScore: 0 },
-  { id: "bot_f_010", username: "Zoé", gender: "F", baseScore: 0 },
-  { id: "bot_001", username: "Zaboule", gender: "M", baseScore: 0 },
-  { id: "bot_002", username: "Ddk", gender: "M", baseScore: 0 },
-  { id: "bot_003", username: "Zokou la panthère", gender: "M", baseScore: 0 },
-  { id: "bot_004", username: "Atom", gender: "M", baseScore: 0 },
-  { id: "bot_005", username: "Yven125", gender: "M", baseScore: 0 },
-  { id: "bot_006", username: "Pataff4", gender: "M", baseScore: 0 },
-  { id: "bot_007", username: "Afrocc", gender: "M", baseScore: 0 },
-  { id: "bot_008", username: "Le babato deluxe", gender: "M", baseScore: 0 },
-  { id: "bot_009", username: "Miello", gender: "M", baseScore: 0 },
-  { id: "bot_010", username: "2418coto", gender: "M", baseScore: 0 },
-  { id: "bot_011", username: "Yako2001", gender: "M", baseScore: 0 },
-  { id: "bot_012", username: "Ziparotus", gender: "M", baseScore: 0 },
-  { id: "bot_013", username: "Agapli", gender: "F", baseScore: 0 },
-  { id: "bot_014", username: "Mireille68", gender: "F", baseScore: 0 },
-  { id: "bot_015", username: "Pela8", gender: "F", baseScore: 0 },
-  { id: "bot_016", username: "Sylivie", gender: "F", baseScore: 0 },
-  { id: "bot_017", username: "Soeur cartie", gender: "F", baseScore: 0 },
-  { id: "bot_018", username: "Zezeta23", gender: "F", baseScore: 0 },
-  { id: "bot_019", username: "Timo", gender: "M", baseScore: 0 },
-  { id: "bot_020", username: "Lina", gender: "F", baseScore: 0 }
+  { id: "bot_001", username: "Zaboule", score: 0 },
+  { id: "bot_002", username: "Ddk", score: 0 },
+  { id: "bot_003", username: "Zokou la panthère", score: 0 },
+  { id: "bot_004", username: "Atom", score: 0 },
+  { id: "bot_005", username: "Yven125", score: 0 },
+  { id: "bot_006", username: "Pataff4", score: 0 },
+  { id: "bot_007", username: "Afrocc", score: 0 },
+  { id: "bot_008", username: "Le babato deluxe", score: 0 },
+  { id: "bot_009", username: "Miello", score: 0 },
+  { id: "bot_010", username: "2418coto", score: 0 },
+  { id: "bot_011", username: "Yako2001", score: 0 },
+  { id: "bot_012", username: "Ziparotus", score: 0 },
+  { id: "bot_013", username: "Agapli", score: 0 },
+  { id: "bot_014", username: "Mireille68", score: 0 },
+  { id: "bot_015", username: "Pela8", score: 0 },
+  { id: "bot_016", username: "Sylivie", score: 0 },
+  { id: "bot_017", username: "Soeur cartie", score: 0 },
+  { id: "bot_018", username: "Zezeta23", score: 0 },
+  { id: "bot_019", username: "Timo", score: 0 },
+  { id: "bot_020", username: "Lina", score: 0 },
+  { id: "bot_021", username: "Lucas", score: 0 },
+  { id: "bot_022", username: "Thomas", score: 0 },
+  { id: "bot_023", username: "Alexandre", score: 0 },
+  { id: "bot_024", username: "Mathis", score: 0 },
+  { id: "bot_025", username: "Nathan", score: 0 },
+  { id: "bot_026", username: "Enzo", score: 0 },
+  { id: "bot_027", username: "Louis", score: 0 },
+  { id: "bot_028", username: "Gabriel", score: 0 },
+  { id: "bot_029", username: "Hugo", score: 0 },
+  { id: "bot_030", username: "Raphaël", score: 0 },
+  { id: "bot_031", username: "Emma", score: 0 },
+  { id: "bot_032", username: "Léa", score: 0 },
+  { id: "bot_033", username: "Manon", score: 0 },
+  { id: "bot_034", username: "Chloé", score: 0 },
+  { id: "bot_035", username: "Camille", score: 0 },
+  { id: "bot_036", username: "Sarah", score: 0 },
+  { id: "bot_037", username: "Julie", score: 0 },
+  { id: "bot_038", username: "Clara", score: 0 },
+  { id: "bot_039", username: "Inès", score: 0 },
+  { id: "bot_040", username: "Zoé", score: 0 }
 ];
 
 let botAutoIncrementInterval = null;
@@ -105,7 +97,7 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// FONCTIONS GESTION LISTE TEMPORAIRE BOTS avec logs détaillés
+// Fonctions de surveillance des bots
 function addPlayerWithBot(playerNumber, botId) {
   PLAYERS_WITH_BOTS.set(playerNumber, {
     botId: botId,
@@ -113,159 +105,68 @@ function addPlayerWithBot(playerNumber, botId) {
     penalized: false,
     addedAt: new Date().toISOString()
   });
-  console.log(`📋 [LISTE] Joueur ${playerNumber} AJOUTÉ à la liste bots (contre ${botId})`);
-  console.log(`   📊 Liste actuelle: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`);
+  console.log(`📋 ${playerNumber} ajouté liste bots (${botId})`);
 }
 
 function removePlayerWithBot(playerNumber) {
   if (PLAYERS_WITH_BOTS.has(playerNumber)) {
     const playerData = PLAYERS_WITH_BOTS.get(playerNumber);
-    console.log(`✅ [LISTE] Joueur ${playerNumber} RETIRÉ de la liste bots`);
-    console.log(`   📅 Temps dans liste: ${Math.round((Date.now() - playerData.timestamp)/1000)}s`);
-    console.log(`   ❌ Pénalisé: ${playerData.penalized ? 'OUI' : 'NON'}`);
+    console.log(`✅ ${playerNumber} retiré liste bots`);
+    console.log(`⏱️ Temps liste: ${Math.round((Date.now() - playerData.timestamp)/1000)}s`);
+    console.log(`❌ Pénalisé: ${playerData.penalized ? 'OUI' : 'NON'}`);
     PLAYERS_WITH_BOTS.delete(playerNumber);
-    console.log(`   📊 Liste après retrait: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`);
     return true;
-  } else {
-    console.log(`ℹ️ [LISTE] Joueur ${playerNumber} n'était PAS dans la liste`);
-    return false;
   }
+  return false;
 }
 
 function checkPlayerInBotList(playerNumber) {
   const inList = PLAYERS_WITH_BOTS.has(playerNumber);
-  const status = inList ? 'OUI' : 'NON';
-  console.log(`🔍 [LISTE] Vérification ${playerNumber}: Listevst = ${status}`);
-  if (inList) {
-    const data = PLAYERS_WITH_BOTS.get(playerNumber);
-    console.log(`   🤖 Bot: ${data.botId}, Pénalisé: ${data.penalized ? 'OUI' : 'NON'}`);
-  }
+  console.log(`🔍 ${playerNumber}: Listevst = ${inList ? 'OUI' : 'NON'}`);
   return inList;
 }
 
 async function penalizePlayerIfInBotList(playerNumber) {
-  console.log(`⚡ [PÉNALITÉ] Vérification pour ${playerNumber}...`);
-  
   if (PLAYERS_WITH_BOTS.has(playerNumber)) {
     const playerData = PLAYERS_WITH_BOTS.get(playerNumber);
     
-    // Éviter de pénaliser deux fois
     if (playerData.penalized) {
-      console.log(`ℹ️ [PÉNALITÉ] Joueur ${playerNumber} DÉJÀ pénalisé précédemment`);
-      console.log(`   📝 Pénalité = NO (déjà appliquée)`);
+      console.log(`ℹ️ ${playerNumber} déjà pénalisé`);
       return false;
     }
     
-    console.log(`⚡ [PÉNALITÉ] Joueur ${playerNumber} DANS la liste - Application pénalité`);
-    console.log(`   📝 Pénalité = -${DISCONNECT_PENALTY} points`);
+    console.log(`⚡ ${playerNumber} DANS liste - Pénalité -${DISCONNECT_PENALTY}`);
     
-    // Marquer comme pénalisé
     playerData.penalized = true;
     playerData.penalizedAt = new Date().toISOString();
     PLAYERS_WITH_BOTS.set(playerNumber, playerData);
     
-    // Appliquer la pénalité
     const penaltyResult = await db.applyDisconnectPenalty(playerNumber);
     
     if (penaltyResult.success) {
-      console.log(`✅ [PÉNALITÉ] Pénalité appliquée avec succès à ${playerNumber}`);
-      console.log(`   💰 Ancien score: ${penaltyResult.oldScore}, Nouveau score: ${penaltyResult.newScore}`);
-      
-      // Retirer de la liste après pénalité
-      setTimeout(() => {
-        removePlayerWithBot(playerNumber);
-      }, 3000);
-      
+      console.log(`✅ Pénalité appliquée ${playerNumber}`);
+      setTimeout(() => removePlayerWithBot(playerNumber), 3000);
       return true;
-    } else {
-      console.log(`❌ [PÉNALITÉ] Échec application pénalité pour ${playerNumber}`);
-      return false;
     }
-  } else {
-    console.log(`ℹ️ [PÉNALITÉ] Joueur ${playerNumber} PAS dans la liste bots`);
-    console.log(`   📝 Pénalité = NO (pas dans liste)`);
-    return false;
   }
+  console.log(`ℹ️ ${playerNumber} PAS dans liste bots`);
+  return false;
 }
 
-// FONCTIONS HEARTBEAT (détection seulement, pas de pénalité)
-function recordHeartbeat(playerNumber) {
-    PLAYER_HEARTBEATS.set(playerNumber, Date.now());
-}
-
-function checkInactivePlayers() {
-    const now = Date.now();
-    
-    for (const [playerNumber, lastHeartbeat] of PLAYER_HEARTBEATS.entries()) {
-        const inactiveTime = now - lastHeartbeat;
-        
-        if (inactiveTime > HEARTBEAT_TIMEOUT) {
-            console.log(`⚠️ [INACTIVITÉ] Joueur ${playerNumber} inactif depuis ${Math.round(inactiveTime/1000)}s`);
-            
-            handleInactivePlayerDisconnect(playerNumber);
-            
-            PLAYER_HEARTBEATS.delete(playerNumber);
-        }
+// Fonction pour trouver le joueur par IP
+function findPlayerByIp(ip) {
+  for (const [deviceKey, playerNumber] of TRUSTED_DEVICES.entries()) {
+    if (deviceKey.includes(ip)) {
+      console.log(`🔗 Trouvé ${playerNumber} pour IP ${ip}`);
+      return playerNumber;
     }
-}
-
-async function handleInactivePlayerDisconnect(playerNumber) {
-    try {
-        const player = await db.getUserByNumber(playerNumber);
-        if (!player) return;
-        
-        console.log(`🔌 [INACTIVITÉ] Déconnexion: ${player.username} (${playerNumber})`);
-        
-        // Vérifier s'il est dans la liste bots
-        const inList = checkPlayerInBotList(playerNumber);
-        if (inList) {
-            await penalizePlayerIfInBotList(playerNumber);
-        }
-        
-        const gameId = PLAYER_TO_GAME.get(playerNumber);
-        if (gameId) {
-            const game = ACTIVE_GAMES.get(gameId);
-            if (game) {
-                const playerObj = game.getPlayerByNumber(playerNumber);
-                if (playerObj) {
-                    game.broadcast({ 
-                        type: 'player_inactive', 
-                        message: `${player.username} a été déconnecté pour inactivité` 
-                    });
-                    
-                    const opponent = game.players.find(p => p.number !== playerNumber);
-                    if (opponent) {
-                        game.broadcast({ 
-                            type: 'game_end', 
-                            data: { 
-                                scores: game.scores, 
-                                winner: opponent.role,
-                                reason: 'inactivity'
-                            } 
-                        });
-                        
-                        setTimeout(() => game.cleanup(), 3000);
-                    }
-                }
-            }
-        }
-        
-        PLAYER_CONNECTIONS.delete(playerNumber);
-        PLAYER_QUEUE.delete(playerNumber);
-        PLAYER_TO_GAME.delete(playerNumber);
-        
-        await db.setUserOnlineStatus(playerNumber, false);
-        
-        return { success: true };
-    } catch (error) {
-        console.error('Erreur gestion inactivité:', error);
-        return { success: false };
-    }
+  }
+  return null;
 }
 
 function getRandomBot() {
   const randomBot = BOTS[Math.floor(Math.random() * BOTS.length)];
-  const botScore = BOT_SCORES.get(randomBot.id) || randomBot.baseScore;
+  const botScore = BOT_SCORES.get(randomBot.id) || randomBot.score;
   return { ...randomBot, score: botScore, is_bot: true };
 }
 
@@ -380,7 +281,7 @@ const db = {
         const oldScore = player.score;
         const newScore = Math.max(0, player.score - DISCONNECT_PENALTY);
         const result = await this.updateUserScore(number, newScore);
-        console.log(`⚡ [PÉNALITÉ DB] ${player.username}: ${oldScore} - ${DISCONNECT_PENALTY} = ${newScore}`);
+        console.log(`⚡ ${player.username}: ${oldScore} - ${DISCONNECT_PENALTY} = ${newScore}`);
         return { success: true, newScore, oldScore };
       }
       return { success: false };
@@ -407,7 +308,7 @@ const db = {
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
     try {
       if (isDraw) {
-        console.log(`[BOT MATCH] Match nul - Aucun changement de score pour ${playerNumber}`);
+        console.log(`[BOT MATCH] Match nul ${playerNumber}`);
         return true;
       }
       
@@ -419,14 +320,14 @@ const db = {
       
       if (isWin) {
         newScore = currentScore + playerGameScore + 200;
-        console.log(`🏆 [BOT MATCH] Victoire ${playerNumber}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
+        console.log(`🏆 ${playerNumber} gagne: +${playerGameScore}+200`);
       } else {
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
-          console.log(`🔥 [BOT MATCH] Défaite (≥10k) ${playerNumber}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
+          console.log(`🔥 ${playerNumber} perd (≥10k): -${playerGameScore}-200`);
         } else {
           newScore = Math.max(0, currentScore - playerGameScore);
-          console.log(`😢 [BOT MATCH] Défaite (<10k) ${playerNumber}: ${currentScore} - ${playerGameScore} = ${newScore}`);
+          console.log(`😢 ${playerNumber} perd: -${playerGameScore}`);
         }
       }
       
@@ -525,7 +426,7 @@ const db = {
       `);
       
       for (const bot of BOTS) {
-        BOT_SCORES.set(bot.id, bot.baseScore);
+        BOT_SCORES.set(bot.id, bot.score);
       }
       
       return { 
@@ -733,8 +634,7 @@ async function initializeDatabase() {
       CREATE TABLE IF NOT EXISTS bot_profiles (
         id VARCHAR(50) PRIMARY KEY,
         username VARCHAR(50) NOT NULL,
-        gender VARCHAR(1) NOT NULL,
-        base_score INTEGER DEFAULT 100,
+        base_score INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -752,19 +652,18 @@ async function initializeDatabase() {
 
     for (const bot of BOTS) {
       await pool.query(`
-        INSERT INTO bot_profiles (id, username, gender, base_score) 
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO bot_profiles (id, username, base_score) 
+        VALUES ($1, $2, $3)
         ON CONFLICT (id) DO UPDATE SET
           username = EXCLUDED.username,
-          gender = EXCLUDED.gender,
           base_score = EXCLUDED.base_score
-      `, [bot.id, bot.username, bot.gender, bot.baseScore]);
+      `, [bot.id, bot.username, bot.score]);
       
       await pool.query(`
         INSERT INTO bot_scores (bot_id, score) 
         VALUES ($1, $2)
         ON CONFLICT (bot_id) DO NOTHING
-      `, [bot.id, bot.baseScore]);
+      `, [bot.id, bot.score]);
     }
 
   } catch (error) {
@@ -943,9 +842,8 @@ class Game {
   }
 
   async handlePlayerDisconnect(disconnectedPlayer) {
-    console.log(`🔴 [DÉCONNEXION PARTIE] Joueur ${disconnectedPlayer.number} déconnecté pendant la partie ${this.id}`);
+    console.log(`🔴 ${disconnectedPlayer.number} déconnecté partie ${this.id}`);
     
-    // Vérifier s'il est dans la liste bots
     const inList = checkPlayerInBotList(disconnectedPlayer.number);
     if (inList) {
       await penalizePlayerIfInBotList(disconnectedPlayer.number);
@@ -954,36 +852,31 @@ class Game {
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
     
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
-      console.log(`📢 [PARTIE] Annonce à ${remainingPlayer.number} que l'adversaire a quitté`);
       remainingPlayer.ws.send(JSON.stringify({ 
         type: 'opponent_left', 
         message: 'Adversaire a quitté la partie',
         opponent: disconnectedPlayer.username || disconnectedPlayer.number
       }));
       
-      // Appliquer la pénalité
       await this._endGameByDisconnect(disconnectedPlayer, remainingPlayer);
     } else {
-      console.log(`🗑️ [PARTIE] Nettoyage partie ${this.id} - aucun joueur restant`);
       this.cleanup();
     }
   }
 
   async _endGameByDisconnect(disconnectedPlayer, remainingPlayer) {
-    console.log(`⚡ [PARTIE] Application pénalité abandon pour ${disconnectedPlayer.number}`);
+    console.log(`⚡ Pénalité abandon ${disconnectedPlayer.number}`);
     
-    // Appliquer la pénalité d'abandon standard
     await db.applyDisconnectPenalty(disconnectedPlayer.number);
     
-    // Si c'est un match PvP, donner des points au joueur restant
     if (!disconnectedPlayer.is_bot && !remainingPlayer.is_bot) {
       try {
         const remainingUser = await db.getUserByNumber(remainingPlayer.number);
         if (remainingUser) {
-          const bonus = 100; // Bonus pour victoire par abandon
+          const bonus = 100;
           const newScore = remainingUser.score + bonus;
           await db.updateUserScore(remainingPlayer.number, newScore);
-          console.log(`🎁 [PARTIE] Bonus ${bonus} points pour ${remainingPlayer.number} (victoire par abandon)`);
+          console.log(`🎁 Bonus ${bonus} points ${remainingPlayer.number}`);
         }
       } catch (error) {
         console.error('Erreur bonus abandon:', error);
@@ -1041,7 +934,7 @@ class Game {
   async _updatePlayerScores(winner) {
     try {
       if (winner === 'draw') {
-        console.log('Match nul - Aucun changement de score');
+        console.log('Match nul');
         return;
       }
       
@@ -1054,14 +947,14 @@ class Game {
           
           if (winner === player.role) {
             newScore = user.score + totalScore + 200;
-            console.log(`🏆 ${player.number} gagne: ${user.score} + ${totalScore} + 200 = ${newScore}`);
+            console.log(`🏆 ${player.number} gagne: +${totalScore}+200`);
           } else {
             if (isHighScore) {
               newScore = Math.max(0, user.score - totalScore - 200);
-              console.log(`🔥 ${player.number} perd (≥10k): ${user.score} - ${totalScore} - 200 = ${newScore}`);
+              console.log(`🔥 ${player.number} perd: -${totalScore}-200`);
             } else {
               newScore = Math.max(0, user.score - totalScore);
-              console.log(`😢 ${player.number} perd (<10k): ${user.score} - ${totalScore} = ${newScore}`);
+              console.log(`😢 ${player.number} perd: -${totalScore}`);
             }
           }
           
@@ -1077,10 +970,8 @@ class Game {
     if (this.timerInterval) clearInterval(this.timerInterval);
     this.players.forEach(p => {
       PLAYER_TO_GAME.delete(p.number);
-      PLAYER_HEARTBEATS.delete(p.number);
     });
     ACTIVE_GAMES.delete(this.id);
-    console.log(`🧹 Partie ${this.id} nettoyée`);
   }
 
   getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
@@ -1120,59 +1011,44 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', async () => {
-    console.log(`🔌 [WEBSOCKET] Connexion fermée (${deviceId})`);
-    
     if (isAdminConnection && adminId) {
-      console.log(`🔧 [ADMIN] Déconnexion admin ${adminId}`);
       ADMIN_CONNECTIONS.delete(adminId);
     } else {
-      // Délai réduit à 5 secondes pour permettre la reconnexion rapide
       setTimeout(async () => {
         const deviceKey = generateDeviceKey(ip, deviceId);
         const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
         
         if (disconnectedNumber) {
-          console.log(`👤 [WEBSOCKET] Déconnexion détectée pour joueur ${disconnectedNumber}`);
-          console.log(`   ⏱️ Attente ${RECONNECTION_GRACE_PERIOD/1000}s avant traitement...`);
+          console.log(`👤 Déconnexion ${disconnectedNumber}`);
           
-          // VÉRIFIER ET PÉNALISER SI LE JOUEUR EST DANS LA LISTE BOTS
-          console.log(`🔍 [WEBSOCKET] Vérification liste bots pour ${disconnectedNumber}...`);
           const inList = checkPlayerInBotList(disconnectedNumber);
           
           if (inList) {
-            console.log(`⚡ [WEBSOCKET] Joueur ${disconnectedNumber} DANS la liste - Application pénalité`);
+            console.log(`⚡ ${disconnectedNumber} DANS liste - Pénalité`);
             await penalizePlayerIfInBotList(disconnectedNumber);
           } else {
-            console.log(`ℹ️ [WEBSOCKET] Joueur ${disconnectedNumber} PAS dans la liste bots`);
-            console.log(`   📝 Pénalité = NO (pas dans liste)`);
+            console.log(`ℹ️ ${disconnectedNumber} PAS dans liste bots`);
           }
           
           PLAYER_CONNECTIONS.delete(disconnectedNumber);
           PLAYER_QUEUE.delete(disconnectedNumber);
-          PLAYER_HEARTBEATS.delete(disconnectedNumber);
           
           await db.setUserOnlineStatus(disconnectedNumber, false);
           
           const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
           if (gameId) {
-            console.log(`🎮 [WEBSOCKET] Joueur ${disconnectedNumber} était en partie ${gameId}`);
             const game = ACTIVE_GAMES.get(gameId);
             if (game) {
               const player = game.getPlayerByNumber(disconnectedNumber);
               if (player) {
-                console.log(`⚡ [WEBSOCKET] Traitement déconnexion pour partie ${gameId}`);
                 await game.handlePlayerDisconnect(player);
               }
             }
-          } else {
-            console.log(`ℹ️ [WEBSOCKET] Joueur ${disconnectedNumber} n'était pas en partie PvP`);
           }
           
           PLAYER_TO_GAME.delete(disconnectedNumber);
-        } else {
-          console.log(`ℹ️ [WEBSOCKET] Aucun joueur associé à ${deviceKey}`);
         }
-      }, RECONNECTION_GRACE_PERIOD); // 5 secondes
+      }, RECONNECTION_GRACE_PERIOD);
     }
   });
 });
@@ -1407,27 +1283,18 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
   
-  if (playerNumber && message.type !== 'heartbeat') {
-      recordHeartbeat(playerNumber);
-  }
-  
   const handlers = {
     heartbeat: async () => {
       if (playerNumber) {
-          recordHeartbeat(playerNumber);
-          ws.send(JSON.stringify({ 
-              type: 'heartbeat_ack',
-              timestamp: Date.now()
-          }));
+        ws.send(JSON.stringify({ 
+            type: 'heartbeat_ack',
+            timestamp: Date.now()
+        }));
       }
     },
 
     check_update: async () => {
-      console.log('📱 Vérification MAJ demandée');
-      console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
-      
       if (UPDATE_CONFIG.force_update) {
-        console.log('⚠️ MAJ FORCÉE activée - Envoi réponse MAJ requise');
         ws.send(JSON.stringify({
           type: 'check_update_response',
           needs_update: true,
@@ -1437,7 +1304,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           update_url: UPDATE_CONFIG.update_url
         }));
       } else {
-        console.log('✅ Pas de MAJ requise - Version à jour');
         ws.send(JSON.stringify({
           type: 'check_update_response',
           needs_update: false,
@@ -1460,8 +1326,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         PLAYER_CONNECTIONS.set(message.number, ws);
         await db.setUserOnlineStatus(message.number, true);
-        
-        recordHeartbeat(message.number);
         
         ws.send(JSON.stringify({ 
           type: 'auth_success', 
@@ -1493,8 +1357,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         PLAYER_CONNECTIONS.set(number, ws);
         
-        recordHeartbeat(number);
-        
         ws.send(JSON.stringify({ 
           type: 'register_success', 
           message: "Inscription réussie", 
@@ -1509,9 +1371,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     logout: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (playerNumber) {
-        console.log(`🚪 [LOGOUT] Logout manuel pour ${playerNumber}`);
         
-        // VÉRIFIER ET PÉNALISER SI LE JOUEUR EST DANS LA LISTE BOTS
         const inList = checkPlayerInBotList(playerNumber);
         if (inList) {
           await penalizePlayerIfInBotList(playerNumber);
@@ -1522,7 +1382,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         
         PLAYER_CONNECTIONS.delete(playerNumber);
         PLAYER_QUEUE.delete(playerNumber);
-        PLAYER_HEARTBEATS.delete(playerNumber);
         
         await db.setUserOnlineStatus(playerNumber, false);
         
@@ -1550,8 +1409,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             TRUSTED_DEVICES.set(deviceKey, user.number);
             await db.createTrustedDevice(deviceKey, user.number);
           }
-          
-          recordHeartbeat(user.number);
           
           ws.send(JSON.stringify({ 
             type: 'auto_login_success', 
@@ -1587,8 +1444,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
             await db.updateUserToken(user.number, newToken);
             user.token = newToken;
           }
-          
-          recordHeartbeat(trustedNumber);
           
           ws.send(JSON.stringify({ 
             type: 'auto_login_success', 
@@ -1666,8 +1521,6 @@ function handleGameAction(ws, message, deviceKey) {
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
   if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non identifié' }));
   
-  recordHeartbeat(playerNumber);
-  
   const game = ACTIVE_GAMES.get(PLAYER_TO_GAME.get(playerNumber));
   if (!game) return ws.send(JSON.stringify({ type: 'error', message: 'Aucune partie active' }));
   
@@ -1688,23 +1541,41 @@ app.get('/get-bot', (req, res) => {
   try {
     const bot = getRandomBot();
     
-    // Récupérer le playerNumber depuis le header ou query
-    const playerNumber = req.headers['player-number'] || req.query.playerNumber;
+    let playerNumber = req.query.playerNumber;
     
-    if (playerNumber) {
-      // Ajouter le joueur à la liste temporaire des bots
-      console.log(`🎯 [GET-BOT] Demande de bot reçue pour joueur ${playerNumber}`);
-      addPlayerWithBot(playerNumber, bot.id);
-      console.log(`🤖 [GET-BOT] Bot ${bot.id} assigné à ${playerNumber}`);
-      console.log(`📊 [GET-BOT] Liste bots mise à jour: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`);
-    } else {
-      console.log(`⚠️ [GET-BOT] Bot ${bot.id} assigné mais playerNumber manquant!`);
-      console.log(`   Headers: ${JSON.stringify(req.headers)}`);
-      console.log(`   Query: ${JSON.stringify(req.query)}`);
+    if (!playerNumber) {
+      playerNumber = req.headers['player-number'];
     }
     
-    res.json({ success: true, bot: bot });
+    if (!playerNumber) {
+      const clientIp = req.headers['x-forwarded-for'] || req.headers['cf-connecting-ip'] || req.ip;
+      console.log(`🔍 Recherche joueur pour IP: ${clientIp}`);
+      
+      playerNumber = findPlayerByIp(clientIp);
+    }
+    
+    if (playerNumber) {
+      console.log(`🎯 /get-bot pour ${playerNumber}`);
+      addPlayerWithBot(playerNumber, bot.id);
+      console.log(`🤖 ${bot.id} assigné à ${playerNumber}`);
+      
+      res.json({ 
+        success: true, 
+        bot: bot,
+        player_identified: true 
+      });
+    } else {
+      console.log(`⚠️ ${bot.id} assigné - joueur NON IDENTIFIÉ`);
+      
+      res.json({ 
+        success: true, 
+        bot: bot,
+        player_identified: false,
+        warning: "Joueur non identifié"
+      });
+    }
   } catch (error) {
+    console.error('Erreur /get-bot:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1717,19 +1588,14 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    console.log(`🎮 [UPDATE-BOT-MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
-    console.log(`   📊 Score joueur: ${playerScore}, Score bot: ${botScore}`);
-    console.log(`   🏆 Victoire joueur: ${isPlayerWin ? 'OUI' : 'NON'}`);
+    console.log(`🎮 Résultats ${playerNumber} vs ${botId}`);
+    console.log(`📊 Score: ${playerScore}-${botScore}, Victoire: ${isPlayerWin ? 'OUI' : 'NON'}`);
     
-    // VÉRIFIER SI LE JOUEUR EST DANS LA LISTE
     const inList = checkPlayerInBotList(playerNumber);
     
-    // RETIRER LE JOUEUR DE LA LISTE TEMPORAIRE (il a terminé sa partie)
     if (inList) {
-      console.log(`✅ [UPDATE-BOT-MATCH] Joueur ${playerNumber} terminé sa partie - Retrait liste`);
+      console.log(`✅ ${playerNumber} terminé - Retrait liste`);
       removePlayerWithBot(playerNumber);
-    } else {
-      console.log(`ℹ️ [UPDATE-BOT-MATCH] Joueur ${playerNumber} n'était pas dans la liste`);
     }
     
     const isBotWin = !isPlayerWin;
@@ -1739,7 +1605,7 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
     
     if (!isDraw) {
       const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
-      const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
+      const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.score || 0;
       
       const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore);
       
@@ -1773,17 +1639,14 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
     }
     
-    console.log(`📞 [REPORT-DISCONNECT] Signalement abandon pour ${playerNumber} contre ${botId || 'inconnu'}`);
+    console.log(`📞 Abandon ${playerNumber} vs ${botId || 'inconnu'}`);
     
-    // Vérifier et pénaliser le joueur s'il est dans la liste
     const inList = checkPlayerInBotList(playerNumber);
     let penalized = false;
     
     if (inList) {
-      console.log(`⚡ [REPORT-DISCONNECT] Application pénalité via liste`);
+      console.log(`⚡ Pénalité via liste`);
       penalized = await penalizePlayerIfInBotList(playerNumber);
-    } else {
-      console.log(`ℹ️ [REPORT-DISCONNECT] Joueur pas dans liste - pénalité standard`);
     }
     
     if (penalized) {
@@ -1794,7 +1657,6 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
         via_list: true
       });
     } else {
-      // Si pas dans la liste, appliquer quand même la pénalité
       const penaltyResult = await db.applyDisconnectPenalty(playerNumber);
       
       if (penaltyResult.success) {
@@ -1826,97 +1688,30 @@ app.get('/bot-players-list', (req, res) => {
     duration: Math.round((Date.now() - data.timestamp) / 1000) + 's'
   }));
   
-  console.log(`📋 [DEBUG] Liste bots actuelle: ${PLAYERS_WITH_BOTS.size} joueurs`);
-  
   res.json({
     success: true,
     count: PLAYERS_WITH_BOTS.size,
-    players: list,
-    debug: `Total: ${PLAYERS_WITH_BOTS.size}, Liste: ${Array.from(PLAYERS_WITH_BOTS.keys()).join(', ') || 'vide'}`
+    players: list
   });
 });
 
-// Route debug pour forcer l'ajout/retrait d'un joueur - CORRIGÉE
-app.get('/debug-bot-list/:action/:playerNumber/:botId', (req, res) => {
-  const { action, playerNumber, botId } = req.params;
-  
-  switch(action) {
-    case 'add':
-      if (botId && botId !== 'undefined') {
-        addPlayerWithBot(playerNumber, botId);
-        res.json({ success: true, message: `Joueur ${playerNumber} ajouté avec bot ${botId}` });
-      } else {
-        res.json({ success: false, message: "botId requis" });
-      }
-      break;
-      
-    case 'remove':
-      const removed = removePlayerWithBot(playerNumber);
-      res.json({ success: removed, message: removed ? `Joueur ${playerNumber} retiré` : `Joueur ${playerNumber} non trouvé` });
-      break;
-      
-    case 'check':
-      const inList = checkPlayerInBotList(playerNumber);
-      res.json({ success: true, inList, message: `Joueur ${playerNumber}: ${inList ? 'DANS la liste' : 'PAS dans la liste'}` });
-      break;
-      
-    case 'clear':
-      const previousSize = PLAYERS_WITH_BOTS.size;
-      PLAYERS_WITH_BOTS.clear();
-      console.log(`🧹 [DEBUG] Liste bots vidée (${previousSize} entrées supprimées)`);
-      res.json({ success: true, message: `Liste vidée (${previousSize} entrées)` });
-      break;
-      
-    default:
-      res.json({ success: false, message: "Action invalide" });
-  }
-});
-
-// Route pour les actions sans botId
-app.get('/debug-bot-list/:action/:playerNumber', (req, res) => {
-  const { action, playerNumber } = req.params;
-  
-  switch(action) {
-    case 'remove':
-      const removed = removePlayerWithBot(playerNumber);
-      res.json({ success: removed, message: removed ? `Joueur ${playerNumber} retiré` : `Joueur ${playerNumber} non trouvé` });
-      break;
-      
-    case 'check':
-      const inList = checkPlayerInBotList(playerNumber);
-      res.json({ success: true, inList, message: `Joueur ${playerNumber}: ${inList ? 'DANS la liste' : 'PAS dans la liste'}` });
-      break;
-      
-    case 'clear':
-      const previousSize = PLAYERS_WITH_BOTS.size;
-      PLAYERS_WITH_BOTS.clear();
-      console.log(`🧹 [DEBUG] Liste bots vidée (${previousSize} entrées supprimées)`);
-      res.json({ success: true, message: `Liste vidée (${previousSize} entrées)` });
-      break;
-      
-    default:
-      res.json({ success: false, message: "Action 'add' requiert un botId. Utilisez /debug-bot-list/add/:playerNumber/:botId" });
-  }
-});
-
-// Nettoyage automatique des anciennes entrées (24h max)
+// Nettoyage automatique
 setInterval(() => {
   const now = Date.now();
-  const maxAge = 24 * 60 * 60 * 1000; // 24 heures
+  const maxAge = 24 * 60 * 60 * 1000;
   let cleaned = 0;
   
   for (const [playerNumber, data] of PLAYERS_WITH_BOTS.entries()) {
     if (now - data.timestamp > maxAge) {
-      console.log(`🧹 [NETTOYAGE] Ancienne entrée pour ${playerNumber} (${data.botId}) - ${Math.round((now - data.timestamp)/3600000)}h`);
       PLAYERS_WITH_BOTS.delete(playerNumber);
       cleaned++;
     }
   }
   
   if (cleaned > 0) {
-    console.log(`🧹 [NETTOYAGE] ${cleaned} anciennes entrées nettoyées`);
+    console.log(`🧹 ${cleaned} anciennes entrées nettoyées`);
   }
-}, 60 * 60 * 1000); // Vérifier toutes les heures
+}, 60 * 60 * 1000);
 
 app.get('/leaderboard-with-bots', async (req, res) => {
   try {
@@ -1953,7 +1748,7 @@ app.get('/health', (req, res) => {
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
     disconnect_penalty: DISCONNECT_PENALTY,
-    reconnect_grace_period: `${RECONNECTION_GRACE_PERIOD/1000} secondes`,
+    reconnect_grace_period: `${RECONNECTION_GRACE_PERIOD/1000}s`,
     players_with_bots: PLAYERS_WITH_BOTS.size,
     timestamp: new Date().toISOString() 
   });
@@ -1962,7 +1757,6 @@ app.get('/health', (req, res) => {
 app.get('/update-config/:status', (req, res) => {
   const status = req.params.status;
   UPDATE_CONFIG.force_update = (status === 'true' || status === '1' || status === 'yes');
-  console.log('✅ Configuration MAJ changée: force_update =', UPDATE_CONFIG.force_update);
   res.json({ 
     success: true, 
     force_update: UPDATE_CONFIG.force_update,
@@ -1983,7 +1777,6 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
-    heartbeatCheckInterval = setInterval(checkInactivePlayers, HEARTBEAT_CHECK_INTERVAL);
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
     setTimeout(() => {
@@ -1994,14 +1787,10 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`📋 Système liste bots avec logs détaillés ACTIVÉ`);
-      console.log(`💓 Système heartbeat activé (${HEARTBEAT_TIMEOUT/1000}s timeout)`);
+      console.log(`📋 Système surveillance bots ACTIVÉ`);
       console.log(`⚡ Délai reconnexion: ${RECONNECTION_GRACE_PERIOD/1000}s`);
-      console.log(`📍 Pénalité abandon contre bot: -${DISCONNECT_PENALTY} points (automatique)`);
-      console.log(`🔍 Routes debug:`);
-      console.log(`   - /bot-players-list : Voir la liste actuelle`);
-      console.log(`   - /debug-bot-list/add/PLAYER/BOT : Ajouter manuellement`);
-      console.log(`   - /debug-bot-list/check/PLAYER : Vérifier un joueur`);
+      console.log(`📍 Pénalité abandon: -${DISCONNECT_PENALTY} points`);
+      console.log(`🔍 /bot-players-list : Voir la liste surveillance`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -2011,7 +1800,6 @@ async function startServer() {
 }
 
 process.on('SIGTERM', () => {
-  if (heartbeatCheckInterval) clearInterval(heartbeatCheckInterval);
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
@@ -2019,7 +1807,6 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
-  if (heartbeatCheckInterval) clearInterval(heartbeatCheckInterval);
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
