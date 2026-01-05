@@ -208,10 +208,8 @@ const db = {
         return { success: false, message: "Joueur non trouvé" };
       }
       
-      // Vérifier si le joueur a déjà un dépôt en cours
-      if (BOT_DEPOSITS.has(playerNumber)) {
-        return { success: false, message: "Déjà un dépôt en cours" };
-      }
+      // NE PAS VÉRIFIER SI DÉPÔT EXISTE DÉJÀ - C'EST SON PROBLÈME
+      // S'il y a déjà un dépôt, c'est qu'il a abandonné, on le perd
       
       // Calculer le dépôt réel (soit le score actuel, soit 250 max)
       let depositAmount = Math.min(player.score, BOT_DEPOSIT);
@@ -221,18 +219,26 @@ const db = {
         depositAmount = 0;
       }
       
-      // Retirer la caution (ou 0 si score=0)
+      // Vérifier si un dépôt existait déjà
+      const existingDeposit = BOT_DEPOSITS.get(playerNumber);
+      if (existingDeposit) {
+        console.log(`⚠️ Dépôt existant trouvé pour ${playerNumber}: ${existingDeposit.depositAmount} points`);
+        console.log(`   Le joueur perd ce dépôt car il demande un nouveau match`);
+      }
+      
+      // Retirer la nouvelle caution (ou 0 si score=0)
       const newScore = player.score - depositAmount;
       await this.updateUserScore(playerNumber, newScore);
       
-      console.log(`💰 Dépôt caution flexible: ${player.username} (-${depositAmount} points)`);
+      console.log(`💰 Nouveau dépôt caution: ${player.username} (-${depositAmount} points)`);
       console.log(`   Score avant: ${player.score}, Score après: ${newScore}`);
       
       return { 
         success: true, 
         newScore: newScore,
         depositAmount: depositAmount,
-        hadEnough: depositAmount > 0
+        hadEnough: depositAmount > 0,
+        hadPreviousDeposit: !!existingDeposit
       };
     } catch (error) {
       console.error('Erreur dépôt caution:', error);
@@ -307,7 +313,9 @@ const db = {
       
       if (isDraw) {
         // Match nul: on rend juste la caution
-        await this.refundBotDeposit(playerNumber);
+        if (depositAmount > 0) {
+          await this.refundBotDeposit(playerNumber);
+        }
         console.log(`🤝 Match nul - ${player.username} récupère sa caution (${depositAmount} points)`);
         return true;
       }
@@ -315,15 +323,15 @@ const db = {
       if (isWin) {
         // Victoire: score normal + 200
         newScore = currentScore + playerGameScore + 200;
-        console.log(`🏆 [BOT MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
+        console.log(`🏆 [ADVERSAIRE MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
         // Défaite
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
-          console.log(`🔥 [BOT MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
+          console.log(`🔥 [ADVERSAIRE MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
         } else {
           newScore = Math.max(0, currentScore - playerGameScore);
-          console.log(`😢 [BOT MATCH] Défaite (<10k) ${player.username}: ${currentScore} - ${playerGameScore} = ${newScore}`);
+          console.log(`😢 [ADVERSAIRE MATCH] Défaite (<10k) ${player.username}: ${currentScore} - ${playerGameScore} = ${newScore}`);
         }
       }
       
@@ -341,7 +349,7 @@ const db = {
       
       return true;
     } catch (error) {
-      console.error('Erreur mise à jour score bot match:', error);
+      console.error('Erreur mise à jour score adversaire match:', error);
       return false;
     }
   },
@@ -389,7 +397,7 @@ const db = {
       
       botsResult.rows.forEach((bot) => {
         leaderboard.push({
-          username: bot.username || `Bot_${bot.bot_id}`,
+          username: bot.username || `Adv_${bot.bot_id}`,
           score: bot.score,
           is_bot: true
         });
@@ -520,7 +528,7 @@ const db = {
       
       const botsResult = await pool.query(`
         SELECT bs.bot_id as id, b.username, bs.score, 
-               'bot' as number, 0 as age, 
+               'adv' as number, 0 as age, 
                bp.created_at, false as online, true as is_bot,
                RANK() OVER (ORDER BY bs.score DESC) as rank
         FROM bot_scores bs 
@@ -566,17 +574,17 @@ const db = {
       
       return combinedList;
     } catch (error) {
-      console.error('Erreur liste complète avec bots:', error);
+      console.error('Erreur liste complète avec adversaires:', error);
       return [];
     }
   },
 
   async updateBotScoreById(botId, points, operation) {
     try {
-      if (!botId) return { success: false, message: "ID bot manquant" };
+      if (!botId) return { success: false, message: "ID adversaire manquant" };
       
       const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
-      if (!botResult.rows[0]) return { success: false, message: "Bot non trouvé" };
+      if (!botResult.rows[0]) return { success: false, message: "Adversaire non trouvé" };
       
       const currentScore = botResult.rows[0].score;
       let newScore;
@@ -604,7 +612,7 @@ const db = {
         operation: operation
       };
     } catch (error) {
-      console.error('Erreur update score bot:', error);
+      console.error('Erreur update score adversaire:', error);
       return { success: false, message: "Erreur serveur" };
     }
   }
@@ -1223,18 +1231,18 @@ async function handleAdminMessage(ws, message, adminId) {
         ws.send(JSON.stringify({
           type: 'admin_update_bot_score',
           success: result.success,
-          message: result.message || 'Score bot mis à jour',
+          message: result.message || 'Score adversaire mis à jour',
           bot_id: result.bot_id,
           new_score: result.new_score,
           points: result.points,
           operation: result.operation
         }));
       } catch (error) {
-        console.error('Erreur update score bot admin:', error);
+        console.error('Erreur update score adversaire admin:', error);
         ws.send(JSON.stringify({ 
           type: 'admin_update_bot_score', 
           success: false, 
-          message: 'Erreur mise à jour score bot' 
+          message: 'Erreur mise à jour score adversaire' 
         }));
       }
     }
@@ -1466,20 +1474,23 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         }));
       }
       
-      // Choisir un bot aléatoire
+      // Choisir un adversaire aléatoire
       const bot = getRandomBot();
       const botId = bot.id;
       
-      // Enregistrer le dépôt (même si 0)
+      // Enregistrer le dépôt avec l'ID de l'adversaire
       BOT_DEPOSITS.set(playerNumber, {
         botId: botId,
         depositAmount: depositResult.depositAmount,
         timestamp: Date.now()
       });
       
-      console.log(`🤖 Bot demandé par ${playerNumber} via WebSocket`);
-      console.log(`💰 Caution flexible prélevée: -${depositResult.depositAmount} points`);
-      console.log(`🤖 Bot assigné: ${bot.username} (${botId})`);
+      console.log(`🤖 Adversaire demandé par ${playerNumber} via WebSocket`);
+      console.log(`💰 Nouvelle caution: -${depositResult.depositAmount} points`);
+      if (depositResult.hadPreviousDeposit) {
+        console.log(`⚠️ Ancien dépôt perdu (abandon implicite)`);
+      }
+      console.log(`🤖 Adversaire assigné: ${bot.username} (${botId})`);
       
       // Message spécial si caution = 0
       let depositMessage = "Caution flexible appliquée.";
@@ -1487,14 +1498,20 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         depositMessage = "Vous jouez avec 0 points de caution. Si vous abandonnez, vous ne perdez rien.";
       }
       
-      // Envoyer le bot au joueur
+      // Message si ancien dépôt perdu
+      if (depositResult.hadPreviousDeposit) {
+        depositMessage += " Ancienne caution perdue (abandon).";
+      }
+      
+      // Envoyer l'adversaire au joueur
       ws.send(JSON.stringify({
         type: 'bot_assigned',
         bot: bot,
         depositApplied: depositResult.hadEnough,
         depositAmount: depositResult.depositAmount,
         newScore: depositResult.newScore,
-        message: depositMessage
+        message: depositMessage,
+        hadPreviousDeposit: depositResult.hadPreviousDeposit
       }));
     },
     
@@ -1558,14 +1575,14 @@ app.get('/get-bot', async (req, res) => {
     // Créer un identifiant temporaire basé sur IP + User-Agent
     const tempId = `temp_${ip.replace(/[^a-zA-Z0-9]/g, '_')}_${userAgent.substring(0, 20).replace(/[^a-zA-Z0-9]/g, '_')}`;
     
-    console.log(`🤖 Bot demandé par IP: ${ip}, TempID: ${tempId}`);
+    console.log(`🤖 Adversaire demandé par IP: ${ip}, TempID: ${tempId}`);
     
     res.json({ 
       success: true, 
       bot: bot,
       tempId: tempId,
       depositApplied: false,
-      message: "Bot assigné (utilisez WebSocket pour système caution)"
+      message: "Adversaire assigné (utilisez WebSocket pour système caution)"
     });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
@@ -1580,13 +1597,13 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    console.log(`[BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
-    console.log(`   Score joueur: ${playerScore}, Score bot: ${botScore}, Victoire joueur: ${isPlayerWin}`);
+    console.log(`[ADVERSAIRE MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
+    console.log(`   Score joueur: ${playerScore}, Score adversaire: ${botScore}, Victoire joueur: ${isPlayerWin}`);
     
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
     
-    // Vérifier si le joueur a un dépôt enregistré
+    // Vérifier si le joueur avait un dépôt enregistré
     const deposit = BOT_DEPOSITS.get(playerNumber);
     const depositAmount = deposit ? deposit.depositAmount : 0;
     
@@ -1622,7 +1639,7 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       });
     }
   } catch (error) {
-    console.error('Erreur update bot match:', error);
+    console.error('Erreur update adversaire match:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1635,7 +1652,7 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
     }
     
-    console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre bot ${botId || 'inconnu'}`);
+    console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre adversaire ${botId || 'inconnu'}`);
     
     // Vérifier si le joueur avait un dépôt
     const deposit = BOT_DEPOSITS.get(playerNumber);
@@ -1684,10 +1701,10 @@ app.post('/force-bot-increment', express.json(), async (req, res) => {
     
     res.json({
       success: result.success,
-      message: "Incrément bots effectué"
+      message: "Incrément adversaires effectué"
     });
   } catch (error) {
-    console.error('Erreur force bot increment:', error);
+    console.error('Erreur force adversaire increment:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -1736,11 +1753,12 @@ async function startServer() {
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
-      console.log(`🤖 ${BOTS.length} bots disponibles`);
+      console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
       console.log(`   • Si score ≥ 250: prélève 250 points`);
       console.log(`   • Si score < 250: prélève tout le score`);
       console.log(`   • Si score = 0: caution de 0 points`);
+      console.log(`⚠️  Ancien dépôt perdu si nouveau match demandé`);
       console.log(`🌐 Utilisez WebSocket "request_bot" pour système caution`);
       console.log(`=========================================`);
     });
