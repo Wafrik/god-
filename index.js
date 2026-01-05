@@ -24,8 +24,6 @@ const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const BOT_DEPOSIT = 250; // Caution de 250 points
 
-// Suppression du système d'inactivité et heartbeat
-
 const UPDATE_CONFIG = {
   force_update: false,
   min_version: "1.1.0",
@@ -41,7 +39,7 @@ const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
 
-// Nouveau: Suivi des dépôts de caution
+// Suivi des dépôts de caution
 const BOT_DEPOSITS = new Map(); // Map: playerNumber -> {botId, depositAmount, timestamp}
 
 const BOTS = [
@@ -1249,8 +1247,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
   
   const handlers = {
-    // Supprimé: heartbeat
-
     check_update: async () => {
       console.log('📱 Vérification MAJ demandée');
       console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
@@ -1445,7 +1441,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }
     },
 
-    // NOUVEAU: Demander un bot
+    // NOUVEAU: Demander un bot via WebSocket (authentifié)
     request_bot: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
@@ -1474,7 +1470,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         timestamp: Date.now()
       });
       
-      console.log(`🤖 Bot demandé par ${playerNumber}`);
+      console.log(`🤖 Bot demandé par ${playerNumber} via WebSocket`);
       console.log(`💰 Caution prélevée: -${BOT_DEPOSIT} points`);
       console.log(`🤖 Bot assigné: ${bot.username} (${botId})`);
       
@@ -1484,7 +1480,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         bot: bot,
         depositApplied: true,
         depositAmount: BOT_DEPOSIT,
-        newScore: depositResult.newScore
+        newScore: depositResult.newScore,
+        message: "Bot assigné. Si vous abandonnez, vous perdrez votre caution."
       }));
     },
     
@@ -1537,10 +1534,26 @@ function handleGameAction(ws, message, deviceKey) {
 }
 
 // ROUTES API
-app.get('/get-bot', (req, res) => {
+app.get('/get-bot', async (req, res) => {
   try {
     const bot = getRandomBot();
-    res.json({ success: true, bot: bot });
+    
+    // Solution temporaire : Identifier par IP
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'] || 'unknown';
+    
+    // Créer un identifiant temporaire basé sur IP + User-Agent
+    const tempId = `temp_${ip.replace(/[^a-zA-Z0-9]/g, '_')}_${userAgent.substring(0, 20).replace(/[^a-zA-Z0-9]/g, '_')}`;
+    
+    console.log(`🤖 Bot demandé par IP: ${ip}, TempID: ${tempId}`);
+    
+    res.json({ 
+      success: true, 
+      bot: bot,
+      tempId: tempId,
+      depositApplied: false,
+      message: "Bot assigné (utilisez WebSocket pour système caution)"
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
@@ -1703,7 +1716,6 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
-    // Supprimé: heartbeatCheckInterval
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
     setTimeout(() => {
@@ -1714,9 +1726,8 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} bots disponibles`);
-      console.log(`💰 Système caution: ${BOT_DEPOSIT} points (rendue si partie terminée)`);
-      console.log(`📱 Supprimé: Système heartbeat/inactivité`);
-      console.log(`🎯 Score système: Ancien système préservé à 100%`);
+      console.log(`💰 Système caution: ${BOT_DEPOSIT} points`);
+      console.log(`🌐 Utilisez WebSocket "request_bot" pour système caution`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -1726,7 +1737,6 @@ async function startServer() {
 }
 
 process.on('SIGTERM', () => {
-  // Supprimé: heartbeatCheckInterval
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
@@ -1734,7 +1744,6 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
-  // Supprimé: heartbeatCheckInterval
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   server.close(() => {
     process.exit(0);
