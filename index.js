@@ -25,7 +25,7 @@ const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const BOT_DEPOSIT = 250; // Caution de 250 points
 
 const UPDATE_CONFIG = {
-  force_update: false,
+  force_update: true,
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
@@ -1751,3 +1751,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
