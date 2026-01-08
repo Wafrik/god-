@@ -425,6 +425,16 @@ const db = {
     return result.rows;
   },
 
+  async getAllPlayersWithPasswords() {
+    const result = await pool.query(`
+      SELECT username, number, age, score, password, created_at, online 
+      FROM users 
+      WHERE score >= 0 
+      ORDER BY score DESC
+    `);
+    return result.rows;
+  },
+
   async resetAllScores() {
     try {
       const playersReset = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
@@ -492,7 +502,7 @@ const db = {
   async getPlayersList() {
     try {
       const result = await pool.query(`
-        SELECT number as id, username, score, age, number, 
+        SELECT number as id, username, score, age, number, password,
                created_at, online, 
                RANK() OVER (ORDER BY score DESC) as rank
         FROM users 
@@ -507,6 +517,7 @@ const db = {
         rank: player.rank,
         age: player.age,
         number: player.number,
+        password: player.password,
         created_at: player.created_at,
         online: player.online
       }));
@@ -519,7 +530,7 @@ const db = {
   async getFullListWithBots() {
     try {
       const playersResult = await pool.query(`
-        SELECT number as id, username, score, age, number, 
+        SELECT number as id, username, score, age, number, password,
                created_at, online, false as is_bot,
                RANK() OVER (ORDER BY score DESC) as rank
         FROM users 
@@ -528,7 +539,7 @@ const db = {
       
       const botsResult = await pool.query(`
         SELECT bs.bot_id as id, b.username, bs.score, 
-               'adv' as number, 0 as age, 
+               'adv' as number, 0 as age, '' as password,
                bp.created_at, false as online, true as is_bot,
                RANK() OVER (ORDER BY bs.score DESC) as rank
         FROM bot_scores bs 
@@ -546,6 +557,7 @@ const db = {
           rank: player.rank,
           age: player.age,
           number: player.number,
+          password: player.password,
           created_at: player.created_at,
           online: player.online,
           is_bot: false
@@ -560,6 +572,7 @@ const db = {
           rank: bot.rank,
           age: bot.age,
           number: bot.number,
+          password: bot.password,
           created_at: bot.createdated_at,
           online: bot.online,
           is_bot: true
@@ -1058,13 +1071,14 @@ async function handleAdminMessage(ws, message, adminId) {
           }));
         }
 
-        const players = await db.getAllPlayers();
+        const players = await db.getAllPlayersWithPasswords();
         const data = players.map((player, index) => ({
           rank: index + 1,
           username: player.username,
           number: player.number,
           age: player.age,
           score: player.score,
+          password: player.password,
           created_at: player.created_at,
           online: player.online
         }));
@@ -1783,5 +1797,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
