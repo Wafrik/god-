@@ -27,11 +27,11 @@ const BOT_DEPOSIT = 250; // Caution de référence de 250 points
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
   anti_quick_rematch: true,       // Activer/désactiver l'anti-match rapide
-  min_rematch_delay: 5 * 60 * 1000, // 5 minutes en millisecondes
+  min_rematch_delay: 50 * 60 * 1000, // 5 minutes en millisecondes
 };
 
 const UPDATE_CONFIG = {
-  force_update: false,
+  force_update: true,
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
@@ -1982,6 +1982,7 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
 
 
