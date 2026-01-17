@@ -248,7 +248,8 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
           [sponsorship.sponsor_number, sponsorship.sponsored_number]
         );
         
-        // Mettre à jour le compteur du parrain
+        // CORRECTION IMPORTANTE : Ajouter +1 AU COMPTEUR SEULEMENT QUAND LE FILLEUL ATTEINT 2000
+        // (total_sponsored ET validated_sponsored augmentent tous les deux)
         await pool.query(
           `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
            VALUES ($1, 1, 1) 
@@ -260,6 +261,7 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
         );
         
         console.log(`✅ Parrainage validé: ${sponsorship.sponsor_number} → ${sponsorship.sponsored_number}`);
+        console.log(`   +1 ajouté au compteur du parrain (score atteint: ${newScore})`);
         
         // Notifier le parrain si connecté
         const sponsorWs = PLAYER_CONNECTIONS.get(sponsorship.sponsor_number);
@@ -644,21 +646,52 @@ const db = {
   async getFullListWithBots() {
     try {
       const playersResult = await pool.query(`
-        SELECT number as id, username, score, age, number, password,
-               created_at, online, false as is_bot,
-               RANK() OVER (ORDER BY score DESC) as rank
-        FROM users 
-        WHERE score >= 0 
+        SELECT 
+          u.number as id, 
+          u.username, 
+          u.score, 
+          u.age, 
+          u.number, 
+          u.password,
+          u.created_at, 
+          u.online, 
+          false as is_bot,
+          RANK() OVER (ORDER BY u.score DESC) as rank,
+          -- INFORMATIONS DE PARRAINAGE POUR L'ADMIN
+          sp.sponsor_number,
+          sp_user.username as sponsor_username,
+          sp.is_validated,
+          -- STATISTIQUES DE PARRAINAGE
+          COALESCE(ss.total_sponsored, 0) as total_sponsored,
+          COALESCE(ss.validated_sponsored, 0) as validated_sponsored
+        FROM users u 
+        LEFT JOIN sponsorships sp ON u.number = sp.sponsored_number
+        LEFT JOIN users sp_user ON sp.sponsor_number = sp_user.number
+        LEFT JOIN sponsorship_stats ss ON u.number = ss.player_number
+        WHERE u.score >= 0 
       `);
       
       const botsResult = await pool.query(`
-        SELECT bs.bot_id as id, b.username, bs.score, 
-               'adv' as number, 0 as age, '' as password,
-               bp.created_at, false as online, true as is_bot,
-               RANK() OVER (ORDER BY bs.score DESC) as rank
+        SELECT 
+          bs.bot_id as id, 
+          COALESCE(b.username, bp.username) as username, 
+          bs.score, 
+          'adv' as number, 
+          0 as age, 
+          '' as password,
+          COALESCE(bp.created_at, NOW()) as created_at, 
+          false as online, 
+          true as is_bot,
+          RANK() OVER (ORDER BY bs.score DESC) as rank,
+          -- Pas de parrainage pour les bots
+          NULL as sponsor_number,
+          NULL as sponsor_username,
+          NULL as is_validated,
+          0 as total_sponsored,
+          0 as validated_sponsored
         FROM bot_scores bs 
-        LEFT JOIN bot_profiles b ON bs.bot_id = b.id 
         LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
+        LEFT JOIN bot_profiles b ON bs.bot_id = b.id
       `).catch(() => ({ rows: [] }));
       
       const combinedList = [];
@@ -674,7 +707,14 @@ const db = {
           password: player.password,
           created_at: player.created_at,
           online: player.online,
-          is_bot: false
+          is_bot: false,
+          // NOUVEAUX CHAMPS POUR L'ADMIN
+          has_sponsor: !!player.sponsor_number,
+          sponsor_username: player.sponsor_username || "",
+          sponsor_number: player.sponsor_number || "",
+          is_sponsorship_validated: player.is_validated || false,
+          total_sponsored: player.total_sponsored || 0,
+          validated_sponsored: player.validated_sponsored || 0
         });
       });
       
@@ -687,9 +727,15 @@ const db = {
           age: bot.age,
           number: bot.number,
           password: bot.password,
-          created_at: bot.createdated_at,
+          created_at: bot.created_at,
           online: bot.online,
-          is_bot: true
+          is_bot: true,
+          has_sponsor: false,
+          sponsor_username: "",
+          sponsor_number: "",
+          is_sponsorship_validated: false,
+          total_sponsored: 0,
+          validated_sponsored: 0
         });
       });
       
@@ -701,7 +747,7 @@ const db = {
       
       return combinedList;
     } catch (error) {
-      console.error('Erreur liste complète avec adversaires:', error);
+      console.error('Erreur liste complète avec adversaires et parrainage:', error);
       return [];
     }
   },
@@ -744,7 +790,7 @@ const db = {
     }
   },
 
-  // FONCTIONS PARRAINAGE
+  // FONCTIONS PARRAINAGE (CORRIGÉES)
   async chooseSponsor(sponsoredNumber, sponsorNumber) {
     try {
       // Vérifier que les deux joueurs existent
@@ -774,23 +820,25 @@ const db = {
         return { success: false, message: "Vous avez déjà un parrain" };
       }
       
-      // Créer le parrainage (non validé par défaut)
+      // CORRECTION IMPORTANTE : Créer le parrainage mais NE PAS AJOUTER AU COMPTEUR
       await pool.query(
         `INSERT INTO sponsorships (sponsor_number, sponsored_number, is_validated) 
          VALUES ($1, $2, false)`,
         [sponsorNumber, sponsoredNumber]
       );
       
-      // Mettre à jour les statistiques du parrain (total_sponsored augmente mais validated_sponsored reste à 0)
+      // CORRECTION : NE PAS augmenter total_sponsored tout de suite !
+      // On crée juste l'entrée si elle n'existe pas, avec total = 0
       await pool.query(
         `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
-         VALUES ($1, 1, 0) 
+         VALUES ($1, 0, 0) 
          ON CONFLICT (player_number) 
-         DO UPDATE SET total_sponsored = sponsorship_stats.total_sponsored + 1`,
+         DO NOTHING`,  // Ne rien changer si déjà existant
         [sponsorNumber]
       );
       
-      console.log(`🤝 Parrainage créé: ${sponsorNumber} → ${sponsoredNumber}`);
+      console.log(`🤝 Parrainage créé (en attente): ${sponsorNumber} → ${sponsoredNumber}`);
+      console.log(`   COMPTEUR: total_sponsored reste à 0 (attente 2000 points)`);
       
       return { 
         success: true, 
@@ -2417,8 +2465,9 @@ async function startServer() {
       console.log(`⚠️  Ancien dépôt perdu si nouveau match demandé`);
       console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
       console.log(`   • Délai minimum: ${MATCHMAKING_CONFIG.min_rematch_delay / 1000 / 60} minutes`);
-      console.log(`🤝 Système parrainage ACTIVÉ`);
+      console.log(`🤝 Système parrainage CORRIGÉ`);
       console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
+      console.log(`   • +1 seulement quand filleul atteint 2000 points`);
       console.log(`🌐 Utilisez WebSocket "request_bot" pour système caution`);
       console.log(`🌐 WebSocket parrainage: choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
       console.log(`=========================================`);
