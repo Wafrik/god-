@@ -556,40 +556,38 @@ const db = {
   },
 
   async updatePlayerScoreById(playerId, points, operation) {
-    try {
-      if (!playerId) return { success: false, message: "ID joueur manquant" };
-      
-      const player = await pool.query('SELECT * FROM users WHERE number = $1', [playerId]);
-      if (!player.rows[0]) return { success: false, message: "Joueur non trouvé" };
-      
-      const currentScore = player.rows[0].score;
-      let newScore;
-      
-      if (operation === "add") {
-        newScore = currentScore + points;
-      } else if (operation === "subtract") {
-        newScore = Math.max(0, currentScore - points);
-      } else {
-        return { success: false, message: "Opération invalide" };
-      }
-      
-      await pool.query(
-        'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-        [newScore, playerId]
-      );
-      
-      return { 
-        success: true, 
-        player_id: playerId,
-        new_score: newScore,
-        points: points,
-        operation: operation
-      };
-    } catch (error) {
-      console.error('Erreur update score joueur:', error);
-      return { success: false, message: "Erreur serveur" };
+  try {
+    if (!playerId) return { success: false, message: "ID joueur manquant" };
+    
+    const player = await pool.query('SELECT * FROM users WHERE number = $1', [playerId]);
+    if (!player.rows[0]) return { success: false, message: "Joueur non trouvé" };
+    
+    const currentScore = player.rows[0].score;
+    let newScore;
+    
+    if (operation === "add") {
+      newScore = currentScore + points;
+    } else if (operation === "subtract") {
+      newScore = Math.max(0, currentScore - points);
+    } else {
+      return { success: false, message: "Opération invalide" };
     }
-  },
+    
+    // CORRECTION ICI : Utiliser updateUserScore() qui valide automatiquement
+    await this.updateUserScore(playerId, newScore);
+    
+    return { 
+      success: true, 
+      player_id: playerId,
+      new_score: newScore,
+      points: points,
+      operation: operation
+    };
+  } catch (error) {
+    console.error('Erreur update score joueur:', error);
+    return { success: false, message: "Erreur serveur" };
+  }
+}
 
   async getPlayersList() {
     try {
@@ -2467,3 +2465,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
