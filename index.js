@@ -23,6 +23,7 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const BOT_DEPOSIT = 250; // Caution de référence de 250 points
+const SPONSOR_MIN_SCORE = 2000; // Score minimum pour valider un parrainage
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
@@ -225,6 +226,58 @@ async function loadBotScores() {
   }
 }
 
+// FONCTIONS PARRAINAGE
+async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
+  try {
+    // Vérifier si le joueur a atteint le score minimum pour valider ses parrainages
+    if (newScore >= SPONSOR_MIN_SCORE) {
+      // Trouver tous les parrainages où ce joueur est parrainé (sponsored)
+      const sponsorshipsResult = await pool.query(
+        `SELECT * FROM sponsorships 
+         WHERE sponsored_number = $1 
+         AND is_validated = false`,
+        [playerNumber]
+      );
+      
+      for (const sponsorship of sponsorshipsResult.rows) {
+        // Valider le parrainage
+        await pool.query(
+          `UPDATE sponsorships 
+           SET is_validated = true, validated_at = CURRENT_TIMESTAMP 
+           WHERE sponsor_number = $1 AND sponsored_number = $2`,
+          [sponsorship.sponsor_number, sponsorship.sponsored_number]
+        );
+        
+        // Mettre à jour le compteur du parrain
+        await pool.query(
+          `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
+           VALUES ($1, 1, 1) 
+           ON CONFLICT (player_number) 
+           DO UPDATE SET 
+             total_sponsored = sponsorship_stats.total_sponsored + 1,
+             validated_sponsored = sponsorship_stats.validated_sponsored + 1`,
+          [sponsorship.sponsor_number]
+        );
+        
+        console.log(`✅ Parrainage validé: ${sponsorship.sponsor_number} → ${sponsorship.sponsored_number}`);
+        
+        // Notifier le parrain si connecté
+        const sponsorWs = PLAYER_CONNECTIONS.get(sponsorship.sponsor_number);
+        if (sponsorWs && sponsorWs.readyState === WebSocket.OPEN) {
+          sponsorWs.send(JSON.stringify({
+            type: 'sponsorship_validated',
+            message: `Votre filleul a atteint ${SPONSOR_MIN_SCORE} points !`,
+            sponsored_player: sponsorship.sponsored_number,
+            validated_count: 1
+          }));
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Erreur validation parrainages:', error);
+  }
+}
+
 const db = {
   async getUserByNumber(number) {
     const result = await pool.query('SELECT * FROM users WHERE number = $1', [number]);
@@ -257,6 +310,9 @@ const db = {
       'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
       [newScore, number]
     );
+    
+    // Vérifier si des parrainages peuvent être validés
+    await validateSponsorshipsWhenScoreReached(number, newScore);
   },
 
   async applyBotDeposit(playerNumber) {
@@ -686,6 +742,159 @@ const db = {
       console.error('Erreur update score adversaire:', error);
       return { success: false, message: "Erreur serveur" };
     }
+  },
+
+  // FONCTIONS PARRAINAGE
+  async chooseSponsor(sponsoredNumber, sponsorNumber) {
+    try {
+      // Vérifier que les deux joueurs existent
+      const sponsored = await this.getUserByNumber(sponsoredNumber);
+      const sponsor = await this.getUserByNumber(sponsorNumber);
+      
+      if (!sponsored) {
+        return { success: false, message: "Joueur parrainé non trouvé" };
+      }
+      
+      if (!sponsor) {
+        return { success: false, message: "Parrain non trouvé" };
+      }
+      
+      // Vérifier que ce n'est pas le même joueur
+      if (sponsoredNumber === sponsorNumber) {
+        return { success: false, message: "Vous ne pouvez pas vous parrainer vous-même" };
+      }
+      
+      // Vérifier si le joueur a déjà un parrain
+      const existingSponsorship = await pool.query(
+        'SELECT * FROM sponsorships WHERE sponsored_number = $1',
+        [sponsoredNumber]
+      );
+      
+      if (existingSponsorship.rows.length > 0) {
+        return { success: false, message: "Vous avez déjà un parrain" };
+      }
+      
+      // Créer le parrainage (non validé par défaut)
+      await pool.query(
+        `INSERT INTO sponsorships (sponsor_number, sponsored_number, is_validated) 
+         VALUES ($1, $2, false)`,
+        [sponsorNumber, sponsoredNumber]
+      );
+      
+      // Mettre à jour les statistiques du parrain (total_sponsored augmente mais validated_sponsored reste à 0)
+      await pool.query(
+        `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
+         VALUES ($1, 1, 0) 
+         ON CONFLICT (player_number) 
+         DO UPDATE SET total_sponsored = sponsorship_stats.total_sponsored + 1`,
+        [sponsorNumber]
+      );
+      
+      console.log(`🤝 Parrainage créé: ${sponsorNumber} → ${sponsoredNumber}`);
+      
+      return { 
+        success: true, 
+        message: "Parrain choisi avec succès",
+        sponsor_username: sponsor.username,
+        is_validated: false
+      };
+    } catch (error) {
+      console.error('Erreur choix parrain:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  async getSponsorInfo(playerNumber) {
+    try {
+      const result = await pool.query(
+        `SELECT s.sponsor_number, u.username as sponsor_username, s.is_validated
+         FROM sponsorships s
+         JOIN users u ON s.sponsor_number = u.number
+         WHERE s.sponsored_number = $1`,
+        [playerNumber]
+      );
+      
+      if (result.rows.length === 0) {
+        return { success: false, message: "Aucun parrain", has_sponsor: false };
+      }
+      
+      const sponsorship = result.rows[0];
+      return {
+        success: true,
+        has_sponsor: true,
+        sponsor_number: sponsorship.sponsor_number,
+        sponsor_username: sponsorship.sponsor_username,
+        is_validated: sponsorship.is_validated
+      };
+    } catch (error) {
+      console.error('Erreur récupération parrain:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  async getSponsorshipStats(playerNumber) {
+    try {
+      const result = await pool.query(
+        'SELECT total_sponsored, validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
+        [playerNumber]
+      );
+      
+      if (result.rows.length === 0) {
+        return { 
+          success: true, 
+          total_sponsored: 0, 
+          validated_sponsored: 0 
+        };
+      }
+      
+      const stats = result.rows[0];
+      return {
+        success: true,
+        total_sponsored: stats.total_sponsored,
+        validated_sponsored: stats.validated_sponsored
+      };
+    } catch (error) {
+      console.error('Erreur récupération stats parrainage:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  async getAllSponsorships() {
+    try {
+      const result = await pool.query(`
+        SELECT 
+          s.sponsor_number,
+          u1.username as sponsor_username,
+          s.sponsored_number,
+          u2.username as sponsored_username,
+          s.is_validated,
+          s.created_at,
+          s.validated_at
+        FROM sponsorships s
+        JOIN users u1 ON s.sponsor_number = u1.number
+        JOIN users u2 ON s.sponsored_number = u2.number
+        ORDER BY s.created_at DESC
+      `);
+      
+      return result.rows;
+    } catch (error) {
+      console.error('Erreur récupération parrainages:', error);
+      return [];
+    }
+  },
+
+  async resetSponsorshipCounters() {
+    try {
+      await pool.query('UPDATE sponsorship_stats SET validated_sponsored = 0, total_sponsored = 0');
+      
+      return { 
+        success: true, 
+        message: "Compteurs de parrainage réinitialisés" 
+      };
+    } catch (error) {
+      console.error('Erreur reset compteurs parrainage:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
   }
 };
 
@@ -733,6 +942,31 @@ async function initializeDatabase() {
         last_played TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         last_auto_increment TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (bot_id) REFERENCES bot_profiles(id) ON DELETE CASCADE
+      )
+    `);
+
+    // TABLES POUR PARRAINAGE
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sponsorships (
+        id SERIAL PRIMARY KEY,
+        sponsor_number VARCHAR(20) NOT NULL,
+        sponsored_number VARCHAR(20) UNIQUE NOT NULL,
+        is_validated BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        validated_at TIMESTAMP,
+        FOREIGN KEY (sponsor_number) REFERENCES users(number) ON DELETE CASCADE,
+        FOREIGN KEY (sponsored_number) REFERENCES users(number) ON DELETE CASCADE
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sponsorship_stats (
+        id SERIAL PRIMARY KEY,
+        player_number VARCHAR(20) UNIQUE NOT NULL,
+        total_sponsored INTEGER DEFAULT 0,
+        validated_sponsored INTEGER DEFAULT 0,
+        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (player_number) REFERENCES users(number) ON DELETE CASCADE
       )
     `);
 
@@ -1381,6 +1615,61 @@ async function handleAdminMessage(ws, message, adminId) {
           message: 'Erreur récupération' 
         }));
       }
+    },
+
+    // NOUVELLES COMMANDES ADMIN POUR PARRAINAGE
+    admin_get_sponsorships: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const sponsorships = await db.getAllSponsorships();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_sponsorships',
+          success: true,
+          sponsorships: sponsorships,
+          count: sponsorships.length,
+          validated_count: sponsorships.filter(s => s.is_validated).length
+        }));
+      } catch (error) {
+        console.error('Erreur récupération parrainages admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_sponsorships', 
+          success: false, 
+          message: 'Erreur récupération' 
+        }));
+      }
+    },
+
+    admin_reset_sponsorship_counters: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const result = await db.resetSponsorshipCounters();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_reset_sponsorship_counters',
+          success: result.success,
+          message: result.message
+        }));
+      } catch (error) {
+        console.error('Erreur reset compteurs parrainage admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_reset_sponsorship_counters', 
+          success: false, 
+          message: 'Erreur réinitialisation' 
+        }));
+      }
     }
   };
   
@@ -1672,6 +1961,68 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }));
     },
     
+    // NOUVELLES FONCTIONS PARRAINAGE
+    choose_sponsor: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      
+      const { sponsor_number } = message;
+      if (!sponsor_number) {
+        return ws.send(JSON.stringify({ 
+          type: 'choose_sponsor_failed', 
+          message: 'Numéro de parrain manquant' 
+        }));
+      }
+      
+      const result = await db.chooseSponsor(playerNumber, sponsor_number);
+      
+      if (result.success) {
+        ws.send(JSON.stringify({
+          type: 'choose_sponsor_success',
+          message: result.message,
+          sponsor_username: result.sponsor_username,
+          is_validated: result.is_validated
+        }));
+      } else {
+        ws.send(JSON.stringify({
+          type: 'choose_sponsor_failed',
+          message: result.message
+        }));
+      }
+    },
+    
+    get_sponsor_info: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      
+      const result = await db.getSponsorInfo(playerNumber);
+      
+      ws.send(JSON.stringify({
+        type: 'sponsor_info',
+        success: result.success,
+        has_sponsor: result.has_sponsor || false,
+        sponsor_number: result.sponsor_number,
+        sponsor_username: result.sponsor_username,
+        is_validated: result.is_validated,
+        message: result.message
+      }));
+    },
+    
+    get_sponsorship_stats: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      
+      const result = await db.getSponsorshipStats(playerNumber);
+      
+      ws.send(JSON.stringify({
+        type: 'sponsorship_stats',
+        success: result.success,
+        total_sponsored: result.total_sponsored,
+        validated_sponsored: result.validated_sponsored,
+        message: result.message || ''
+      }));
+    },
+    
     player_move: () => handleGameAction(ws, message, deviceKey),
     dice_swap: () => handleGameAction(ws, message, deviceKey),
     emoji_used: () => handleGameAction(ws, message, deviceKey)
@@ -1904,6 +2255,113 @@ app.post('/matchmaking-config/update', express.json(), (req, res) => {
   }
 });
 
+// ROUTES POUR PARRAINAGE
+app.get('/sponsor-info/:playerNumber', async (req, res) => {
+  try {
+    const playerNumber = req.params.playerNumber;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const result = await db.getSponsorInfo(playerNumber);
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(404).json(result);
+    }
+  } catch (error) {
+    console.error('Erreur récupération info parrain:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+app.get('/sponsorship-stats/:playerNumber', async (req, res) => {
+  try {
+    const playerNumber = req.params.playerNumber;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const result = await db.getSponsorshipStats(playerNumber);
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(404).json(result);
+    }
+  } catch (error) {
+    console.error('Erreur récupération stats parrainage:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+app.post('/choose-sponsor', express.json(), async (req, res) => {
+  try {
+    const { playerNumber, sponsorNumber } = req.body;
+    
+    if (!playerNumber || !sponsorNumber) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Numéro joueur ou numéro parrain manquant" 
+      });
+    }
+    
+    const result = await db.chooseSponsor(playerNumber, sponsorNumber);
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    console.error('Erreur choix parrain:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// ROUTES ADMIN POUR PARRAINAGE
+app.get('/admin/sponsorships', async (req, res) => {
+  try {
+    const { admin_key } = req.query;
+    
+    if (admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    const sponsorships = await db.getAllSponsorships();
+    
+    res.json({
+      success: true,
+      sponsorships: sponsorships,
+      count: sponsorships.length,
+      validated_count: sponsorships.filter(s => s.is_validated).length
+    });
+  } catch (error) {
+    console.error('Erreur récupération parrainages admin:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+app.post('/admin/reset-sponsorship-counters', express.json(), async (req, res) => {
+  try {
+    const { admin_key } = req.body;
+    
+    if (admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    const result = await db.resetSponsorshipCounters();
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Erreur reset compteurs parrainage admin:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
@@ -1913,6 +2371,7 @@ app.get('/health', (req, res) => {
     active_deposits: BOT_DEPOSITS.size,
     matchmaking_config: MATCHMAKING_CONFIG,
     last_matches_tracked: LAST_MATCHES.size,
+    sponsorship_min_score: SPONSOR_MIN_SCORE,
     timestamp: new Date().toISOString() 
   });
 });
@@ -1958,7 +2417,10 @@ async function startServer() {
       console.log(`⚠️  Ancien dépôt perdu si nouveau match demandé`);
       console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
       console.log(`   • Délai minimum: ${MATCHMAKING_CONFIG.min_rematch_delay / 1000 / 60} minutes`);
+      console.log(`🤝 Système parrainage ACTIVÉ`);
+      console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
       console.log(`🌐 Utilisez WebSocket "request_bot" pour système caution`);
+      console.log(`🌐 WebSocket parrainage: choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -1982,13 +2444,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
-
-
-
-
-
-
-
-
