@@ -24,6 +24,7 @@ const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const BOT_DEPOSIT = 250;
 const SPONSOR_MIN_SCORE = 2000; // Score minimum pour valider un parrainage
+const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000; // Scanner toutes les 5 minutes
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
@@ -92,6 +93,7 @@ const BOTS = [
 ];
 
 let botAutoIncrementInterval = null;
+let sponsorshipScanInterval = null;
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
@@ -220,7 +222,93 @@ async function loadBotScores() {
   }
 }
 
-// FONCTIONS PARRAINAGE
+// ===========================================
+// NOUVELLE FONCTION : SCAN GLOBAL DES PARRAINAGES
+// ===========================================
+async function scanAndValidateAllSponsorships() {
+  try {
+    console.log('🔍 Démarrage scan global des parrainages...');
+    
+    // Trouver TOUS les filleuls qui ont atteint 2000 points mais dont le parrainage n'est pas validé
+    const result = await pool.query(`
+      SELECT 
+        u.number as sponsored_number,
+        u.username as sponsored_username,
+        u.score as sponsored_score,
+        s.sponsor_number,
+        sp.username as sponsor_username,
+        s.is_validated
+      FROM users u
+      JOIN sponsorships s ON u.number = s.sponsored_number
+      JOIN users sp ON s.sponsor_number = sp.number
+      WHERE u.score >= $1 
+        AND s.is_validated = false
+      ORDER BY u.score DESC
+    `, [SPONSOR_MIN_SCORE]);
+    
+    console.log(`📊 ${result.rows.length} parrainages éligibles à la validation trouvés`);
+    
+    let validatedCount = 0;
+    
+    for (const row of result.rows) {
+      const sponsoredNumber = row.sponsored_number;
+      const sponsoredUsername = row.sponsored_username;
+      const sponsoredScore = row.sponsored_score;
+      const sponsorNumber = row.sponsor_number;
+      const sponsorUsername = row.sponsor_username;
+      
+      console.log(`🎯 Vérification: ${sponsoredUsername} (${sponsoredScore} points) → ${sponsorUsername}`);
+      
+      // Valider le parrainage
+      await pool.query(
+        `UPDATE sponsorships 
+         SET is_validated = true, validated_at = CURRENT_TIMESTAMP 
+         WHERE sponsor_number = $1 AND sponsored_number = $2`,
+        [sponsorNumber, sponsoredNumber]
+      );
+      
+      // Mettre à jour les compteurs (total et validé augmentent tous les deux)
+      await pool.query(
+        `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
+         VALUES ($1, 1, 1) 
+         ON CONFLICT (player_number) 
+         DO UPDATE SET 
+           total_sponsored = sponsorship_stats.total_sponsored + 1,
+           validated_sponsored = sponsorship_stats.validated_sponsored + 1`,
+        [sponsorNumber]
+      );
+      
+      console.log(`✅ Parrainage validé par scan: ${sponsorUsername} → ${sponsoredUsername}`);
+      console.log(`   Score: ${sponsoredScore} points | +1 ajouté au compteur`);
+      
+      validatedCount++;
+      
+      // Notifier le parrain s'il est connecté
+      const sponsorWs = PLAYER_CONNECTIONS.get(sponsorNumber);
+      if (sponsorWs && sponsorWs.readyState === WebSocket.OPEN) {
+        sponsorWs.send(JSON.stringify({
+          type: 'sponsorship_validated',
+          message: `Votre filleul ${sponsoredUsername} a atteint ${SPONSOR_MIN_SCORE} points !`,
+          sponsored_player: sponsoredUsername,
+          validated_count: 1
+        }));
+      }
+    }
+    
+    if (validatedCount > 0) {
+      console.log(`🎉 Scan terminé: ${validatedCount} parrainages validés`);
+    } else {
+      console.log('✅ Aucun parrainage à valider');
+    }
+    
+    return { success: true, validated: validatedCount };
+  } catch (error) {
+    console.error('❌ Erreur scan parrainages:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// FONCTION ORIGINALE (conservée pour compatibilité)
 async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
   try {
     // Vérifier si le joueur a atteint le score minimum pour valider ses parrainages
@@ -302,12 +390,15 @@ const db = {
   },
 
   async updateUserScore(number, newScore) {
+    console.log(`🔄 updateUserScore(${number}, ${newScore}) appelé`);
+    
     await pool.query(
       'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
       [newScore, number]
     );
     
     // Vérifier si des parrainages peuvent être validés
+    console.log(`   Validation parrainage pour ${number} (score: ${newScore})`);
     await validateSponsorshipsWhenScoreReached(number, newScore);
   },
 
@@ -430,10 +521,8 @@ const db = {
         }
       }
       
-      await pool.query(
-        'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
-        [newScore, playerNumber]
-      );
+      // Utiliser updateUserScore qui valide automatiquement les parrainages
+      await this.updateUserScore(playerNumber, newScore);
       
       if (deposit) {
         BOT_DEPOSITS.delete(playerNumber);
@@ -545,6 +634,10 @@ const db = {
       
       BOT_DEPOSITS.clear();
       
+      // Scanner pour réinitialiser les validations
+      await pool.query('UPDATE sponsorships SET is_validated = false, validated_at = NULL');
+      await pool.query('UPDATE sponsorship_stats SET validated_sponsored = 0, total_sponsored = 0');
+      
       return { 
         playersReset: playersReset.rowCount,
         botsReset: BOTS.length 
@@ -556,38 +649,42 @@ const db = {
   },
 
   async updatePlayerScoreById(playerId, points, operation) {
-  try {
-    if (!playerId) return { success: false, message: "ID joueur manquant" };
-    
-    const player = await pool.query('SELECT * FROM users WHERE number = $1', [playerId]);
-    if (!player.rows[0]) return { success: false, message: "Joueur non trouvé" };
-    
-    const currentScore = player.rows[0].score;
-    let newScore;
-    
-    if (operation === "add") {
-      newScore = currentScore + points;
-    } else if (operation === "subtract") {
-      newScore = Math.max(0, currentScore - points);
-    } else {
-      return { success: false, message: "Opération invalide" };
+    try {
+      console.log(`📝 updatePlayerScoreById(${playerId}, ${points}, ${operation}) appelé`);
+      
+      if (!playerId) return { success: false, message: "ID joueur manquant" };
+      
+      const player = await pool.query('SELECT * FROM users WHERE number = $1', [playerId]);
+      if (!player.rows[0]) return { success: false, message: "Joueur non trouvé" };
+      
+      const currentScore = player.rows[0].score;
+      let newScore;
+      
+      if (operation === "add") {
+        newScore = currentScore + points;
+      } else if (operation === "subtract") {
+        newScore = Math.max(0, currentScore - points);
+      } else {
+        return { success: false, message: "Opération invalide" };
+      }
+      
+      console.log(`   Ancien score: ${currentScore}, Nouveau score: ${newScore}`);
+      
+      // CORRECTION CRITIQUE : Utiliser updateUserScore() qui valide automatiquement
+      await this.updateUserScore(playerId, newScore);
+      
+      return { 
+        success: true, 
+        player_id: playerId,
+        new_score: newScore,
+        points: points,
+        operation: operation
+      };
+    } catch (error) {
+      console.error('Erreur update score joueur:', error);
+      return { success: false, message: "Erreur serveur" };
     }
-    
-    // CORRECTION ICI : Utiliser updateUserScore() qui valide automatiquement
-    await this.updateUserScore(playerId, newScore);
-    
-    return { 
-      success: true, 
-      player_id: playerId,
-      new_score: newScore,
-      points: points,
-      operation: operation
-    };
-  } catch (error) {
-    console.error('Erreur update score joueur:', error);
-    return { success: false, message: "Erreur serveur" };
-  }
-}
+  },
 
   async getPlayersList() {
     try {
@@ -791,7 +888,7 @@ const db = {
         return { success: false, message: "Vous avez déjà un parrain" };
       }
       
-      // CORRECTION : Vérifier le score DU FILLEUL avant de créer le parrainage
+      // Vérifier le score DU FILLEUL avant de créer le parrainage
       const sponsoredScore = sponsored.score;
       let isAlreadyValidated = false;
       
@@ -935,6 +1032,7 @@ const db = {
   async resetSponsorshipCounters() {
     try {
       await pool.query('UPDATE sponsorship_stats SET validated_sponsored = 0, total_sponsored = 0');
+      await pool.query('UPDATE sponsorships SET is_validated = false, validated_at = NULL');
       
       return { 
         success: true, 
@@ -1719,6 +1817,36 @@ async function handleAdminMessage(ws, message, adminId) {
           message: 'Erreur réinitialisation' 
         }));
       }
+    },
+
+    // NOUVELLE COMMANDE : FORCER UN SCAN DES PARRAINAGES
+    admin_force_sponsorship_scan: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const result = await scanAndValidateAllSponsorships();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_sponsorship_scan',
+          success: result.success,
+          validated: result.validated,
+          message: result.success ? 
+            `Scan terminé: ${result.validated} parrainages validés` : 
+            'Erreur lors du scan'
+        }));
+      } catch (error) {
+        console.error('Erreur scan parrainages admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_sponsorship_scan', 
+          success: false, 
+          message: 'Erreur scan' 
+        }));
+      }
     }
   };
   
@@ -2278,7 +2406,9 @@ app.post('/matchmaking-config/update', express.json(), (req, res) => {
   }
 });
 
-// ROUTES POUR PARRAINAGE
+// ===========================================
+// NOUVELLES ROUTES POUR PARRAINAGE AUTOMATIQUE
+// ===========================================
 app.get('/sponsor-info/:playerNumber', async (req, res) => {
   try {
     const playerNumber = req.params.playerNumber;
@@ -2345,6 +2475,30 @@ app.post('/choose-sponsor', express.json(), async (req, res) => {
   }
 });
 
+// NOUVELLE ROUTE : FORCER UN SCAN DES PARRAINAGES
+app.post('/force-sponsorship-scan', express.json(), async (req, res) => {
+  try {
+    const { admin_key } = req.body;
+    
+    if (!admin_key || admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    const result = await scanAndValidateAllSponsorships();
+    
+    res.json({
+      success: result.success,
+      validated: result.validated || 0,
+      message: result.success ? 
+        `Scan terminé: ${result.validated} parrainages validés` : 
+        'Erreur lors du scan'
+    });
+  } catch (error) {
+    console.error('Erreur scan parrainages:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
 // ROUTES ADMIN POUR PARRAINAGE
 app.get('/admin/sponsorships', async (req, res) => {
   try {
@@ -2396,6 +2550,7 @@ app.get('/health', (req, res) => {
     matchmaking_config: MATCHMAKING_CONFIG,
     last_matches_tracked: LAST_MATCHES.size,
     sponsorship_min_score: SPONSOR_MIN_SCORE,
+    sponsorship_scan_interval: SPONSORSHIP_SCAN_INTERVAL,
     timestamp: new Date().toISOString() 
   });
 });
@@ -2424,6 +2579,14 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
+    // Lancer le scanner automatique des parrainages
+    sponsorshipScanInterval = setInterval(scanAndValidateAllSponsorships, SPONSORSHIP_SCAN_INTERVAL);
+    
+    // Scanner immédiatement au démarrage
+    setTimeout(() => {
+      scanAndValidateAllSponsorships();
+    }, 10 * 1000); // 10 secondes après démarrage
+    
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
     setTimeout(() => {
@@ -2436,12 +2599,15 @@ async function startServer() {
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
       console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
-      console.log(`🤝 SYSTÈME PARRAINAGE CORRIGÉ`);
+      console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ`);
       console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
       console.log(`   • +1 seulement quand filleul atteint 2000 points`);
+      console.log(`   • Scanner automatique: toutes les ${SPONSORSHIP_SCAN_INTERVAL/60000} minutes`);
       console.log(`   • Vérification score à la création`);
       console.log(`   • Routes admin pour voir parrains et compteurs`);
+      console.log(`   • Commande admin: admin_force_sponsorship_scan`);
       console.log(`🌐 WebSocket parrainage: choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
+      console.log(`🌐 Route API: POST /force-sponsorship-scan (admin_key requis)`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -2452,6 +2618,7 @@ async function startServer() {
 
 process.on('SIGTERM', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
+  if (sponsorshipScanInterval) clearInterval(sponsorshipScanInterval);
   server.close(() => {
     process.exit(0);
   });
@@ -2459,10 +2626,10 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
+  if (sponsorshipScanInterval) clearInterval(sponsorshipScanInterval);
   server.close(() => {
     process.exit(0);
   });
 });
 
 startServer();
-
