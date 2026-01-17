@@ -22,13 +22,13 @@ const PORT = process.env.PORT || 8000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
-const BOT_DEPOSIT = 250; // Caution de référence de 250 points
+const BOT_DEPOSIT = 250;
 const SPONSOR_MIN_SCORE = 2000; // Score minimum pour valider un parrainage
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
-  anti_quick_rematch: true,       // Activer/désactiver l'anti-match rapide
-  min_rematch_delay: 50 * 60 * 1000, // 5 minutes en millisecondes
+  anti_quick_rematch: true,
+  min_rematch_delay: 50 * 60 * 1000,
 };
 
 const UPDATE_CONFIG = {
@@ -45,12 +45,8 @@ const PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
-
-// Suivi des dépôts de caution
-const BOT_DEPOSITS = new Map(); // Map: playerNumber -> {botId, depositAmount, timestamp}
-
-// Suivi des derniers matchs pour éviter les matchs trop rapides
-const LAST_MATCHES = new Map(); // Map: playerNumber -> { opponent: playerNumber, timestamp: Date.now() }
+const BOT_DEPOSITS = new Map();
+const LAST_MATCHES = new Map();
 
 const BOTS = [
   { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 0 },
@@ -112,7 +108,6 @@ function canMatchPlayers(player1Number, player2Number) {
     return { canMatch: true, reason: "Anti-quick-rematch désactivé" };
   }
   
-  // Vérifier si joueur1 a déjà joué contre joueur2 récemment
   const lastMatch1 = LAST_MATCHES.get(player1Number);
   const lastMatch2 = LAST_MATCHES.get(player2Number);
   
@@ -146,7 +141,6 @@ function recordMatch(player1Number, player2Number) {
   LAST_MATCHES.set(player1Number, { opponent: player2Number, timestamp: Date.now() });
   LAST_MATCHES.set(player2Number, { opponent: player1Number, timestamp: Date.now() });
   
-  // Nettoyer les anciens matchs (> 24h)
   const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
   for (const [player, match] of LAST_MATCHES.entries()) {
     if (match.timestamp < twentyFourHoursAgo) {
@@ -248,7 +242,7 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
           [sponsorship.sponsor_number, sponsorship.sponsored_number]
         );
         
-        // CORRECTION IMPORTANTE : Ajouter +1 AU COMPTEUR SEULEMENT QUAND LE FILLEUL ATTEINT 2000
+        // CORRECTION : Ajouter +1 AU COMPTEUR SEULEMENT QUAND LE FILLEUL ATTEINT 2000
         // (total_sponsored ET validated_sponsored augmentent tous les deux)
         await pool.query(
           `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
@@ -324,25 +318,18 @@ const db = {
         return { success: false, message: "Joueur non trouvé" };
       }
       
-      // NE PAS VÉRIFIER SI DÉPÔT EXISTE DÉJÀ - C'EST SON PROBLÈME
-      // S'il y a déjà un dépôt, c'est qu'il a abandonné, on le perd
-      
-      // Calculer le dépôt réel (soit le score actuel, soit 250 max)
       let depositAmount = Math.min(player.score, BOT_DEPOSIT);
       
-      // Si le joueur a 0 points, on autorise quand même (dépôt de 0)
       if (player.score === 0) {
         depositAmount = 0;
       }
       
-      // Vérifier si un dépôt existait déjà
       const existingDeposit = BOT_DEPOSITS.get(playerNumber);
       if (existingDeposit) {
         console.log(`⚠️ Dépôt existant trouvé pour ${playerNumber}: ${existingDeposit.depositAmount} points`);
         console.log(`   Le joueur perd ce dépôt car il demande un nouveau match`);
       }
       
-      // Retirer la nouvelle caution (ou 0 si score=0)
       const newScore = player.score - depositAmount;
       await this.updateUserScore(playerNumber, newScore);
       
@@ -374,14 +361,11 @@ const db = {
         return { success: false, message: "Joueur non trouvé" };
       }
       
-      // Rendre exactement le montant qui a été prélevé
       const refundAmount = deposit.depositAmount;
       const newScore = player.score + refundAmount;
       
-      // Mettre à jour le score
       await this.updateUserScore(playerNumber, newScore);
       
-      // Supprimer le dépôt
       BOT_DEPOSITS.delete(playerNumber);
       
       console.log(`💰 Caution rendue: ${player.username} (+${refundAmount} points)`);
@@ -417,18 +401,15 @@ const db = {
       const player = await this.getUserByNumber(playerNumber);
       if (!player) return false;
       
-      // Récupérer le dépôt
       const deposit = BOT_DEPOSITS.get(playerNumber);
       const depositAmount = deposit ? deposit.depositAmount : 0;
       
-      // Calcul du score selon l'ancien système (mais avec le score actuel AVANT dépôt)
-      const currentScore = player.score + depositAmount; // Score avant dépôt
+      const currentScore = player.score + depositAmount;
       const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
       
       let newScore = currentScore;
       
       if (isDraw) {
-        // Match nul: on rend juste la caution
         if (depositAmount > 0) {
           await this.refundBotDeposit(playerNumber);
         }
@@ -437,11 +418,9 @@ const db = {
       }
       
       if (isWin) {
-        // Victoire: score normal + 200
         newScore = currentScore + playerGameScore + 200;
         console.log(`🏆 [ADVERSAIRE MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
-        // Défaite
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
           console.log(`🔥 [ADVERSAIRE MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
@@ -451,13 +430,11 @@ const db = {
         }
       }
       
-      // Mettre à jour le score final
       await pool.query(
         'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
         [newScore, playerNumber]
       );
       
-      // Pas besoin de rendre la caution car le score a déjà été calculé avec
       if (deposit) {
         BOT_DEPOSITS.delete(playerNumber);
         console.log(`💰 Dépôt de ${depositAmount} points intégré au calcul`);
@@ -566,7 +543,6 @@ const db = {
         BOT_SCORES.set(bot.id, bot.baseScore);
       }
       
-      // Vider les dépôts
       BOT_DEPOSITS.clear();
       
       return { 
@@ -793,7 +769,6 @@ const db = {
   // FONCTIONS PARRAINAGE (CORRIGÉES)
   async chooseSponsor(sponsoredNumber, sponsorNumber) {
     try {
-      // Vérifier que les deux joueurs existent
       const sponsored = await this.getUserByNumber(sponsoredNumber);
       const sponsor = await this.getUserByNumber(sponsorNumber);
       
@@ -805,12 +780,10 @@ const db = {
         return { success: false, message: "Parrain non trouvé" };
       }
       
-      // Vérifier que ce n'est pas le même joueur
       if (sponsoredNumber === sponsorNumber) {
         return { success: false, message: "Vous ne pouvez pas vous parrainer vous-même" };
       }
       
-      // Vérifier si le joueur a déjà un parrain
       const existingSponsorship = await pool.query(
         'SELECT * FROM sponsorships WHERE sponsored_number = $1',
         [sponsoredNumber]
@@ -820,31 +793,60 @@ const db = {
         return { success: false, message: "Vous avez déjà un parrain" };
       }
       
-      // CORRECTION IMPORTANTE : Créer le parrainage mais NE PAS AJOUTER AU COMPTEUR
+      // CORRECTION : Vérifier le score DU FILLEUL avant de créer le parrainage
+      const sponsoredScore = sponsored.score;
+      let isAlreadyValidated = false;
+      
+      // Si le filleul a déjà 2000 points, le parrainage est validé IMMÉDIATEMENT
+      if (sponsoredScore >= SPONSOR_MIN_SCORE) {
+        isAlreadyValidated = true;
+      }
+      
+      // Créer le parrainage
       await pool.query(
         `INSERT INTO sponsorships (sponsor_number, sponsored_number, is_validated) 
-         VALUES ($1, $2, false)`,
-        [sponsorNumber, sponsoredNumber]
+         VALUES ($1, $2, $3)`,
+        [sponsorNumber, sponsoredNumber, isAlreadyValidated]
       );
       
-      // CORRECTION : NE PAS augmenter total_sponsored tout de suite !
-      // On crée juste l'entrée si elle n'existe pas, avec total = 0
-      await pool.query(
-        `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
-         VALUES ($1, 0, 0) 
-         ON CONFLICT (player_number) 
-         DO NOTHING`,  // Ne rien changer si déjà existant
-        [sponsorNumber]
-      );
-      
-      console.log(`🤝 Parrainage créé (en attente): ${sponsorNumber} → ${sponsoredNumber}`);
-      console.log(`   COMPTEUR: total_sponsored reste à 0 (attente 2000 points)`);
+      // Si le filleul a déjà 2000 points, ajouter +1 AU COMPTEUR tout de suite
+      if (isAlreadyValidated) {
+        await pool.query(
+          `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
+           VALUES ($1, 1, 1) 
+           ON CONFLICT (player_number) 
+           DO UPDATE SET 
+             total_sponsored = sponsorship_stats.total_sponsored + 1,
+             validated_sponsored = sponsorship_stats.validated_sponsored + 1`,
+          [sponsorNumber]
+        );
+        
+        console.log(`✅ Parrainage créé et VALIDÉ IMMÉDIATEMENT: ${sponsorNumber} → ${sponsoredNumber}`);
+        console.log(`   +1 ajouté au compteur (score actuel: ${sponsoredScore} points)`);
+      } else {
+        // Sinon, juste créer l'entrée stats avec total = 0
+        await pool.query(
+          `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
+           VALUES ($1, 0, 0) 
+           ON CONFLICT (player_number) 
+           DO NOTHING`,
+          [sponsorNumber]
+        );
+        
+        console.log(`🤝 Parrainage créé (en attente): ${sponsorNumber} → ${sponsoredNumber}`);
+        console.log(`   Score filleul: ${sponsoredScore} points (attente ${SPONSOR_MIN_SCORE})`);
+        console.log(`   COMPTEUR: total_sponsored = 0 (attente validation)`);
+      }
       
       return { 
         success: true, 
-        message: "Parrain choisi avec succès",
+        message: isAlreadyValidated ? 
+          "Parrain choisi et validé immédiatement !" : 
+          "Parrain choisi avec succès",
         sponsor_username: sponsor.username,
-        is_validated: false
+        is_validated: isAlreadyValidated,
+        sponsored_score: sponsoredScore,
+        needs_score: SPONSOR_MIN_SCORE - sponsoredScore
       };
     } catch (error) {
       console.error('Erreur choix parrain:', error);
@@ -917,7 +919,8 @@ const db = {
           u2.username as sponsored_username,
           s.is_validated,
           s.created_at,
-          s.validated_at
+          s.validated_at,
+          u2.score as sponsored_score
         FROM sponsorships s
         JOIN users u1 ON s.sponsor_number = u1.number
         JOIN users u2 ON s.sponsored_number = u2.number
@@ -1069,7 +1072,6 @@ class Game {
     
     ACTIVE_GAMES.set(id, this);
     
-    // ENREGISTRER LE MATCH POUR ANTI-QUICK-REMATCH
     recordMatch(p1.number, p2.number);
     
     setTimeout(() => this.checkAndStartGame(), 1000);
@@ -1682,7 +1684,8 @@ async function handleAdminMessage(ws, message, adminId) {
           success: true,
           sponsorships: sponsorships,
           count: sponsorships.length,
-          validated_count: sponsorships.filter(s => s.is_validated).length
+          validated_count: sponsorships.filter(s => s.is_validated).length,
+          pending_count: sponsorships.filter(s => !s.is_validated).length
         }));
       } catch (error) {
         console.error('Erreur récupération parrainages admin:', error);
@@ -1915,16 +1918,13 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       PLAYER_QUEUE.add(playerNumber);
       ws.send(JSON.stringify({ type: 'queue_joined', message: 'En attente adversaire' }));
       
-      // Vérifier si on peut créer un match
       if (PLAYER_QUEUE.size >= 2) {
         const players = Array.from(PLAYER_QUEUE);
         
-        // Trouver une paire qui peut matcher
         for (let i = 0; i < players.length - 1; i++) {
           for (let j = i + 1; j < players.length; j++) {
             const checkResult = canMatchPlayers(players[i], players[j]);
             if (checkResult.canMatch) {
-              // Créer le match avec ces deux joueurs
               const selectedPlayers = [players[i], players[j]];
               selectedPlayers.forEach(p => PLAYER_QUEUE.delete(p));
               createGameLobby(selectedPlayers);
@@ -1935,7 +1935,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           }
         }
         
-        // Si aucun match possible, attendre d'autres joueurs
         ws.send(JSON.stringify({ 
           type: 'queue_waiting', 
           message: 'En attente d’un adversaire disponible' 
@@ -1959,7 +1958,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         return ws.send(JSON.stringify({ type: 'error', message: 'Déjà dans une partie' }));
       }
       
-      // Prélever la caution flexible (0 à 250 selon le score)
       const depositResult = await db.applyBotDeposit(playerNumber);
       if (!depositResult.success) {
         return ws.send(JSON.stringify({ 
@@ -1968,11 +1966,9 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         }));
       }
       
-      // Choisir un adversaire aléatoire
       const bot = getRandomBot();
       const botId = bot.id;
       
-      // Enregistrer le dépôt avec l'ID de l'adversaire
       BOT_DEPOSITS.set(playerNumber, {
         botId: botId,
         depositAmount: depositResult.depositAmount,
@@ -1981,31 +1977,19 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       
       console.log(`🤖 Adversaire demandé par ${playerNumber} via WebSocket`);
       console.log(`💰 Nouvelle caution: -${depositResult.depositAmount} points`);
-      if (depositResult.hadPreviousDeposit) {
-        console.log(`⚠️ Ancien dépôt perdu (abandon implicite)`);
-      }
-      console.log(`🤖 Adversaire assigné: ${bot.username} (${botId})`);
       
-      // Message spécial si caution = 0
       let depositMessage = "Caution flexible appliquée.";
       if (depositResult.depositAmount === 0) {
         depositMessage = "Vous jouez avec 0 points de caution. Si vous abandonnez, vous ne perdez rien.";
       }
       
-      // Message si ancien dépôt perdu
-      if (depositResult.hadPreviousDeposit) {
-        depositMessage += " Ancienne caution perdue (abandon).";
-      }
-      
-      // Envoyer l'adversaire au joueur
       ws.send(JSON.stringify({
         type: 'bot_assigned',
         bot: bot,
         depositApplied: depositResult.hadEnough,
         depositAmount: depositResult.depositAmount,
         newScore: depositResult.newScore,
-        message: depositMessage,
-        hadPreviousDeposit: depositResult.hadPreviousDeposit
+        message: depositMessage
       }));
     },
     
@@ -2029,7 +2013,9 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           type: 'choose_sponsor_success',
           message: result.message,
           sponsor_username: result.sponsor_username,
-          is_validated: result.is_validated
+          is_validated: result.is_validated,
+          sponsored_score: result.sponsored_score,
+          needs_score: result.needs_score
         }));
       } else {
         ws.send(JSON.stringify({
@@ -2124,11 +2110,9 @@ app.get('/get-bot', async (req, res) => {
   try {
     const bot = getRandomBot();
     
-    // Solution temporaire : Identifier par IP
     const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const userAgent = req.headers['user-agent'] || 'unknown';
     
-    // Créer un identifiant temporaire basé sur IP + User-Agent
     const tempId = `temp_${ip.replace(/[^a-zA-Z0-9]/g, '_')}_${userAgent.substring(0, 20).replace(/[^a-zA-Z0-9]/g, '_')}`;
     
     console.log(`🤖 Adversaire demandé par IP: ${ip}, TempID: ${tempId}`);
@@ -2154,16 +2138,12 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
     }
     
     console.log(`[ADVERSAIRE MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
-    console.log(`   Score joueur: ${playerScore}, Score adversaire: ${botScore}, Victoire joueur: ${isPlayerWin}`);
     
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
     
-    // Vérifier si le joueur avait un dépôt enregistré
     const deposit = BOT_DEPOSITS.get(playerNumber);
     const depositAmount = deposit ? deposit.depositAmount : 0;
-    
-    console.log(`💰 Dépôt enregistré pour ${playerNumber}: ${depositAmount} points`);
     
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin, isDraw);
     
@@ -2185,7 +2165,6 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
         res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
       }
     } else {
-      // Pour un match nul, le dépôt a déjà été rendu dans updateUserScoreAfterBotMatch
       res.json({ 
         success: true, 
         message: "Match nul - Caution rendue",
@@ -2210,14 +2189,12 @@ app.post('/report-disconnect', express.json(), async (req, res) => {
     
     console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre adversaire ${botId || 'inconnu'}`);
     
-    // Vérifier si le joueur avait un dépôt
     const deposit = BOT_DEPOSITS.get(playerNumber);
     if (deposit) {
       const depositAmount = deposit.depositAmount;
       console.log(`💰 Caution NON remboursée (abandon): ${depositAmount} points perdus`);
       BOT_DEPOSITS.delete(playerNumber);
       
-      // Le joueur perd sa caution (elle n'est pas rendue)
       res.json({ 
         success: true, 
         message: `Abandon enregistré. Caution de ${depositAmount} points perdue.`,
@@ -2385,7 +2362,8 @@ app.get('/admin/sponsorships', async (req, res) => {
       success: true,
       sponsorships: sponsorships,
       count: sponsorships.length,
-      validated_count: sponsorships.filter(s => s.is_validated).length
+      validated_count: sponsorships.filter(s => s.is_validated).length,
+      pending_count: sponsorships.filter(s => !s.is_validated).length
     });
   } catch (error) {
     console.error('Erreur récupération parrainages admin:', error);
@@ -2459,16 +2437,12 @@ async function startServer() {
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
-      console.log(`   • Si score ≥ 250: prélève 250 points`);
-      console.log(`   • Si score < 250: prélève tout le score`);
-      console.log(`   • Si score = 0: caution de 0 points`);
-      console.log(`⚠️  Ancien dépôt perdu si nouveau match demandé`);
       console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
-      console.log(`   • Délai minimum: ${MATCHMAKING_CONFIG.min_rematch_delay / 1000 / 60} minutes`);
-      console.log(`🤝 Système parrainage CORRIGÉ`);
+      console.log(`🤝 SYSTÈME PARRAINAGE CORRIGÉ`);
       console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
       console.log(`   • +1 seulement quand filleul atteint 2000 points`);
-      console.log(`🌐 Utilisez WebSocket "request_bot" pour système caution`);
+      console.log(`   • Vérification score à la création`);
+      console.log(`   • Routes admin pour voir parrains et compteurs`);
       console.log(`🌐 WebSocket parrainage: choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
       console.log(`=========================================`);
     });
