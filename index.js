@@ -223,13 +223,13 @@ async function loadBotScores() {
 }
 
 // ===========================================
-// NOUVELLE FONCTION : SCAN GLOBAL DES PARRAINAGES
+// NOUVELLE FONCTION : SCAN GLOBAL DES PARRAINAGES (MODIFIÉE POUR ÉVITER REVALIDATION)
 // ===========================================
 async function scanAndValidateAllSponsorships() {
   try {
-    console.log('🔍 Démarrage scan global des parrainages...');
+    console.log('🔍 Démarrage scan global des parrainages (anti-revalidation)...');
     
-    // Trouver TOUS les filleuls qui ont atteint 2000 points mais dont le parrainage n'est pas validé
+    // Trouver les filleuls qui ont atteint 2000 points mais dont le parrainage n'est PAS DÉJÀ DANS L'HISTORIQUE
     const result = await pool.query(`
       SELECT 
         u.number as sponsored_number,
@@ -241,12 +241,14 @@ async function scanAndValidateAllSponsorships() {
       FROM users u
       JOIN sponsorships s ON u.number = s.sponsored_number
       JOIN users sp ON s.sponsor_number = sp.number
+      LEFT JOIN sponsorship_validated_history h ON u.number = h.sponsored_number
       WHERE u.score >= $1 
         AND s.is_validated = false
+        AND h.sponsored_number IS NULL  -- IMPORTANT: Pas déjà dans l'historique
       ORDER BY u.score DESC
     `, [SPONSOR_MIN_SCORE]);
     
-    console.log(`📊 ${result.rows.length} parrainages éligibles à la validation trouvés`);
+    console.log(`📊 ${result.rows.length} NOUVEAUX parrainages éligibles à la validation trouvés`);
     
     let validatedCount = 0;
     
@@ -257,13 +259,21 @@ async function scanAndValidateAllSponsorships() {
       const sponsorNumber = row.sponsor_number;
       const sponsorUsername = row.sponsor_username;
       
-      console.log(`🎯 Vérification: ${sponsoredUsername} (${sponsoredScore} points) → ${sponsorUsername}`);
+      console.log(`🎯 NOUVEAU parrainage à valider: ${sponsoredUsername} (${sponsoredScore} points) → ${sponsorUsername}`);
       
-      // Valider le parrainage
+      // Valider le parrainage dans sponsorships
       await pool.query(
         `UPDATE sponsorships 
          SET is_validated = true, validated_at = CURRENT_TIMESTAMP 
          WHERE sponsor_number = $1 AND sponsored_number = $2`,
+        [sponsorNumber, sponsoredNumber]
+      );
+      
+      // AJOUTER À L'HISTORIQUE DES VALIDATIONS (permanent)
+      await pool.query(
+        `INSERT INTO sponsorship_validated_history (sponsor_number, sponsored_number, validated_at)
+         VALUES ($1, $2, CURRENT_TIMESTAMP)
+         ON CONFLICT (sponsored_number) DO NOTHING`,
         [sponsorNumber, sponsoredNumber]
       );
       
@@ -279,7 +289,7 @@ async function scanAndValidateAllSponsorships() {
       );
       
       console.log(`✅ Parrainage validé par scan: ${sponsorUsername} → ${sponsoredUsername}`);
-      console.log(`   Score: ${sponsoredScore} points | +1 ajouté au compteur`);
+      console.log(`   Score: ${sponsoredScore} points | +1 ajouté au compteur | Ajouté à l'historique`);
       
       validatedCount++;
       
@@ -296,9 +306,9 @@ async function scanAndValidateAllSponsorships() {
     }
     
     if (validatedCount > 0) {
-      console.log(`🎉 Scan terminé: ${validatedCount} parrainages validés`);
+      console.log(`🎉 Scan terminé: ${validatedCount} NOUVEAUX parrainages validés`);
     } else {
-      console.log('✅ Aucun parrainage à valider');
+      console.log('✅ Aucun NOUVEAU parrainage à valider (tous déjà validés ou score insuffisant)');
     }
     
     return { success: true, validated: validatedCount };
@@ -308,16 +318,19 @@ async function scanAndValidateAllSponsorships() {
   }
 }
 
-// FONCTION ORIGINALE (conservée pour compatibilité)
+// FONCTION ORIGINALE MODIFIÉE POUR ÉVITER REVALIDATION
 async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
   try {
     // Vérifier si le joueur a atteint le score minimum pour valider ses parrainages
     if (newScore >= SPONSOR_MIN_SCORE) {
-      // Trouver tous les parrainages où ce joueur est parrainé (sponsored)
+      // Trouver tous les parrainages où ce joueur est parrainé (sponsored) et non déjà dans l'historique
       const sponsorshipsResult = await pool.query(
-        `SELECT * FROM sponsorships 
-         WHERE sponsored_number = $1 
-         AND is_validated = false`,
+        `SELECT s.* 
+         FROM sponsorships s
+         LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
+         WHERE s.sponsored_number = $1 
+         AND s.is_validated = false
+         AND h.sponsored_number IS NULL`,  // Pas déjà validé dans l'historique
         [playerNumber]
       );
       
@@ -330,8 +343,15 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
           [sponsorship.sponsor_number, sponsorship.sponsored_number]
         );
         
-        // CORRECTION : Ajouter +1 AU COMPTEUR SEULEMENT QUAND LE FILLEUL ATTEINT 2000
-        // (total_sponsored ET validated_sponsored augmentent tous les deux)
+        // Ajouter à l'historique des validations (permanent)
+        await pool.query(
+          `INSERT INTO sponsorship_validated_history (sponsor_number, sponsored_number, validated_at)
+           VALUES ($1, $2, CURRENT_TIMESTAMP)
+           ON CONFLICT (sponsored_number) DO NOTHING`,
+          [sponsorship.sponsor_number, sponsorship.sponsored_number]
+        );
+        
+        // Ajouter +1 au compteur seulement si c'est une NOUVELLE validation
         await pool.query(
           `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
            VALUES ($1, 1, 1) 
@@ -342,8 +362,8 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
           [sponsorship.sponsor_number]
         );
         
-        console.log(`✅ Parrainage validé: ${sponsorship.sponsor_number} → ${sponsorship.sponsored_number}`);
-        console.log(`   +1 ajouté au compteur du parrain (score atteint: ${newScore})`);
+        console.log(`✅ NOUVEAU parrainage validé: ${sponsorship.sponsor_number} → ${sponsorship.sponsored_number}`);
+        console.log(`   +1 ajouté au compteur du parrain (score atteint: ${newScore}) | Ajouté à l'historique`);
         
         // Notifier le parrain si connecté
         const sponsorWs = PLAYER_CONNECTIONS.get(sponsorship.sponsor_number);
@@ -397,7 +417,7 @@ const db = {
       [newScore, number]
     );
     
-    // Vérifier si des parrainages peuvent être validés
+    // Vérifier si des NOUVEAUX parrainages peuvent être validés
     console.log(`   Validation parrainage pour ${number} (score: ${newScore})`);
     await validateSponsorshipsWhenScoreReached(number, newScore);
   },
@@ -634,9 +654,31 @@ const db = {
       
       BOT_DEPOSITS.clear();
       
-      // Scanner pour réinitialiser les validations
-      await pool.query('UPDATE sponsorships SET is_validated = false, validated_at = NULL');
-      await pool.query('UPDATE sponsorship_stats SET validated_sponsored = 0, total_sponsored = 0');
+      // IMPORTANT: NE PAS RÉINITIALISER L'HISTORIQUE DES VALIDATIONS
+      // On réinitialise seulement la table sponsorships pour le reset hebdomadaire
+      // mais on garde l'historique des validations permanentes
+      await pool.query(`
+        UPDATE sponsorships s 
+        SET is_validated = false, validated_at = NULL 
+        FROM sponsorship_validated_history h 
+        WHERE s.sponsored_number = h.sponsored_number
+        AND h.sponsored_number IS NULL  -- IMPORTANT: pas ceux déjà dans l'historique
+      `);
+      
+      // NE PAS réinitialiser sponsorship_stats car les compteurs doivent rester
+      // On fait un UPDATE pour réinitialiser seulement validated_sponsored pour ceux qui ne sont pas dans l'historique
+      await pool.query(`
+        UPDATE sponsorship_stats ss
+        SET validated_sponsored = 0
+        FROM (
+          SELECT s.sponsor_number
+          FROM sponsorships s
+          LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
+          WHERE h.sponsored_number IS NULL
+          GROUP BY s.sponsor_number
+        ) AS to_reset
+        WHERE ss.player_number = to_reset.sponsor_number
+      `);
       
       return { 
         playersReset: playersReset.rowCount,
@@ -670,7 +712,6 @@ const db = {
       
       console.log(`   Ancien score: ${currentScore}, Nouveau score: ${newScore}`);
       
-      // CORRECTION CRITIQUE : Utiliser updateUserScore() qui valide automatiquement
       await this.updateUserScore(playerId, newScore);
       
       return { 
@@ -728,11 +769,9 @@ const db = {
           u.online, 
           false as is_bot,
           RANK() OVER (ORDER BY u.score DESC) as rank,
-          -- INFORMATIONS DE PARRAINAGE POUR L'ADMIN
           sp.sponsor_number,
           sp_user.username as sponsor_username,
           sp.is_validated,
-          -- STATISTIQUES DE PARRAINAGE
           COALESCE(ss.total_sponsored, 0) as total_sponsored,
           COALESCE(ss.validated_sponsored, 0) as validated_sponsored
         FROM users u 
@@ -754,7 +793,6 @@ const db = {
           false as online, 
           true as is_bot,
           RANK() OVER (ORDER BY bs.score DESC) as rank,
-          -- Pas de parrainage pour les bots
           NULL as sponsor_number,
           NULL as sponsor_username,
           NULL as is_validated,
@@ -779,7 +817,6 @@ const db = {
           created_at: player.created_at,
           online: player.online,
           is_bot: false,
-          // NOUVEAUX CHAMPS POUR L'ADMIN
           has_sponsor: !!player.sponsor_number,
           sponsor_username: player.sponsor_username || "",
           sponsor_number: player.sponsor_number || "",
@@ -861,7 +898,7 @@ const db = {
     }
   },
 
-  // FONCTIONS PARRAINAGE (CORRIGÉES)
+  // FONCTIONS PARRAINAGE (MODIFIÉES POUR ÉVITER REVALIDATION)
   async chooseSponsor(sponsoredNumber, sponsorNumber) {
     try {
       const sponsored = await this.getUserByNumber(sponsoredNumber);
@@ -888,11 +925,20 @@ const db = {
         return { success: false, message: "Vous avez déjà un parrain" };
       }
       
-      // Vérifier le score DU FILLEUL avant de créer le parrainage
+      // Vérifier si ce filleul a DÉJÀ validé un parrainage dans l'historique
+      const alreadyValidatedInHistory = await pool.query(
+        'SELECT * FROM sponsorship_validated_history WHERE sponsored_number = $1',
+        [sponsoredNumber]
+      );
+      
+      if (alreadyValidatedInHistory.rows.length > 0) {
+        return { success: false, message: "Ce joueur a déjà validé un parrainage (ne peut plus changer)" };
+      }
+      
       const sponsoredScore = sponsored.score;
       let isAlreadyValidated = false;
       
-      // Si le filleul a déjà 2000 points, le parrainage est validé IMMÉDIATEMENT
+      // Si le filleul a déjà 2000 points ET n'est pas dans l'historique, valider immédiatement
       if (sponsoredScore >= SPONSOR_MIN_SCORE) {
         isAlreadyValidated = true;
       }
@@ -904,8 +950,15 @@ const db = {
         [sponsorNumber, sponsoredNumber, isAlreadyValidated]
       );
       
-      // Si le filleul a déjà 2000 points, ajouter +1 AU COMPTEUR tout de suite
+      // Si le filleul a déjà 2000 points ET n'est pas dans l'historique, valider tout de suite
       if (isAlreadyValidated) {
+        // Ajouter à l'historique des validations
+        await pool.query(
+          `INSERT INTO sponsorship_validated_history (sponsor_number, sponsored_number, validated_at)
+           VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+          [sponsorNumber, sponsoredNumber]
+        );
+        
         await pool.query(
           `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
            VALUES ($1, 1, 1) 
@@ -917,7 +970,7 @@ const db = {
         );
         
         console.log(`✅ Parrainage créé et VALIDÉ IMMÉDIATEMENT: ${sponsorNumber} → ${sponsoredNumber}`);
-        console.log(`   +1 ajouté au compteur (score actuel: ${sponsoredScore} points)`);
+        console.log(`   +1 ajouté au compteur (score actuel: ${sponsoredScore} points) | Ajouté à l'historique`);
       } else {
         // Sinon, juste créer l'entrée stats avec total = 0
         await pool.query(
@@ -930,7 +983,6 @@ const db = {
         
         console.log(`🤝 Parrainage créé (en attente): ${sponsorNumber} → ${sponsoredNumber}`);
         console.log(`   Score filleul: ${sponsoredScore} points (attente ${SPONSOR_MIN_SCORE})`);
-        console.log(`   COMPTEUR: total_sponsored = 0 (attente validation)`);
       }
       
       return { 
@@ -952,9 +1004,11 @@ const db = {
   async getSponsorInfo(playerNumber) {
     try {
       const result = await pool.query(
-        `SELECT s.sponsor_number, u.username as sponsor_username, s.is_validated
+        `SELECT s.sponsor_number, u.username as sponsor_username, s.is_validated,
+                h.validated_at as permanently_validated_at
          FROM sponsorships s
          JOIN users u ON s.sponsor_number = u.number
+         LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
          WHERE s.sponsored_number = $1`,
         [playerNumber]
       );
@@ -964,12 +1018,16 @@ const db = {
       }
       
       const sponsorship = result.rows[0];
+      const isPermanentlyValidated = !!sponsorship.permanently_validated_at;
+      
       return {
         success: true,
         has_sponsor: true,
         sponsor_number: sponsorship.sponsor_number,
         sponsor_username: sponsorship.sponsor_username,
-        is_validated: sponsorship.is_validated
+        is_validated: sponsorship.is_validated,
+        is_permanently_validated: isPermanentlyValidated,
+        permanently_validated_at: sponsorship.permanently_validated_at
       };
     } catch (error) {
       console.error('Erreur récupération parrain:', error);
@@ -1015,10 +1073,13 @@ const db = {
           s.is_validated,
           s.created_at,
           s.validated_at,
-          u2.score as sponsored_score
+          u2.score as sponsored_score,
+          h.validated_at as permanently_validated_at,
+          CASE WHEN h.sponsored_number IS NOT NULL THEN true ELSE false END as is_permanently_validated
         FROM sponsorships s
         JOIN users u1 ON s.sponsor_number = u1.number
         JOIN users u2 ON s.sponsored_number = u2.number
+        LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
         ORDER BY s.created_at DESC
       `);
       
@@ -1031,16 +1092,62 @@ const db = {
 
   async resetSponsorshipCounters() {
     try {
-      await pool.query('UPDATE sponsorship_stats SET validated_sponsored = 0, total_sponsored = 0');
-      await pool.query('UPDATE sponsorships SET is_validated = false, validated_at = NULL');
+      // IMPORTANT: NE PAS réinitialiser l'historique des validations
+      // On réinitialise seulement les parrainages non encore dans l'historique
+      await pool.query(`
+        UPDATE sponsorships s 
+        SET is_validated = false, validated_at = NULL 
+        WHERE NOT EXISTS (
+          SELECT 1 FROM sponsorship_validated_history h 
+          WHERE h.sponsored_number = s.sponsored_number
+        )
+      `);
+      
+      // Réinitialiser validated_sponsored pour ceux qui ne sont pas dans l'historique
+      await pool.query(`
+        UPDATE sponsorship_stats ss
+        SET validated_sponsored = 0
+        FROM (
+          SELECT s.sponsor_number
+          FROM sponsorships s
+          LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
+          WHERE h.sponsored_number IS NULL
+          GROUP BY s.sponsor_number
+        ) AS to_reset
+        WHERE ss.player_number = to_reset.sponsor_number
+      `);
       
       return { 
         success: true, 
-        message: "Compteurs de parrainage réinitialisés" 
+        message: "Compteurs de parrainage réinitialisés (sans affecter les validations permanentes)" 
       };
     } catch (error) {
       console.error('Erreur reset compteurs parrainage:', error);
       return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  // NOUVELLE FONCTION: Récupérer l'historique des validations permanentes
+  async getPermanentValidationHistory() {
+    try {
+      const result = await pool.query(`
+        SELECT 
+          h.sponsor_number,
+          u1.username as sponsor_username,
+          h.sponsored_number,
+          u2.username as sponsored_username,
+          h.validated_at,
+          u2.score as current_sponsored_score
+        FROM sponsorship_validated_history h
+        JOIN users u1 ON h.sponsor_number = u1.number
+        JOIN users u2 ON h.sponsored_number = u2.number
+        ORDER BY h.validated_at DESC
+      `);
+      
+      return result.rows;
+    } catch (error) {
+      console.error('Erreur récupération historique validations:', error);
+      return [];
     }
   }
 };
@@ -1114,6 +1221,18 @@ async function initializeDatabase() {
         validated_sponsored INTEGER DEFAULT 0,
         last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (player_number) REFERENCES users(number) ON DELETE CASCADE
+      )
+    `);
+
+    // NOUVELLE TABLE: Historique des validations permanentes (NE JAMAIS RÉINITIALISER)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sponsorship_validated_history (
+        id SERIAL PRIMARY KEY,
+        sponsor_number VARCHAR(20) NOT NULL,
+        sponsored_number VARCHAR(20) UNIQUE NOT NULL, -- Un filleul ne peut être validé qu'une fois
+        validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (sponsor_number) REFERENCES users(number) ON DELETE CASCADE,
+        FOREIGN KEY (sponsored_number) REFERENCES users(number) ON DELETE CASCADE
       )
     `);
 
@@ -1609,7 +1728,7 @@ async function handleAdminMessage(ws, message, adminId) {
         ws.send(JSON.stringify({
           type: 'admin_reset_scores',
           success: true,
-          message: `Scores réinitialisés`,
+          message: `Scores réinitialisés (validations permanentes conservées)`,
           players_reset: resetResult.playersReset,
           bots_reset: resetResult.botsReset
         }));
@@ -1763,7 +1882,6 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // NOUVELLES COMMANDES ADMIN POUR PARRAINAGE
     admin_get_sponsorships: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -1781,7 +1899,8 @@ async function handleAdminMessage(ws, message, adminId) {
           sponsorships: sponsorships,
           count: sponsorships.length,
           validated_count: sponsorships.filter(s => s.is_validated).length,
-          pending_count: sponsorships.filter(s => !s.is_validated).length
+          pending_count: sponsorships.filter(s => !s.is_validated).length,
+          permanently_validated_count: sponsorships.filter(s => s.is_permanently_validated).length
         }));
       } catch (error) {
         console.error('Erreur récupération parrainages admin:', error);
@@ -1819,7 +1938,6 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // NOUVELLE COMMANDE : FORCER UN SCAN DES PARRAINAGES
     admin_force_sponsorship_scan: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -1836,7 +1954,7 @@ async function handleAdminMessage(ws, message, adminId) {
           success: result.success,
           validated: result.validated,
           message: result.success ? 
-            `Scan terminé: ${result.validated} parrainages validés` : 
+            `Scan terminé: ${result.validated} NOUVEAUX parrainages validés` : 
             'Erreur lors du scan'
         }));
       } catch (error) {
@@ -1845,6 +1963,35 @@ async function handleAdminMessage(ws, message, adminId) {
           type: 'admin_sponsorship_scan', 
           success: false, 
           message: 'Erreur scan' 
+        }));
+      }
+    },
+
+    // NOUVELLE COMMANDE: Voir l'historique des validations permanentes
+    admin_get_permanent_validations: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const history = await db.getPermanentValidationHistory();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_permanent_validations',
+          success: true,
+          history: history,
+          count: history.length,
+          message: `Historique des ${history.length} validations permanentes`
+        }));
+      } catch (error) {
+        console.error('Erreur récupération historique validations admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_permanent_validations', 
+          success: false, 
+          message: 'Erreur récupération' 
         }));
       }
     }
@@ -2119,7 +2266,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }));
     },
     
-    // NOUVELLES FONCTIONS PARRAINAGE
     choose_sponsor: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
@@ -2164,6 +2310,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         sponsor_number: result.sponsor_number,
         sponsor_username: result.sponsor_username,
         is_validated: result.is_validated,
+        is_permanently_validated: result.is_permanently_validated || false,
         message: result.message
       }));
     },
@@ -2368,7 +2515,6 @@ app.post('/force-bot-increment', express.json(), async (req, res) => {
   }
 });
 
-// NOUVELLES ROUTES POUR LA CONFIGURATION DU MATCHMAKING
 app.get('/matchmaking-config', (req, res) => {
   res.json({
     success: true,
@@ -2406,9 +2552,7 @@ app.post('/matchmaking-config/update', express.json(), (req, res) => {
   }
 });
 
-// ===========================================
-// NOUVELLES ROUTES POUR PARRAINAGE AUTOMATIQUE
-// ===========================================
+// ROUTES POUR PARRAINAGE
 app.get('/sponsor-info/:playerNumber', async (req, res) => {
   try {
     const playerNumber = req.params.playerNumber;
@@ -2475,7 +2619,7 @@ app.post('/choose-sponsor', express.json(), async (req, res) => {
   }
 });
 
-// NOUVELLE ROUTE : FORCER UN SCAN DES PARRAINAGES
+// ROUTE : FORCER UN SCAN DES PARRAINAGES
 app.post('/force-sponsorship-scan', express.json(), async (req, res) => {
   try {
     const { admin_key } = req.body;
@@ -2490,7 +2634,7 @@ app.post('/force-sponsorship-scan', express.json(), async (req, res) => {
       success: result.success,
       validated: result.validated || 0,
       message: result.success ? 
-        `Scan terminé: ${result.validated} parrainages validés` : 
+        `Scan terminé: ${result.validated} NOUVEAUX parrainages validés` : 
         'Erreur lors du scan'
     });
   } catch (error) {
@@ -2515,7 +2659,8 @@ app.get('/admin/sponsorships', async (req, res) => {
       sponsorships: sponsorships,
       count: sponsorships.length,
       validated_count: sponsorships.filter(s => s.is_validated).length,
-      pending_count: sponsorships.filter(s => !s.is_validated).length
+      pending_count: sponsorships.filter(s => !s.is_validated).length,
+      permanently_validated_count: sponsorships.filter(s => s.is_permanently_validated).length
     });
   } catch (error) {
     console.error('Erreur récupération parrainages admin:', error);
@@ -2536,6 +2681,29 @@ app.post('/admin/reset-sponsorship-counters', express.json(), async (req, res) =
     res.json(result);
   } catch (error) {
     console.error('Erreur reset compteurs parrainage admin:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// NOUVELLE ROUTE: Historique des validations permanentes
+app.get('/admin/permanent-validations', async (req, res) => {
+  try {
+    const { admin_key } = req.query;
+    
+    if (admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    const history = await db.getPermanentValidationHistory();
+    
+    res.json({
+      success: true,
+      history: history,
+      count: history.length,
+      message: `Historique des ${history.length} validations permanentes`
+    });
+  } catch (error) {
+    console.error('Erreur récupération historique validations admin:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -2599,15 +2767,17 @@ async function startServer() {
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
       console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
-      console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ`);
+      console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ (ANTI-REVALIDATION)`);
       console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
       console.log(`   • +1 seulement quand filleul atteint 2000 points`);
+      console.log(`   • Historique des validations: JAMAIS réinitialisé`);
       console.log(`   • Scanner automatique: toutes les ${SPONSORSHIP_SCAN_INTERVAL/60000} minutes`);
       console.log(`   • Vérification score à la création`);
-      console.log(`   • Routes admin pour voir parrains et compteurs`);
       console.log(`   • Commande admin: admin_force_sponsorship_scan`);
+      console.log(`   • Commande admin: admin_get_permanent_validations`);
+      console.log(`   • Après reset: les validations permanentes NE sont PAS revalidées`);
       console.log(`🌐 WebSocket parrainage: choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
-      console.log(`🌐 Route API: POST /force-sponsorship-scan (admin_key requis)`);
+      console.log(`🌐 Route API: GET /admin/permanent-validations`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -2633,7 +2803,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
-
-
