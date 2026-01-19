@@ -28,7 +28,7 @@ const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000; // Scanner toutes les 5 minutes
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
-  anti_quick_rematch: true,
+  anti_quick_rematch: false,
   min_rematch_delay: 50 * 60 * 1000,
 };
 
@@ -2633,4 +2633,5 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
