@@ -23,8 +23,9 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const BOT_DEPOSIT = 250;
-const SPONSOR_MIN_SCORE = 2000; // Score minimum pour valider un parrainage
-const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000; // Scanner toutes les 5 minutes
+const SPONSOR_MIN_SCORE = 2000;
+const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000;
+const LOBBY_TIMEOUT = 30000; // 30 secondes pour démarrer un lobby
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
@@ -48,6 +49,7 @@ const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
 const BOT_DEPOSITS = new Map();
 const LAST_MATCHES = new Map();
+const PENDING_LOBBIES = new Map(); // Nouveau: pour suivre les lobbys en attente
 
 const BOTS = [
   { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 0 },
@@ -222,14 +224,10 @@ async function loadBotScores() {
   }
 }
 
-// ===========================================
-// NOUVELLE FONCTION : SCAN GLOBAL DES PARRAINAGES (MODIFIÉE POUR ÉVITER REVALIDATION)
-// ===========================================
 async function scanAndValidateAllSponsorships() {
   try {
     console.log('🔍 Démarrage scan global des parrainages (anti-revalidation)...');
     
-    // Trouver les filleuls qui ont atteint 2000 points mais dont le parrainage n'est PAS DÉJÀ DANS L'HISTORIQUE
     const result = await pool.query(`
       SELECT 
         u.number as sponsored_number,
@@ -244,7 +242,7 @@ async function scanAndValidateAllSponsorships() {
       LEFT JOIN sponsorship_validated_history h ON u.number = h.sponsored_number
       WHERE u.score >= $1 
         AND s.is_validated = false
-        AND h.sponsored_number IS NULL  -- IMPORTANT: Pas déjà dans l'historique
+        AND h.sponsored_number IS NULL
       ORDER BY u.score DESC
     `, [SPONSOR_MIN_SCORE]);
     
@@ -261,7 +259,6 @@ async function scanAndValidateAllSponsorships() {
       
       console.log(`🎯 NOUVEAU parrainage à valider: ${sponsoredUsername} (${sponsoredScore} points) → ${sponsorUsername}`);
       
-      // Valider le parrainage dans sponsorships
       await pool.query(
         `UPDATE sponsorships 
          SET is_validated = true, validated_at = CURRENT_TIMESTAMP 
@@ -269,7 +266,6 @@ async function scanAndValidateAllSponsorships() {
         [sponsorNumber, sponsoredNumber]
       );
       
-      // AJOUTER À L'HISTORIQUE DES VALIDATIONS (permanent)
       await pool.query(
         `INSERT INTO sponsorship_validated_history (sponsor_number, sponsored_number, validated_at)
          VALUES ($1, $2, CURRENT_TIMESTAMP)
@@ -277,7 +273,6 @@ async function scanAndValidateAllSponsorships() {
         [sponsorNumber, sponsoredNumber]
       );
       
-      // Mettre à jour les compteurs (total et validé augmentent tous les deux)
       await pool.query(
         `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
          VALUES ($1, 1, 1) 
@@ -293,7 +288,6 @@ async function scanAndValidateAllSponsorships() {
       
       validatedCount++;
       
-      // Notifier le parrain s'il est connecté
       const sponsorWs = PLAYER_CONNECTIONS.get(sponsorNumber);
       if (sponsorWs && sponsorWs.readyState === WebSocket.OPEN) {
         sponsorWs.send(JSON.stringify({
@@ -308,7 +302,7 @@ async function scanAndValidateAllSponsorships() {
     if (validatedCount > 0) {
       console.log(`🎉 Scan terminé: ${validatedCount} NOUVEAUX parrainages validés`);
     } else {
-      console.log('✅ Aucun NOUVEAU parrainage à valider (tous déjà validés ou score insuffisant)');
+      console.log('✅ Aucun NOUVEAU parrainage à valider');
     }
     
     return { success: true, validated: validatedCount };
@@ -318,24 +312,20 @@ async function scanAndValidateAllSponsorships() {
   }
 }
 
-// FONCTION ORIGINALE MODIFIÉE POUR ÉVITER REVALIDATION
 async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
   try {
-    // Vérifier si le joueur a atteint le score minimum pour valider ses parrainages
     if (newScore >= SPONSOR_MIN_SCORE) {
-      // Trouver tous les parrainages où ce joueur est parrainé (sponsored) et non déjà dans l'historique
       const sponsorshipsResult = await pool.query(
         `SELECT s.* 
          FROM sponsorships s
          LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
          WHERE s.sponsored_number = $1 
          AND s.is_validated = false
-         AND h.sponsored_number IS NULL`,  // Pas déjà validé dans l'historique
+         AND h.sponsored_number IS NULL`,
         [playerNumber]
       );
       
       for (const sponsorship of sponsorshipsResult.rows) {
-        // Valider le parrainage
         await pool.query(
           `UPDATE sponsorships 
            SET is_validated = true, validated_at = CURRENT_TIMESTAMP 
@@ -343,7 +333,6 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
           [sponsorship.sponsor_number, sponsorship.sponsored_number]
         );
         
-        // Ajouter à l'historique des validations (permanent)
         await pool.query(
           `INSERT INTO sponsorship_validated_history (sponsor_number, sponsored_number, validated_at)
            VALUES ($1, $2, CURRENT_TIMESTAMP)
@@ -351,7 +340,6 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
           [sponsorship.sponsor_number, sponsorship.sponsored_number]
         );
         
-        // Ajouter +1 au compteur seulement si c'est une NOUVELLE validation
         await pool.query(
           `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
            VALUES ($1, 1, 1) 
@@ -363,9 +351,8 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
         );
         
         console.log(`✅ NOUVEAU parrainage validé: ${sponsorship.sponsor_number} → ${sponsorship.sponsored_number}`);
-        console.log(`   +1 ajouté au compteur du parrain (score atteint: ${newScore}) | Ajouté à l'historique`);
+        console.log(`   +1 ajouté au compteur (score atteint: ${newScore}) | Ajouté à l'historique`);
         
-        // Notifier le parrain si connecté
         const sponsorWs = PLAYER_CONNECTIONS.get(sponsorship.sponsor_number);
         if (sponsorWs && sponsorWs.readyState === WebSocket.OPEN) {
           sponsorWs.send(JSON.stringify({
@@ -417,7 +404,6 @@ const db = {
       [newScore, number]
     );
     
-    // Vérifier si des NOUVEAUX parrainages peuvent être validés
     console.log(`   Validation parrainage pour ${number} (score: ${newScore})`);
     await validateSponsorshipsWhenScoreReached(number, newScore);
   },
@@ -541,7 +527,6 @@ const db = {
         }
       }
       
-      // Utiliser updateUserScore qui valide automatiquement les parrainages
       await this.updateUserScore(playerNumber, newScore);
       
       if (deposit) {
@@ -654,19 +639,14 @@ const db = {
       
       BOT_DEPOSITS.clear();
       
-      // IMPORTANT: NE PAS RÉINITIALISER L'HISTORIQUE DES VALIDATIONS
-      // On réinitialise seulement la table sponsorships pour le reset hebdomadaire
-      // mais on garde l'historique des validations permanentes
       await pool.query(`
         UPDATE sponsorships s 
         SET is_validated = false, validated_at = NULL 
         FROM sponsorship_validated_history h 
         WHERE s.sponsored_number = h.sponsored_number
-        AND h.sponsored_number IS NULL  -- IMPORTANT: pas ceux déjà dans l'historique
+        AND h.sponsored_number IS NULL
       `);
       
-      // NE PAS réinitialiser sponsorship_stats car les compteurs doivent rester
-      // On fait un UPDATE pour réinitialiser seulement validated_sponsored pour ceux qui ne sont pas dans l'historique
       await pool.query(`
         UPDATE sponsorship_stats ss
         SET validated_sponsored = 0
@@ -898,7 +878,6 @@ const db = {
     }
   },
 
-  // FONCTIONS PARRAINAGE (MODIFIÉES POUR ÉVITER REVALIDATION)
   async chooseSponsor(sponsoredNumber, sponsorNumber) {
     try {
       const sponsored = await this.getUserByNumber(sponsoredNumber);
@@ -925,7 +904,6 @@ const db = {
         return { success: false, message: "Vous avez déjà un parrain" };
       }
       
-      // Vérifier si ce filleul a DÉJÀ validé un parrainage dans l'historique
       const alreadyValidatedInHistory = await pool.query(
         'SELECT * FROM sponsorship_validated_history WHERE sponsored_number = $1',
         [sponsoredNumber]
@@ -938,21 +916,17 @@ const db = {
       const sponsoredScore = sponsored.score;
       let isAlreadyValidated = false;
       
-      // Si le filleul a déjà 2000 points ET n'est pas dans l'historique, valider immédiatement
       if (sponsoredScore >= SPONSOR_MIN_SCORE) {
         isAlreadyValidated = true;
       }
       
-      // Créer le parrainage
       await pool.query(
         `INSERT INTO sponsorships (sponsor_number, sponsored_number, is_validated) 
          VALUES ($1, $2, $3)`,
         [sponsorNumber, sponsoredNumber, isAlreadyValidated]
       );
       
-      // Si le filleul a déjà 2000 points ET n'est pas dans l'historique, valider tout de suite
       if (isAlreadyValidated) {
-        // Ajouter à l'historique des validations
         await pool.query(
           `INSERT INTO sponsorship_validated_history (sponsor_number, sponsored_number, validated_at)
            VALUES ($1, $2, CURRENT_TIMESTAMP)`,
@@ -972,7 +946,6 @@ const db = {
         console.log(`✅ Parrainage créé et VALIDÉ IMMÉDIATEMENT: ${sponsorNumber} → ${sponsoredNumber}`);
         console.log(`   +1 ajouté au compteur (score actuel: ${sponsoredScore} points) | Ajouté à l'historique`);
       } else {
-        // Sinon, juste créer l'entrée stats avec total = 0
         await pool.query(
           `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
            VALUES ($1, 0, 0) 
@@ -1092,8 +1065,6 @@ const db = {
 
   async resetSponsorshipCounters() {
     try {
-      // IMPORTANT: NE PAS réinitialiser l'historique des validations
-      // On réinitialise seulement les parrainages non encore dans l'historique
       await pool.query(`
         UPDATE sponsorships s 
         SET is_validated = false, validated_at = NULL 
@@ -1103,7 +1074,6 @@ const db = {
         )
       `);
       
-      // Réinitialiser validated_sponsored pour ceux qui ne sont pas dans l'historique
       await pool.query(`
         UPDATE sponsorship_stats ss
         SET validated_sponsored = 0
@@ -1127,7 +1097,6 @@ const db = {
     }
   },
 
-  // NOUVELLE FONCTION: Récupérer l'historique des validations permanentes
   async getPermanentValidationHistory() {
     try {
       const result = await pool.query(`
@@ -1199,7 +1168,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // TABLES POUR PARRAINAGE
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sponsorships (
         id SERIAL PRIMARY KEY,
@@ -1224,12 +1192,11 @@ async function initializeDatabase() {
       )
     `);
 
-    // NOUVELLE TABLE: Historique des validations permanentes (NE JAMAIS RÉINITIALISER)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sponsorship_validated_history (
         id SERIAL PRIMARY KEY,
         sponsor_number VARCHAR(20) NOT NULL,
-        sponsored_number VARCHAR(20) UNIQUE NOT NULL, -- Un filleul ne peut être validé qu'une fois
+        sponsored_number VARCHAR(20) UNIQUE NOT NULL,
         validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (sponsor_number) REFERENCES users(number) ON DELETE CASCADE,
         FOREIGN KEY (sponsored_number) REFERENCES users(number) ON DELETE CASCADE
@@ -1270,13 +1237,17 @@ async function loadTrustedDevices() {
   }
 }
 
+// CLASSE GAME AVEC GESTION AMÉLIORÉE DES LOBBIES
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
       id, players: [], phase: 'waiting', manche: 1, maxManches: 3, turn: null,
       scores: { player1: 0, player2: 0 }, playerCombinations: { player1: null, player2: null },
       availableSlots: { player1: [1,2,3,4,5,6], player2: [1,2,3,4,5,6] },
-      preparationTime: 20, turnTime: 30, selectionsThisManche: 0, maxSelections: 3, timerInterval: null
+      preparationTime: 20, turnTime: 30, selectionsThisManche: 0, maxSelections: 3, timerInterval: null,
+      lobbyTimeout: null,
+      created_at: Date.now(),
+      status: 'lobby' // 'lobby', 'active', 'cancelled', 'finished'
     });
     
     [p1, p2].forEach((p, i) => {
@@ -1286,10 +1257,57 @@ class Game {
     });
     
     ACTIVE_GAMES.set(id, this);
+    PENDING_LOBBIES.set(id, this);
     
     recordMatch(p1.number, p2.number);
     
+    console.log(`🎮 Nouveau lobby créé: ${this.id}`);
+    console.log(`   Joueurs: ${p1.username} vs ${p2.username}`);
+    console.log(`   Lobbys actifs: ${PENDING_LOBBIES.size}, Parties actives: ${ACTIVE_GAMES.size}`);
+    
+    // Timeout pour annuler le lobby si pas démarré
+    this.lobbyTimeout = setTimeout(() => {
+      if (this.phase === 'waiting' && this.status === 'lobby') {
+        console.log(`⏱️ Timeout lobby ${this.id} - Annulation automatique`);
+        this.cancelLobby('Délai de connexion dépassé');
+      }
+    }, LOBBY_TIMEOUT);
+    
     setTimeout(() => this.checkAndStartGame(), 1000);
+  }
+
+  // ANNULER UN LOBBY PROPREMENT
+  cancelLobby(reason) {
+    if (this.status === 'cancelled') return;
+    
+    console.log(`❌ Annulation lobby ${this.id}: ${reason}`);
+    this.status = 'cancelled';
+    
+    // Notifier tous les joueurs
+    this.players.forEach(p => {
+      if (p.ws?.readyState === WebSocket.OPEN) {
+        p.ws.send(JSON.stringify({
+          type: 'match_cancelled',
+          message: reason,
+          lobby_id: this.id
+        }));
+      }
+      
+      // Retirer du jeu mais pas de la file (ils peuvent re-rechercher)
+      PLAYER_TO_GAME.delete(p.number);
+      
+      // Si déconnecté, on le remet dans la file
+      if (!p.ws || p.ws.readyState !== WebSocket.OPEN) {
+        PLAYER_QUEUE.add(p.number);
+      }
+    });
+    
+    // Nettoyer
+    this.cleanup();
+    
+    // Retirer des structures
+    PENDING_LOBBIES.delete(this.id);
+    ACTIVE_GAMES.delete(this.id);
   }
 
   broadcast(msg) {
@@ -1312,8 +1330,28 @@ class Game {
   }
 
   checkAndStartGame() {
-    if (this.players.filter(p => p.ws?.readyState === WebSocket.OPEN).length === 2 && this.phase === 'waiting') {
+    // Vérifier que les deux joueurs sont encore connectés
+    const connectedPlayers = this.players.filter(p => p.ws?.readyState === WebSocket.OPEN);
+    
+    if (connectedPlayers.length < 2) {
+      console.log(`⚠️ Lobby ${this.id}: Un joueur s'est déconnecté avant le début`);
+      this.cancelLobby('Un joueur s\'est déconnecté');
+      return;
+    }
+    
+    if (this.phase === 'waiting' && this.status === 'lobby') {
       this.phase = 'preparation';
+      this.status = 'active';
+      PENDING_LOBBIES.delete(this.id);
+      
+      if (this.lobbyTimeout) {
+        clearTimeout(this.lobbyTimeout);
+        this.lobbyTimeout = null;
+      }
+      
+      console.log(`🎲 Début de partie ${this.id}: ${this.players[0].username} vs ${this.players[1].username}`);
+      console.log(`   Lobbys en attente: ${PENDING_LOBBIES.size}, Parties en cours: ${ACTIVE_GAMES.size - PENDING_LOBBIES.size}`);
+      
       this.broadcast({ type: 'game_start' });
       this.broadcastGameState();
       this.startPreparationTimer();
@@ -1432,9 +1470,21 @@ class Game {
   }
 
   async handlePlayerDisconnect(disconnectedPlayer) {
+    if (this.status === 'cancelled') return;
+    
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
+    
+    if (this.phase === 'waiting' && this.status === 'lobby') {
+      // Annuler le lobby si déconnexion avant début
+      this.cancelLobby('Un joueur s\'est déconnecté');
+      return;
+    }
+    
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
-      remainingPlayer.ws.send(JSON.stringify({ type: 'opponent_left', message: 'Adversaire a quitté la partie' }));
+      remainingPlayer.ws.send(JSON.stringify({ 
+        type: 'opponent_left', 
+        message: 'Adversaire a quitté la partie' 
+      }));
       setTimeout(() => this._endGameByDisconnect(disconnectedPlayer, remainingPlayer), 10000);
     } else {
       this.cleanup();
@@ -1538,14 +1588,23 @@ class Game {
   }
 
   cleanup() {
+    if (this.lobbyTimeout) clearTimeout(this.lobbyTimeout);
     if (this.timerInterval) clearInterval(this.timerInterval);
+    
     this.players.forEach(p => {
       PLAYER_TO_GAME.delete(p.number);
     });
+    
+    PENDING_LOBBIES.delete(this.id);
     ACTIVE_GAMES.delete(this.id);
+    
+    console.log(`🗑️  Nettoyage partie ${this.id}`);
+    console.log(`   Lobbys restants: ${PENDING_LOBBIES.size}, Parties actives: ${ACTIVE_GAMES.size}`);
   }
 
-  getPlayerByNumber(n) { return this.players.find(p => p.number === n); }
+  getPlayerByNumber(n) { 
+    return this.players.find(p => p.number === n); 
+  }
 }
 
 wss.on('connection', (ws, req) => {
@@ -1585,23 +1644,31 @@ wss.on('connection', (ws, req) => {
     if (isAdminConnection && adminId) {
       ADMIN_CONNECTIONS.delete(adminId);
     } else {
-      setTimeout(async () => {
-        const deviceKey = generateDeviceKey(ip, deviceId);
-        const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
+      // Gestion IMMÉDIATE de la déconnexion
+      const deviceKey = generateDeviceKey(ip, deviceId);
+      const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
+      
+      if (disconnectedNumber) {
+        console.log(`🔌 Déconnexion: ${disconnectedNumber}`);
         
-        if (disconnectedNumber) {
-          PLAYER_CONNECTIONS.delete(disconnectedNumber);
-          PLAYER_QUEUE.delete(disconnectedNumber);
-          
-          await db.setUserOnlineStatus(disconnectedNumber, false);
-          
-          const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
+        PLAYER_CONNECTIONS.delete(disconnectedNumber);
+        PLAYER_QUEUE.delete(disconnectedNumber);
+        
+        await db.setUserOnlineStatus(disconnectedNumber, false);
+        
+        const gameId = PLAYER_TO_GAME.get(disconnectedNumber);
+        if (gameId) {
           const game = ACTIVE_GAMES.get(gameId);
-          const player = game?.getPlayerByNumber(disconnectedNumber);
-          if (player) await game.handlePlayerDisconnect(player);
-          PLAYER_TO_GAME.delete(disconnectedNumber);
+          if (game) {
+            const player = game.getPlayerByNumber(disconnectedNumber);
+            if (player) {
+              await game.handlePlayerDisconnect(player);
+            }
+          }
         }
-      }, 10000);
+        
+        PLAYER_TO_GAME.delete(disconnectedNumber);
+      }
     }
   });
 });
@@ -1967,7 +2034,6 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // NOUVELLE COMMANDE: Voir l'historique des validations permanentes
     admin_get_permanent_validations: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -1992,6 +2058,40 @@ async function handleAdminMessage(ws, message, adminId) {
           type: 'admin_permanent_validations', 
           success: false, 
           message: 'Erreur récupération' 
+        }));
+      }
+    },
+
+    admin_get_server_stats: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        ws.send(JSON.stringify({
+          type: 'admin_server_stats',
+          success: true,
+          stats: {
+            connected_players: PLAYER_CONNECTIONS.size,
+            in_queue: PLAYER_QUEUE.size,
+            active_games: ACTIVE_GAMES.size,
+            pending_lobbies: PENDING_LOBBIES.size,
+            player_to_game: PLAYER_TO_GAME.size,
+            bot_deposits: BOT_DEPOSITS.size,
+            last_matches: LAST_MATCHES.size,
+            trusted_devices: TRUSTED_DEVICES.size
+          },
+          message: 'Statistiques serveur'
+        }));
+      } catch (error) {
+        console.error('Erreur stats serveur admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_server_stats', 
+          success: false, 
+          message: 'Erreur stats' 
         }));
       }
     }
@@ -2104,9 +2204,14 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         await db.setUserOnlineStatus(playerNumber, false);
         
         const gameId = PLAYER_TO_GAME.get(playerNumber);
-        const game = ACTIVE_GAMES.get(gameId);
-        const player = game?.getPlayerByNumber(playerNumber);
-        if (player) await game.handlePlayerDisconnect(player);
+        if (gameId) {
+          const game = ACTIVE_GAMES.get(gameId);
+          if (game) {
+            const player = game.getPlayerByNumber(playerNumber);
+            if (player) await game.handlePlayerDisconnect(player);
+          }
+        }
+        
         PLAYER_TO_GAME.delete(playerNumber);
         
         ws.send(JSON.stringify({ type: 'logout_success', message: 'Déconnexion réussie' }));
@@ -2221,6 +2326,34 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         PLAYER_QUEUE.delete(playerNumber);
         ws.send(JSON.stringify({ type: 'queue_left', message: 'Recherche annulée' }));
       }
+    },
+
+    // NOUVELLE COMMANDE: Annuler un lobby trouvé
+    cancel_match: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      
+      const gameId = PLAYER_TO_GAME.get(playerNumber);
+      if (!gameId) return ws.send(JSON.stringify({ type: 'error', message: 'Aucun match trouvé' }));
+      
+      const game = ACTIVE_GAMES.get(gameId);
+      if (!game) return ws.send(JSON.stringify({ type: 'error', message: 'Match introuvable' }));
+      
+      // Seulement annuler si le jeu n'a pas encore commencé
+      if (game.phase !== 'waiting' || game.status !== 'lobby') {
+        return ws.send(JSON.stringify({ 
+          type: 'error', 
+          message: 'La partie a déjà commencé' 
+        }));
+      }
+      
+      console.log(`🖐️ Annulation lobby ${gameId} par ${playerNumber}`);
+      game.cancelLobby('L\'adversaire a annulé le match');
+      
+      ws.send(JSON.stringify({
+        type: 'match_cancelled_success',
+        message: 'Match annulé avec succès'
+      }));
     },
 
     request_bot: async () => {
@@ -2345,6 +2478,21 @@ async function createGameLobby(playerNumbers) {
   const p2 = await db.getUserByNumber(playerNumbers[1]);
   if (!p1 || !p2) return;
   
+  // Vérifier que les deux joueurs sont encore connectés
+  const ws1 = PLAYER_CONNECTIONS.get(p1.number);
+  const ws2 = PLAYER_CONNECTIONS.get(p2.number);
+  
+  if (!ws1 || ws1.readyState !== WebSocket.OPEN || !ws2 || ws2.readyState !== WebSocket.OPEN) {
+    console.log(`❌ Impossible de créer lobby: un joueur déconnecté`);
+    // Remettre dans la file
+    playerNumbers.forEach(num => {
+      if (PLAYER_CONNECTIONS.get(num)?.readyState === WebSocket.OPEN) {
+        PLAYER_QUEUE.add(num);
+      }
+    });
+    return;
+  }
+  
   const gameId = generateId();
   new Game(gameId, p1, p2);
   
@@ -2352,9 +2500,15 @@ async function createGameLobby(playerNumbers) {
     const ws = PLAYER_CONNECTIONS.get(num);
     const opponent = idx === 0 ? p2 : p1;
     ws?.send(JSON.stringify({
-      type: 'match_found', matchId: gameId,
-      opponent: { username: opponent.username, score: opponent.score, number: opponent.number },
-      isPlayer1: idx === 0
+      type: 'match_found',
+      matchId: gameId,
+      opponent: { 
+        username: opponent.username, 
+        score: opponent.score, 
+        number: opponent.number 
+      },
+      isPlayer1: idx === 0,
+      can_cancel: true // Indique que l'annulation est possible
     }));
   });
 }
@@ -2552,7 +2706,6 @@ app.post('/matchmaking-config/update', express.json(), (req, res) => {
   }
 });
 
-// ROUTES POUR PARRAINAGE
 app.get('/sponsor-info/:playerNumber', async (req, res) => {
   try {
     const playerNumber = req.params.playerNumber;
@@ -2619,7 +2772,6 @@ app.post('/choose-sponsor', express.json(), async (req, res) => {
   }
 });
 
-// ROUTE : FORCER UN SCAN DES PARRAINAGES
 app.post('/force-sponsorship-scan', express.json(), async (req, res) => {
   try {
     const { admin_key } = req.body;
@@ -2643,7 +2795,6 @@ app.post('/force-sponsorship-scan', express.json(), async (req, res) => {
   }
 });
 
-// ROUTES ADMIN POUR PARRAINAGE
 app.get('/admin/sponsorships', async (req, res) => {
   try {
     const { admin_key } = req.query;
@@ -2685,7 +2836,6 @@ app.post('/admin/reset-sponsorship-counters', express.json(), async (req, res) =
   }
 });
 
-// NOUVELLE ROUTE: Historique des validations permanentes
 app.get('/admin/permanent-validations', async (req, res) => {
   try {
     const { admin_key } = req.query;
@@ -2708,6 +2858,22 @@ app.get('/admin/permanent-validations', async (req, res) => {
   }
 });
 
+app.get('/server-stats', (req, res) => {
+  res.json({
+    success: true,
+    stats: {
+      connected_players: PLAYER_CONNECTIONS.size,
+      in_queue: PLAYER_QUEUE.size,
+      active_games: ACTIVE_GAMES.size,
+      pending_lobbies: PENDING_LOBBIES.size,
+      player_to_game: PLAYER_TO_GAME.size,
+      bot_deposits: BOT_DEPOSITS.size,
+      last_matches: LAST_MATCHES.size
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
@@ -2719,6 +2885,8 @@ app.get('/health', (req, res) => {
     last_matches_tracked: LAST_MATCHES.size,
     sponsorship_min_score: SPONSOR_MIN_SCORE,
     sponsorship_scan_interval: SPONSORSHIP_SCAN_INTERVAL,
+    pending_lobbies: PENDING_LOBBIES.size,
+    lobby_timeout: LOBBY_TIMEOUT,
     timestamp: new Date().toISOString() 
   });
 });
@@ -2747,13 +2915,11 @@ async function startServer() {
     await loadTrustedDevices();
     await loadBotScores();
     
-    // Lancer le scanner automatique des parrainages
     sponsorshipScanInterval = setInterval(scanAndValidateAllSponsorships, SPONSORSHIP_SCAN_INTERVAL);
     
-    // Scanner immédiatement au démarrage
     setTimeout(() => {
       scanAndValidateAllSponsorships();
-    }, 10 * 1000); // 10 secondes après démarrage
+    }, 10 * 1000);
     
     botAutoIncrementInterval = setInterval(incrementBotScoresAutomatically, BOT_INCREMENT_INTERVAL);
     
@@ -2767,17 +2933,22 @@ async function startServer() {
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
       console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
+      console.log(`🎮 SYSTÈME LOBBY AVEC ANNULATION`);
+      console.log(`   • Timeout lobby: ${LOBBY_TIMEOUT/1000} secondes`);
+      console.log(`   • Commande annulation: cancel_match`);
+      console.log(`   • Nettoyage automatique des lobbys abandonnés`);
+      console.log(`   • Notification en temps réel aux deux joueurs`);
+      console.log(`   • Réintégration automatique dans la file`);
       console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ (ANTI-REVALIDATION)`);
       console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
-      console.log(`   • +1 seulement quand filleul atteint 2000 points`);
       console.log(`   • Historique des validations: JAMAIS réinitialisé`);
       console.log(`   • Scanner automatique: toutes les ${SPONSORSHIP_SCAN_INTERVAL/60000} minutes`);
-      console.log(`   • Vérification score à la création`);
-      console.log(`   • Commande admin: admin_force_sponsorship_scan`);
-      console.log(`   • Commande admin: admin_get_permanent_validations`);
-      console.log(`   • Après reset: les validations permanentes NE sont PAS revalidées`);
-      console.log(`🌐 WebSocket parrainage: choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
-      console.log(`🌐 Route API: GET /admin/permanent-validations`);
+      console.log(`🌐 Nouvelles commandes WebSocket:`);
+      console.log(`   • cancel_match - Annuler un lobby trouvé`);
+      console.log(`   • choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
+      console.log(`🌐 Nouvelles routes API:`);
+      console.log(`   • GET /server-stats - Statistiques serveur`);
+      console.log(`   • GET /admin/permanent-validations - Historique validations`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -2803,6 +2974,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
-
