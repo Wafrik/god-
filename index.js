@@ -29,7 +29,7 @@ const LOBBY_TIMEOUT = 30000; // 30 secondes pour démarrer un lobby
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
-  anti_quick_rematch: true,
+  anti_quick_rematch: false,
   min_rematch_delay: 50 * 60 * 1000,
 };
 
@@ -2974,4 +2974,5 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
