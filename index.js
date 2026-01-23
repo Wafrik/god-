@@ -30,12 +30,12 @@ const AUTO_MOVE_BONUS = 200; // Bonus quand l'adversaire quitte
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
-  anti_quick_rematch: false,
+  anti_quick_rematch: true,
   min_rematch_delay: 50 * 60 * 1000,
 };
 
 const UPDATE_CONFIG = {
-  force_update: false,
+  force_update: true,
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
@@ -3020,3 +3020,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
