@@ -26,6 +26,7 @@ const BOT_DEPOSIT = 250;
 const SPONSOR_MIN_SCORE = 2000;
 const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000;
 const LOBBY_TIMEOUT = 30000; // 30 secondes pour démarrer un lobby
+const AUTO_MOVE_BONUS = 200; // Bonus quand l'adversaire quitte
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
@@ -49,7 +50,7 @@ const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
 const BOT_DEPOSITS = new Map();
 const LAST_MATCHES = new Map();
-const PENDING_LOBBIES = new Map(); // Nouveau: pour suivre les lobbys en attente
+const PENDING_LOBBIES = new Map();
 
 const BOTS = [
   { id: "bot_m_001", username: "Lucas", gender: "M", baseScore: 0 },
@@ -1247,7 +1248,8 @@ class Game {
       preparationTime: 20, turnTime: 30, selectionsThisManche: 0, maxSelections: 3, timerInterval: null,
       lobbyTimeout: null,
       created_at: Date.now(),
-      status: 'lobby' // 'lobby', 'active', 'cancelled', 'finished'
+      status: 'lobby', // 'lobby', 'active', 'cancelled', 'finished'
+      autoMoveUsed: { player1: false, player2: false } // Pour suivre les coups automatiques par joueur par manche
     });
     
     [p1, p2].forEach((p, i) => {
@@ -1386,12 +1388,54 @@ class Game {
     this.timerInterval = setInterval(() => {
       if (--timeLeft <= 0) {
         clearInterval(this.timerInterval);
-        const player = this.players.find(p => p.role === this.turn);
-        player ? this.makeAutomaticMove(player) : this.endTurn();
+        
+        const currentPlayer = this.players.find(p => p.role === this.turn);
+        if (!currentPlayer) {
+          console.log(`❌ Joueur ${this.turn} non trouvé`);
+          this.endTurn();
+          return;
+        }
+        
+        // Vérifier si le joueur a déjà utilisé son coup automatique cette manche
+        if (!this.autoMoveUsed[this.turn]) {
+          // Premier coup automatique de la manche pour ce joueur
+          console.log(`⏰ Timeout tour ${this.turn} - Premier coup automatique`);
+          this.makeSingleAutomaticMove(currentPlayer);
+        } else {
+          // Si déjà utilisé un coup automatique cette manche → joueur a quitté
+          console.log(`⏰ Timeout tour ${this.turn} - Coup automatique déjà utilisé → JOUEUR A QUITTÉ`);
+          this.handlePlayerDisconnect(currentPlayer);
+        }
       } else {
         this.broadcast({ type: 'timer_update', timer: timeLeft });
       }
     }, 1000);
+  }
+
+  // NOUVELLE MÉTHODE: Un seul coup automatique par joueur par manche
+  makeSingleAutomaticMove(player) {
+    const slots = this.availableSlots[player.role];
+    if (slots.length === 0) { 
+      console.log(`⚠️ Aucun slot disponible pour ${player.role}`);
+      this.endTurn(); 
+      return false; 
+    }
+    
+    // Marquer que ce joueur a utilisé son coup automatique cette manche
+    this.autoMoveUsed[player.role] = true;
+    console.log(`🤖 Coup automatique unique pour ${player.role} (manche ${this.manche})`);
+    
+    const randomSlot = slots[Math.floor(Math.random() * slots.length)];
+    const success = this.makeMove(player, randomSlot, 0, null);
+    
+    // Notifier les joueurs
+    this.broadcast({
+      type: 'auto_move_notification',
+      player: player.role,
+      message: 'Le serveur a joué automatiquement (1 coup max/manche)'
+    });
+    
+    return success;
   }
 
   makeMove(player, slotIndex, value, combination) {
@@ -1437,13 +1481,6 @@ class Game {
     return true;
   }
 
-  makeAutomaticMove(player) {
-    const slots = this.availableSlots[player.role];
-    if (slots.length === 0) { this.endTurn(); return false; }
-    const randomSlot = slots[Math.floor(Math.random() * slots.length)];
-    return this.makeMove(player, randomSlot, 0, null);
-  }
-
   swapDice(player, dieIndexA, dieIndexB, combination) {
     const a = parseInt(dieIndexA) - 1, b = parseInt(dieIndexB) - 1;
     if (a >= 0 && a < 6 && b >= 0 && b < 6) {
@@ -1480,21 +1517,20 @@ class Game {
       return;
     }
     
+    console.log(`🔌 ${disconnectedPlayer.username} (${disconnectedPlayer.role}) a quitté la partie ${this.id}`);
+    
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
       remainingPlayer.ws.send(JSON.stringify({ 
         type: 'opponent_left', 
         message: 'Adversaire a quitté la partie' 
       }));
-      setTimeout(() => this._endGameByDisconnect(disconnectedPlayer, remainingPlayer), 10000);
+      // Appliquer immédiatement les pénalités et fin du match
+      await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
+      this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
+      this.cleanup();
     } else {
       this.cleanup();
     }
-  }
-
-  async _endGameByDisconnect(disconnectedPlayer, remainingPlayer) {
-    await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
-    this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
-    setTimeout(() => this.cleanup(), 5000);
   }
 
   async _applyDisconnectPenalties(disconnectedPlayer, remainingPlayer) {
@@ -1506,8 +1542,13 @@ class Game {
         const disconnectedScore = this.scores[disconnectedPlayer.role];
         const remainingScore = this.scores[remainingPlayer.role];
         
+        // MODIFICATION: +200 points bonus pour le joueur restant
         const newDisconnectedScore = Math.max(0, disconnectedUser.score - (disconnectedScore > 15 ? disconnectedScore : 15));
-        const newRemainingScore = remainingUser.score + (remainingScore < 15 ? 15 : remainingScore);
+        const newRemainingScore = remainingUser.score + (remainingScore < 15 ? 15 : remainingScore) + AUTO_MOVE_BONUS;
+        
+        console.log(`💰 Bonus +${AUTO_MOVE_BONUS} points pour ${remainingPlayer.username} (adversaire a quitté)`);
+        console.log(`   Score ${remainingPlayer.username}: ${remainingUser.score} → ${newRemainingScore}`);
+        console.log(`   Score ${disconnectedPlayer.username}: ${disconnectedUser.score} → ${newDisconnectedScore}`);
         
         await db.updateUserScore(disconnectedPlayer.number, newDisconnectedScore);
         await db.updateUserScore(remainingPlayer.number, newRemainingScore);
@@ -1527,6 +1568,11 @@ class Game {
 
   endManche() {
     if (this.timerInterval) clearInterval(this.timerInterval);
+    
+    // Réinitialiser les coups automatiques pour la nouvelle manche
+    this.autoMoveUsed = { player1: false, player2: false };
+    console.log(`🔄 Fin manche ${this.manche} - Réinitialisation coups automatiques`);
+    
     this.broadcast({ type: 'manche_end', manche: this.manche, scores: this.scores });
     this.broadcastGameState();
     this.manche >= this.maxManches ? setTimeout(() => this.endGame(), 2000) : (this.manche++, setTimeout(() => this.startNewManche(), 2000));
@@ -1649,7 +1695,7 @@ wss.on('connection', (ws, req) => {
       const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
       
       if (disconnectedNumber) {
-        console.log(`🔌 Déconnexion: ${disconnectedNumber}`);
+        console.log(`🔌 Déconnexion WebSocket: ${disconnectedNumber}`);
         
         PLAYER_CONNECTIONS.delete(disconnectedNumber);
         PLAYER_QUEUE.delete(disconnectedNumber);
@@ -2328,7 +2374,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }
     },
 
-    // NOUVELLE COMMANDE: Annuler un lobby trouvé
     cancel_match: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
@@ -2508,7 +2553,7 @@ async function createGameLobby(playerNumbers) {
         number: opponent.number 
       },
       isPlayer1: idx === 0,
-      can_cancel: true // Indique que l'annulation est possible
+      can_cancel: true
     }));
   });
 }
@@ -2887,6 +2932,7 @@ app.get('/health', (req, res) => {
     sponsorship_scan_interval: SPONSORSHIP_SCAN_INTERVAL,
     pending_lobbies: PENDING_LOBBIES.size,
     lobby_timeout: LOBBY_TIMEOUT,
+    auto_move_bonus: AUTO_MOVE_BONUS,
     timestamp: new Date().toISOString() 
   });
 });
@@ -2933,12 +2979,15 @@ async function startServer() {
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
       console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
+      console.log(`🎮 SYSTÈME DE JEU AMÉLIORÉ`);
+      console.log(`   • 1 coup automatique unique par joueur par manche`);
+      console.log(`   • Si timeout après 1 coup auto → joueur a quitté → match terminé`);
+      console.log(`   • Bonus +${AUTO_MOVE_BONUS} points pour victoire par déconnexion`);
+      console.log(`   • Réinitialisation coups auto à chaque nouvelle manche`);
       console.log(`🎮 SYSTÈME LOBBY AVEC ANNULATION`);
       console.log(`   • Timeout lobby: ${LOBBY_TIMEOUT/1000} secondes`);
       console.log(`   • Commande annulation: cancel_match`);
       console.log(`   • Nettoyage automatique des lobbys abandonnés`);
-      console.log(`   • Notification en temps réel aux deux joueurs`);
-      console.log(`   • Réintégration automatique dans la file`);
       console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ (ANTI-REVALIDATION)`);
       console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
       console.log(`   • Historique des validations: JAMAIS réinitialisé`);
@@ -2946,9 +2995,6 @@ async function startServer() {
       console.log(`🌐 Nouvelles commandes WebSocket:`);
       console.log(`   • cancel_match - Annuler un lobby trouvé`);
       console.log(`   • choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
-      console.log(`🌐 Nouvelles routes API:`);
-      console.log(`   • GET /server-stats - Statistiques serveur`);
-      console.log(`   • GET /admin/permanent-validations - Historique validations`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -2974,5 +3020,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
