@@ -35,7 +35,7 @@ const MATCHMAKING_CONFIG = {
 };
 
 const UPDATE_CONFIG = {
-  force_update: false,
+  force_update: true,
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
@@ -3020,5 +3020,6 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
 
