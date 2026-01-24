@@ -31,7 +31,7 @@ const AUTO_MOVE_BONUS = 200; // Bonus quand l'adversaire quitte
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
   anti_quick_rematch: true,
-  min_rematch_delay: 10 * 60 * 1000,
+  min_rematch_delay: 50 * 60 * 1000,
 };
 
 const UPDATE_CONFIG = {
@@ -3020,6 +3020,7 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
 
 
