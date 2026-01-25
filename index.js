@@ -1552,7 +1552,7 @@ class Game {
   }
 }
 
-// FONCTION DE MATCHMAKING AMÉLIORÉE
+// FONCTION DE MATCHMAKING AMÉLIORÉE AVEC VÉRIFICATION DE DOUBLON
 async function findBestMatchFromQueue() {
   if (PLAYER_QUEUE.size < 2) {
     console.log(`📊 File d'attente: ${PLAYER_QUEUE.size} joueur(s) - Pas assez pour un match`);
@@ -1562,9 +1562,30 @@ async function findBestMatchFromQueue() {
   const players = Array.from(PLAYER_QUEUE);
   console.log(`📊 Analyse file d'attente: ${players.length} joueurs`);
   
-  // Récupérer les scores de tous les joueurs
+  // FILTRE CRITIQUE: Éliminer les joueurs déjà dans un jeu/lobby
+  const availablePlayers = players.filter(playerNumber => !PLAYER_TO_GAME.has(playerNumber));
+  
+  if (availablePlayers.length !== players.length) {
+    const alreadyInGame = players.length - availablePlayers.length;
+    console.log(`⚠️ ${alreadyInGame} joueur(s) déjà dans un jeu/lobby, ignorés de la file`);
+    
+    // Nettoyer la file d'attente des joueurs déjà dans un jeu
+    players.forEach(playerNumber => {
+      if (PLAYER_TO_GAME.has(playerNumber)) {
+        PLAYER_QUEUE.delete(playerNumber);
+        console.log(`🧹 Suppression de la file: ${playerNumber} (déjà dans un jeu)`);
+      }
+    });
+  }
+  
+  if (availablePlayers.length < 2) {
+    console.log(`❌ Pas assez de joueurs disponibles pour un match (${availablePlayers.length} disponible(s))`);
+    return null;
+  }
+  
+  // Récupérer les scores de tous les joueurs disponibles
   const playersWithScores = [];
-  for (const playerNumber of players) {
+  for (const playerNumber of availablePlayers) {
     const user = await db.getUserByNumber(playerNumber);
     if (user) {
       playersWithScores.push({
@@ -1582,6 +1603,12 @@ async function findBestMatchFromQueue() {
     for (let j = i + 1; j < playersWithScores.length; j++) {
       const player1 = playersWithScores[i];
       const player2 = playersWithScores[j];
+      
+      // VÉRIFICATION: Pas déjà dans un jeu (double vérification)
+      if (PLAYER_TO_GAME.has(player1.number) || PLAYER_TO_GAME.has(player2.number)) {
+        console.log(`⛔ Double vérification échouée: ${player1.number} ou ${player2.number} déjà dans un jeu`);
+        continue;
+      }
       
       // Vérifier l'écart de score
       const scoreGapBlocked = (player1.score >= HIGH_SCORE_THRESHOLD && player2.score < LOW_SCORE_THRESHOLD) ||
@@ -1601,7 +1628,9 @@ async function findBestMatchFromQueue() {
           player2: player2.number,
           player1Score: player1.score,
           player2Score: player2.score,
-          scoreDiff: Math.abs(player1.score - player2.score)
+          scoreDiff: Math.abs(player1.score - player2.score),
+          player1Name: player1.username,
+          player2Name: player2.username
         });
         console.log(`✅ Match possible: ${player1.username} (${player1.score}) vs ${player2.username} (${player2.score})`);
       } else {
@@ -1612,7 +1641,7 @@ async function findBestMatchFromQueue() {
   
   // Si aucune paire possible
   if (possiblePairs.length === 0) {
-    console.log(`❌ Aucune paire possible trouvée parmi ${playersWithScores.length} joueurs`);
+    console.log(`❌ Aucune paire possible trouvée parmi ${playersWithScores.length} joueurs disponibles`);
     return null;
   }
   
@@ -1620,8 +1649,27 @@ async function findBestMatchFromQueue() {
   possiblePairs.sort((a, b) => a.scoreDiff - b.scoreDiff);
   const bestPair = possiblePairs[0];
   
-  console.log(`🎯 Meilleur match sélectionné: ${bestPair.player1} vs ${bestPair.player2}`);
+  // TRIPLE VÉRIFICATION: S'assurer que les joueurs ne sont toujours pas dans un jeu
+  if (PLAYER_TO_GAME.has(bestPair.player1) || PLAYER_TO_GAME.has(bestPair.player2)) {
+    console.log(`🚨 ALERTE: ${bestPair.player1Name} ou ${bestPair.player2Name} a rejoint un jeu entre-temps!`);
+    console.log(`   Annulation du match pour éviter les doublons`);
+    
+    // Retirer ces joueurs de la file s'ils sont dans un jeu
+    if (PLAYER_TO_GAME.has(bestPair.player1)) {
+      PLAYER_QUEUE.delete(bestPair.player1);
+      console.log(`   ${bestPair.player1Name} retiré de la file (déjà dans jeu)`);
+    }
+    if (PLAYER_TO_GAME.has(bestPair.player2)) {
+      PLAYER_QUEUE.delete(bestPair.player2);
+      console.log(`   ${bestPair.player2Name} retiré de la file (déjà dans jeu)`);
+    }
+    
+    return null;
+  }
+  
+  console.log(`🎯 Meilleur match sélectionné: ${bestPair.player1Name} vs ${bestPair.player2Name}`);
   console.log(`   Différence de score: ${bestPair.scoreDiff}`);
+  console.log(`   Joueurs disponibles confirmés`);
   
   return [bestPair.player1, bestPair.player2];
 }
@@ -2644,42 +2692,67 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   }
 }
 
-// CRÉATION DU LOBBY
+// CRÉATION DU LOBBY AVEC VÉRIFICATION DE DOUBLON
 async function createGameLobby(playerNumbers) {
-  const p1 = await db.getUserByNumber(playerNumbers[0]);
-  const p2 = await db.getUserByNumber(playerNumbers[1]);
-  if (!p1 || !p2) return;
+  if (!playerNumbers || playerNumbers.length !== 2) {
+    console.log(`❌ Données invalides pour créer un lobby`);
+    return;
+  }
+  
+  const [player1Number, player2Number] = playerNumbers;
+  
+  // VÉRIFICATION FINALE AVANT CRÉATION
+  if (PLAYER_TO_GAME.has(player1Number)) {
+    console.log(`🚨 ERREUR CRITIQUE: ${player1Number} déjà dans un jeu! Annulation création lobby`);
+    PLAYER_QUEUE.delete(player1Number);
+    return;
+  }
+  
+  if (PLAYER_TO_GAME.has(player2Number)) {
+    console.log(`🚨 ERREUR CRITIQUE: ${player2Number} déjà dans un jeu! Annulation création lobby`);
+    PLAYER_QUEUE.delete(player2Number);
+    return;
+  }
+  
+  const p1 = await db.getUserByNumber(player1Number);
+  const p2 = await db.getUserByNumber(player2Number);
+  if (!p1 || !p2) {
+    console.log(`❌ Un des joueurs non trouvé en base`);
+    return;
+  }
   
   const ws1 = PLAYER_CONNECTIONS.get(p1.number);
   const ws2 = PLAYER_CONNECTIONS.get(p2.number);
   
   if (!ws1 || ws1.readyState !== WebSocket.OPEN || !ws2 || ws2.readyState !== WebSocket.OPEN) {
     console.log(`❌ Impossible de créer lobby: un joueur déconnecté`);
-    playerNumbers.forEach(num => {
-      if (PLAYER_CONNECTIONS.get(num)?.readyState === WebSocket.OPEN) {
-        PLAYER_QUEUE.add(num);
-      }
-    });
+    // Remettre dans la file seulement si pas déjà dans un jeu
+    if (!PLAYER_TO_GAME.has(player1Number)) PLAYER_QUEUE.add(player1Number);
+    if (!PLAYER_TO_GAME.has(player2Number)) PLAYER_QUEUE.add(player2Number);
     return;
   }
   
   const gameId = generateId();
+  console.log(`🎮 Création lobby ${gameId}: ${p1.username} vs ${p2.username}`);
+  
   new Game(gameId, p1, p2);
   
   playerNumbers.forEach((num, idx) => {
     const ws = PLAYER_CONNECTIONS.get(num);
     const opponent = idx === 0 ? p2 : p1;
-    ws?.send(JSON.stringify({
-      type: 'match_found',
-      matchId: gameId,
-      opponent: { 
-        username: opponent.username, 
-        score: opponent.score, 
-        number: opponent.number 
-      },
-      isPlayer1: idx === 0,
-      can_cancel: true
-    }));
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'match_found',
+        matchId: gameId,
+        opponent: { 
+          username: opponent.username, 
+          score: opponent.score, 
+          number: opponent.number 
+        },
+        isPlayer1: idx === 0,
+        can_cancel: true
+      }));
+    }
   });
 }
 
@@ -3169,3 +3242,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
