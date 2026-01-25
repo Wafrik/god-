@@ -27,11 +27,12 @@ const SPONSOR_MIN_SCORE = 2000;
 const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000;
 const LOBBY_TIMEOUT = 30000; // 30 secondes pour démarrer un lobby
 const AUTO_MOVE_BONUS = 200; // Bonus quand l'adversaire quitte
+const CLEANUP_INTERVAL = 30 * 60 * 1000; // Nettoyage toutes les 30 minutes
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
   anti_quick_rematch: true,
-  min_rematch_delay: 50 * 60 * 1000,
+  min_rematch_delay: 50 * 60 * 1000, // 50 minutes en millisecondes
 };
 
 const UPDATE_CONFIG = {
@@ -49,7 +50,7 @@ const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
 const BOT_DEPOSITS = new Map();
-const LAST_MATCHES = new Map();
+const LAST_MATCHES = new Map(); // Stocke {joueur: {opponent, timestamp, opponentType}}
 const PENDING_LOBBIES = new Map();
 
 const BOTS = [
@@ -97,6 +98,7 @@ const BOTS = [
 
 let botAutoIncrementInterval = null;
 let sponsorshipScanInterval = null;
+let cleanupInterval = null;
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
@@ -107,22 +109,29 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// FONCTION ANTI-MATCH RAPIDE
+// FONCTION ANTI-MATCH RAPIDE AMÉLIORÉE
 function canMatchPlayers(player1Number, player2Number) {
   if (!MATCHMAKING_CONFIG.anti_quick_rematch) {
+    console.log(`✅ Match autorisé (anti-quick-rematch désactivé): ${player1Number} vs ${player2Number}`);
     return { canMatch: true, reason: "Anti-quick-rematch désactivé" };
   }
   
   const lastMatch1 = LAST_MATCHES.get(player1Number);
   const lastMatch2 = LAST_MATCHES.get(player2Number);
   
+  console.log(`🔍 Vérification match ${player1Number} vs ${player2Number}:`);
+  console.log(`   Dernier match ${player1Number}:`, lastMatch1);
+  console.log(`   Dernier match ${player2Number}:`, lastMatch2);
+  
   if (lastMatch1 && lastMatch1.opponent === player2Number) {
     const timeSinceLastMatch = Date.now() - lastMatch1.timestamp;
     if (timeSinceLastMatch < MATCHMAKING_CONFIG.min_rematch_delay) {
-      const remainingTime = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 / 60);
+      const remainingMinutes = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 / 60);
+      const remainingSeconds = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 % 60);
       return { 
         canMatch: false, 
-        reason: `Vous avez déjà joué contre ce joueur il y a moins de ${remainingTime} minute(s). Attendez un peu.` 
+        reason: `Vous avez déjà joué contre ce joueur il y a moins de ${remainingMinutes} minute(s) ${remainingSeconds} seconde(s). Attendez un peu.`,
+        remainingTime: MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch
       };
     }
   }
@@ -130,27 +139,91 @@ function canMatchPlayers(player1Number, player2Number) {
   if (lastMatch2 && lastMatch2.opponent === player1Number) {
     const timeSinceLastMatch = Date.now() - lastMatch2.timestamp;
     if (timeSinceLastMatch < MATCHMAKING_CONFIG.min_rematch_delay) {
-      const remainingTime = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 / 60);
+      const remainingMinutes = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 / 60);
+      const remainingSeconds = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 % 60);
       return { 
         canMatch: false, 
-        reason: `Ce joueur vous a déjà affronté il y a moins de ${remainingTime} minute(s).` 
+        reason: `Ce joueur vous a déjà affronté il y a moins de ${remainingMinutes} minute(s) ${remainingSeconds} seconde(s).`,
+        remainingTime: MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch
       };
     }
   }
   
+  console.log(`✅ Match autorisé: ${player1Number} vs ${player2Number}`);
   return { canMatch: true, reason: "Match autorisé" };
 }
 
-// ENREGISTRER UN MATCH
-function recordMatch(player1Number, player2Number) {
-  LAST_MATCHES.set(player1Number, { opponent: player2Number, timestamp: Date.now() });
-  LAST_MATCHES.set(player2Number, { opponent: player1Number, timestamp: Date.now() });
+// VÉRIFIER SI UN JOUEUR PEUT JOUER (POUR BOTS AUSSI)
+function canPlayerPlay(playerNumber) {
+  if (!MATCHMAKING_CONFIG.anti_quick_rematch) {
+    return { canPlay: true, reason: "Anti-quick-rematch désactivé" };
+  }
   
+  const lastMatch = LAST_MATCHES.get(playerNumber);
+  if (!lastMatch) {
+    return { canPlay: true, reason: "Aucun match récent" };
+  }
+  
+  const timeSinceLastMatch = Date.now() - lastMatch.timestamp;
+  if (timeSinceLastMatch < MATCHMAKING_CONFIG.min_rematch_delay) {
+    const remainingMinutes = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 / 60);
+    const remainingSeconds = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 % 60);
+    return { 
+      canPlay: false, 
+      reason: `Vous avez déjà joué il y a moins de ${remainingMinutes} minute(s) ${remainingSeconds} seconde(s). Attendez un peu.`,
+      remainingTime: MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch,
+      lastOpponent: lastMatch.opponent,
+      lastOpponentType: lastMatch.opponentType
+    };
+  }
+  
+  return { canPlay: true, reason: "Peut jouer" };
+}
+
+// ENREGISTRER UN MATCH AMÉLIORÉ
+function recordMatch(player1Number, player2Number) {
+  const now = Date.now();
+  
+  // Déterminer le type d'adversaire
+  const player2Type = player2Number.startsWith('bot_') ? 'bot' : 'player';
+  const player1Type = player1Number.startsWith('bot_') ? 'bot' : 'player';
+  
+  // Enregistrer pour le joueur 1
+  LAST_MATCHES.set(player1Number, { 
+    opponent: player2Number, 
+    timestamp: now,
+    opponentType: player2Type
+  });
+  
+  // Enregistrer pour le joueur 2 seulement si c'est un vrai joueur
+  if (!player2Number.startsWith('bot_')) {
+    LAST_MATCHES.set(player2Number, { 
+      opponent: player1Number, 
+      timestamp: now,
+      opponentType: player1Type
+    });
+  }
+  
+  console.log(`📝 Match enregistré: ${player1Number} vs ${player2Number} (type: ${player2Type})`);
+  
+  // Nettoyage léger des anciens matchs
+  cleanupOldMatches();
+}
+
+// NETTOYAGE DES ANCIENS MATCHS
+function cleanupOldMatches() {
   const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+  let cleaned = 0;
+  
   for (const [player, match] of LAST_MATCHES.entries()) {
     if (match.timestamp < twentyFourHoursAgo) {
       LAST_MATCHES.delete(player);
+      cleaned++;
     }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`🧹 Nettoyage auto: ${cleaned} anciens matchs supprimés`);
   }
 }
 
@@ -2355,6 +2428,10 @@ async function handleClientMessage(ws, message, ip, deviceId) {
               return;
             } else {
               console.log(`⏳ Match bloqué entre ${players[i]} et ${players[j]}: ${checkResult.reason}`);
+              ws.send(JSON.stringify({ 
+                type: 'queue_waiting', 
+                message: checkResult.reason 
+              }));
             }
           }
         }
@@ -2407,6 +2484,17 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       
       if (PLAYER_TO_GAME.has(playerNumber)) {
         return ws.send(JSON.stringify({ type: 'error', message: 'Déjà dans une partie' }));
+      }
+      
+      // VÉRIFICATION ANTI-MATCH RAPIDE POUR BOTS
+      const canPlayResult = canPlayerPlay(playerNumber);
+      if (!canPlayResult.canPlay) {
+        console.log(`⏳ Bloqué joueur ${playerNumber}: ${canPlayResult.reason}`);
+        return ws.send(JSON.stringify({ 
+          type: 'bot_request_failed', 
+          message: canPlayResult.reason,
+          remainingTime: canPlayResult.remainingTime
+        }));
       }
       
       const depositResult = await db.applyBotDeposit(playerNumber);
@@ -2538,6 +2626,25 @@ async function createGameLobby(playerNumbers) {
     return;
   }
   
+  // VÉRIFICATION FINALE AVANT CRÉATION DU LOBBY
+  const checkResult = canMatchPlayers(p1.number, p2.number);
+  if (!checkResult.canMatch) {
+    console.log(`❌ Création lobby bloquée: ${checkResult.reason}`);
+    
+    // Notifier les joueurs
+    playerNumbers.forEach(num => {
+      const ws = PLAYER_CONNECTIONS.get(num);
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'queue_waiting',
+          message: checkResult.reason
+        }));
+      }
+      PLAYER_QUEUE.add(num);
+    });
+    return;
+  }
+  
   const gameId = generateId();
   new Game(gameId, p1, p2);
   
@@ -2580,6 +2687,21 @@ function handleGameAction(ws, message, deviceKey) {
 // ROUTES API
 app.get('/get-bot', async (req, res) => {
   try {
+    // VÉRIFICATION ANTI-MATCH RAPIDE POUR L'API
+    const playerNumber = req.query.playerNumber;
+    
+    if (playerNumber && MATCHMAKING_CONFIG.anti_quick_rematch) {
+      const canPlayResult = canPlayerPlay(playerNumber);
+      if (!canPlayResult.canPlay) {
+        console.log(`⏳ API bloqué joueur ${playerNumber}: ${canPlayResult.reason}`);
+        return res.status(429).json({ 
+          success: false, 
+          message: canPlayResult.reason,
+          remainingTime: canPlayResult.remainingTime
+        });
+      }
+    }
+    
     const bot = getRandomBot();
     
     const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -2626,6 +2748,9 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore);
       
       if (playerUpdateSuccess && botUpdateSuccess) {
+        // ENREGISTRER LE MATCH CONTRE LE BOT
+        recordMatch(playerNumber, botId);
+        
         res.json({ 
           success: true, 
           message: "Scores mis à jour",
@@ -2718,7 +2843,8 @@ app.get('/matchmaking-config', (req, res) => {
   res.json({
     success: true,
     config: MATCHMAKING_CONFIG,
-    last_matches_count: LAST_MATCHES.size
+    last_matches_count: LAST_MATCHES.size,
+    connected_players: PLAYER_CONNECTIONS.size
   });
 });
 
@@ -2915,6 +3041,7 @@ app.get('/server-stats', (req, res) => {
       bot_deposits: BOT_DEPOSITS.size,
       last_matches: LAST_MATCHES.size
     },
+    matchmaking_config: MATCHMAKING_CONFIG,
     timestamp: new Date().toISOString()
   });
 });
@@ -2973,12 +3100,19 @@ async function startServer() {
       incrementBotScoresAutomatically();
     }, 60 * 1000);
     
+    // NOUVEAU: Intervalle de nettoyage des anciens matchs
+    cleanupInterval = setInterval(cleanupOldMatches, CLEANUP_INTERVAL);
+    
     server.listen(PORT, '0.0.0.0', () => {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
-      console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
+      console.log(`⚙️  SYSTÈME ANTI-MATCH RAPIDE RENFORCÉ`);
+      console.log(`   • Activation: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
+      console.log(`   • Délai minimum: ${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes`);
+      console.log(`   • Vérification pour joueurs ET bots`);
+      console.log(`   • Nettoyage auto toutes les ${CLEANUP_INTERVAL / 60000} minutes`);
       console.log(`🎮 SYSTÈME DE JEU AMÉLIORÉ`);
       console.log(`   • 1 coup automatique unique par joueur par manche`);
       console.log(`   • Si timeout après 1 coup auto → joueur a quitté → match terminé`);
@@ -2987,7 +3121,7 @@ async function startServer() {
       console.log(`🎮 SYSTÈME LOBBY AVEC ANNULATION`);
       console.log(`   • Timeout lobby: ${LOBBY_TIMEOUT/1000} secondes`);
       console.log(`   • Commande annulation: cancel_match`);
-      console.log(`   • Nettoyage automatique des lobbys abandonnés`);
+      console.log(`   • Vérification finale avant création de lobby`);
       console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ (ANTI-REVALIDATION)`);
       console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
       console.log(`   • Historique des validations: JAMAIS réinitialisé`);
@@ -3006,6 +3140,7 @@ async function startServer() {
 process.on('SIGTERM', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   if (sponsorshipScanInterval) clearInterval(sponsorshipScanInterval);
+  if (cleanupInterval) clearInterval(cleanupInterval);
   server.close(() => {
     process.exit(0);
   });
@@ -3014,16 +3149,10 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   if (botAutoIncrementInterval) clearInterval(botAutoIncrementInterval);
   if (sponsorshipScanInterval) clearInterval(sponsorshipScanInterval);
+  if (cleanupInterval) clearInterval(cleanupInterval);
   server.close(() => {
     process.exit(0);
   });
 });
 
 startServer();
-
-
-
-
-
-
-
