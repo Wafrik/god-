@@ -36,7 +36,7 @@ const MATCHMAKING_CONFIG = {
 };
 
 const UPDATE_CONFIG = {
-  force_update: false,
+  force_update: true,
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
@@ -527,92 +527,52 @@ const db = {
   },
 
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
-  try {
-    const player = await this.getUserByNumber(playerNumber);
-    if (!player) return false;
-    
-    const deposit = BOT_DEPOSITS.get(playerNumber);
-    const depositAmount = deposit ? deposit.depositAmount : 0;
-    
-    // Score actuel SANS la caution (car caution déduite précédemment)
-    const currentScore = player.score;
-    const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
-    
-    let newScore = currentScore;
-    let bonusMessage = "";
-    
-    if (isDraw) {
-      // Match nul : score inchangé + caution rendue
-      newScore = currentScore;
-      bonusMessage = `Match nul: score inchangé`;
+    try {
+      const player = await this.getUserByNumber(playerNumber);
+      if (!player) return false;
       
-      if (depositAmount > 0) {
-        // Rendre la caution
-        newScore = currentScore + depositAmount;
-        bonusMessage = `Match nul: +${depositAmount} points caution rendue`;
-      }
+      const deposit = BOT_DEPOSITS.get(playerNumber);
+      const depositAmount = deposit ? deposit.depositAmount : 0;
       
-      console.log(`🤝 ${bonusMessage} - ${player.username}: ${currentScore} → ${newScore}`);
-    } 
-    else if (isWin) {
-      // Victoire : +points jeu +200 +caution rendue
-      const gamePoints = playerGameScore + 200;
-      newScore = currentScore + gamePoints;
-      bonusMessage = `Victoire: +${gamePoints} points`;
+      const currentScore = player.score + depositAmount;
+      const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
       
-      if (depositAmount > 0) {
-        // Rendre la caution en PLUS
-        newScore = newScore + depositAmount;
-        bonusMessage = `Victoire: +${gamePoints} points + ${depositAmount} points caution`;
-      }
+      let newScore = currentScore;
       
-      console.log(`🏆 ${bonusMessage} - ${player.username}: ${currentScore} → ${newScore}`);
-    } 
-    else {
-      // Défaite
-      if (isHighScore) {
-        // ≥10k : -points jeu -200 +caution rendue
-        const penalty = playerGameScore + 200;
-        newScore = Math.max(0, currentScore - penalty);
-        bonusMessage = `Défaite (≥10k): -${penalty} points`;
-        
+      if (isDraw) {
         if (depositAmount > 0) {
-          // Rendre la caution en PLUS (même en défaite)
-          newScore = Math.max(0, newScore + depositAmount);
-          bonusMessage = `Défaite (≥10k): -${penalty} points + ${depositAmount} points caution`;
+          await this.refundBotDeposit(playerNumber);
         }
-        
-        console.log(`🔥 ${bonusMessage} - ${player.username}: ${currentScore} → ${newScore}`);
+        console.log(`🤝 Match nul - ${player.username} récupère sa caution (${depositAmount} points)`);
+        return true;
+      }
+      
+      if (isWin) {
+        newScore = currentScore + playerGameScore + 200;
+        console.log(`🏆 [ADVERSAIRE MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
-        // <10k : -points jeu +caution rendue
-        newScore = Math.max(0, currentScore - playerGameScore);
-        bonusMessage = `Défaite (<10k): -${playerGameScore} points`;
-        
-        if (depositAmount > 0) {
-          // Rendre la caution en PLUS (même en défaite)
-          newScore = Math.max(0, newScore + depositAmount);
-          bonusMessage = `Défaite (<10k): -${playerGameScore} points + ${depositAmount} points caution`;
+        if (isHighScore) {
+          newScore = Math.max(0, currentScore - playerGameScore - 200);
+          console.log(`🔥 [ADVERSAIRE MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
+        } else {
+          newScore = Math.max(0, currentScore - playerGameScore);
+          console.log(`😢 [ADVERSAIRE MATCH] Défaite (<10k) ${player.username}: ${currentScore} - ${playerGameScore} = ${newScore}`);
         }
-        
-        console.log(`😢 ${bonusMessage} - ${player.username}: ${currentScore} → ${newScore}`);
       }
+      
+      await this.updateUserScore(playerNumber, newScore);
+      
+      if (deposit) {
+        BOT_DEPOSITS.delete(playerNumber);
+        console.log(`💰 Dépôt de ${depositAmount} points intégré au calcul`);
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('Erreur mise à jour score adversaire match:', error);
+      return false;
     }
-    
-    // Mettre à jour le score
-    await this.updateUserScore(playerNumber, newScore);
-    
-    // Supprimer le dépôt de la mémoire
-    if (deposit) {
-      BOT_DEPOSITS.delete(playerNumber);
-      console.log(`💰 Dépôt caution ${depositAmount} points supprimé de la mémoire`);
-    }
-    
-    return true;
-  } catch (error) {
-    console.error('Erreur mise à jour score adversaire match:', error);
-    return false;
-  }
-}
+  },
 
   async getTrustedDevice(deviceKey) {
     const result = await pool.query(
@@ -696,86 +656,52 @@ const db = {
   },
 
   async resetAllScores() {
-  try {
-    // ⚠️ ATTENTION: POUR LE 26/01/2026 - NE PAS RÉINITIALISER LES SCORES DES JOUEURS
-    // ⚠️ LES JOUEURS ONT DÉJÀ PERDU LEURS SCORES HIER (25/01), ON NE TOUCHE PLUS
-    // ⚠️ À PARTIR DE DIMANCHE PROCHAIN (01/02/2026), ON RÉINITIALISERA CORRECTEMENT
-    
-    // TODO: À PARTIR DU 01/02/2026, DÉCOMMENTER CETTE LIGNE:
-    // const playersReset = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
-    
-    const playersReset = { rowCount: 0 }; // TEMPORAIRE: aucun joueur reset
-    
-    const botsReset = await pool.query(`
-      UPDATE bot_scores bs 
-      SET score = bp.base_score 
-      FROM bot_profiles bp 
-      WHERE bs.bot_id = bp.id
-    `);
-    
-    for (const bot of BOTS) {
-      BOT_SCORES.set(bot.id, bot.baseScore);
+    try {
+      const playersReset = await pool.query('UPDATE users SET score = 0 WHERE score > 0');
+      
+      const botsReset = await pool.query(`
+        UPDATE bot_scores bs 
+        SET score = bp.base_score 
+        FROM bot_profiles bp 
+        WHERE bs.bot_id = bp.id
+      `);
+      
+      for (const bot of BOTS) {
+        BOT_SCORES.set(bot.id, bot.baseScore);
+      }
+      
+      BOT_DEPOSITS.clear();
+      
+      await pool.query(`
+        UPDATE sponsorships s 
+        SET is_validated = false, validated_at = NULL 
+        FROM sponsorship_validated_history h 
+        WHERE s.sponsored_number = h.sponsored_number
+        AND h.sponsored_number IS NULL
+      `);
+      
+      await pool.query(`
+        UPDATE sponsorship_stats ss
+        SET validated_sponsored = 0
+        FROM (
+          SELECT s.sponsor_number
+          FROM sponsorships s
+          LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
+          WHERE h.sponsored_number IS NULL
+          GROUP BY s.sponsor_number
+        ) AS to_reset
+        WHERE ss.player_number = to_reset.sponsor_number
+      `);
+      
+      return { 
+        playersReset: playersReset.rowCount,
+        botsReset: BOTS.length 
+      };
+    } catch (error) {
+      console.error('Erreur reset scores:', error);
+      throw error;
     }
-    
-    BOT_DEPOSITS.clear();
-    
-    // ====================================================
-    // ✅ CORRECTION TEMPORAIRE POUR 26/01/2026
-    // ====================================================
-    // Problème: Les joueurs ont déjà perdu leurs scores hier (25/01)
-    // Solution: On archive les parrainages validés et on réinitialise
-    //           mais on conserve l'historique permanent
-    
-    console.log('📦 ARCHIVAGE TEMPORAIRE (26/01/2026) - Parrainages validés');
-    
-    // Étape 1: Archiver TOUS les parrainages validés dans l'historique permanent
-    await pool.query(`
-      INSERT INTO sponsorship_validated_history (sponsor_number, sponsored_number, validated_at)
-      SELECT s.sponsor_number, s.sponsored_number, COALESCE(s.validated_at, NOW())
-      FROM sponsorships s
-      WHERE s.is_validated = true
-      AND s.sponsored_number NOT IN (
-        SELECT sponsored_number FROM sponsorship_validated_history
-      )
-      ON CONFLICT (sponsored_number) DO NOTHING
-    `);
-    
-    // Étape 2: Calculer combien de parrainages ont été validés DEPUIS AUJOURD'HUI
-    // On considère "à partir d'aujourd'hui" = parrainages validés après minuit du 26/01
-    const today = '2026-01-26'; // Date fixe pour aujourd'hui
-    
-    // Étape 3: Mettre à jour les compteurs pour qu'ils n'affichent que 
-    // les parrainages validés À PARTIR D'AUJOURD'HUI (26/01)
-    await pool.query(`
-      UPDATE sponsorship_stats ss
-      SET validated_sponsored = COALESCE((
-        SELECT COUNT(*) 
-        FROM sponsorships s
-        WHERE s.sponsor_number = ss.player_number
-        AND s.is_validated = true
-        AND s.validated_at >= $1::timestamp
-      ), 0)
-    `, [`${today} 00:00:00`]);
-    
-    console.log(`✅ Correction temporaire appliquée (${today})`);
-    console.log(`   • Scores joueurs: NON réinitialisés (déjà reset hier 25/01)`);
-    console.log(`   • ${BOTS.length} bots réinitialisés`);
-    console.log(`   • Parrainages validés archivés dans l'historique permanent`);
-    console.log(`   • Compteurs mis à jour: affichent seulement parrainages validés à partir du 26/01/2026`);
-    // ====================================================
-    
-    console.log(`🔄 Reset hebdomadaire effectué (version temporaire 26/01/2026)`);
-    
-    return { 
-      playersReset: playersReset.rowCount,
-      botsReset: BOTS.length,
-      message: "Reset effectué (scores joueurs conservés, compteurs corrigés pour afficher seulement parrainages du 26/01)"
-    };
-  } catch (error) {
-    console.error('Erreur reset scores:', error);
-    throw error;
-  }
-}
+  },
 
   async updatePlayerScoreById(playerId, points, operation) {
     try {
@@ -3316,5 +3242,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
