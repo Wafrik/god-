@@ -21,17 +21,18 @@ if (!process.env.DATABASE_URL) {
 const PORT = process.env.PORT || 8000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
+const LOW_SCORE_THRESHOLD = 3000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
 const BOT_DEPOSIT = 250;
 const SPONSOR_MIN_SCORE = 2000;
 const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000;
-const LOBBY_TIMEOUT = 30000; // 30 secondes pour démarrer un lobby
-const AUTO_MOVE_BONUS = 200; // Bonus quand l'adversaire quitte
+const LOBBY_TIMEOUT = 30000;
+const AUTO_MOVE_BONUS = 200;
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
   anti_quick_rematch: true,
-  min_rematch_delay: 50 * 60 * 1000,
+  min_rematch_delay: 50 * 60 * 1000, // 50 minutes par défaut
 };
 
 const UPDATE_CONFIG = {
@@ -49,7 +50,6 @@ const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
 const BOT_DEPOSITS = new Map();
-const LAST_MATCHES = new Map();
 const PENDING_LOBBIES = new Map();
 
 const BOTS = [
@@ -107,50 +107,82 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// FONCTION ANTI-MATCH RAPIDE
-function canMatchPlayers(player1Number, player2Number) {
+// FONCTIONS PERSISTANTES POUR ANTI-MATCH RAPIDE
+async function canMatchPlayers(player1Number, player2Number) {
+  // Si désactivé, retourner immédiatement vrai
   if (!MATCHMAKING_CONFIG.anti_quick_rematch) {
     return { canMatch: true, reason: "Anti-quick-rematch désactivé" };
   }
   
-  const lastMatch1 = LAST_MATCHES.get(player1Number);
-  const lastMatch2 = LAST_MATCHES.get(player2Number);
-  
-  if (lastMatch1 && lastMatch1.opponent === player2Number) {
-    const timeSinceLastMatch = Date.now() - lastMatch1.timestamp;
-    if (timeSinceLastMatch < MATCHMAKING_CONFIG.min_rematch_delay) {
-      const remainingTime = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 / 60);
+  try {
+    // Vérifier l'écart de score
+    const player1 = await db.getUserByNumber(player1Number);
+    const player2 = await db.getUserByNumber(player2Number);
+    
+    if (!player1 || !player2) {
+      return { canMatch: true, reason: "Un des joueurs non trouvé" };
+    }
+    
+    // Vérification de l'écart de score (≥10.000 vs <3.000)
+    if ((player1.score >= HIGH_SCORE_THRESHOLD && player2.score < LOW_SCORE_THRESHOLD) ||
+        (player2.score >= HIGH_SCORE_THRESHOLD && player1.score < LOW_SCORE_THRESHOLD)) {
       return { 
         canMatch: false, 
-        reason: `Vous avez déjà joué contre ce joueur il y a moins de ${remainingTime} minute(s). Attendez un peu.` 
+        reason: `Écart de score trop important (≥${HIGH_SCORE_THRESHOLD} vs <${LOW_SCORE_THRESHOLD})` 
       };
     }
-  }
-  
-  if (lastMatch2 && lastMatch2.opponent === player1Number) {
-    const timeSinceLastMatch = Date.now() - lastMatch2.timestamp;
-    if (timeSinceLastMatch < MATCHMAKING_CONFIG.min_rematch_delay) {
-      const remainingTime = Math.ceil((MATCHMAKING_CONFIG.min_rematch_delay - timeSinceLastMatch) / 1000 / 60);
-      return { 
-        canMatch: false, 
-        reason: `Ce joueur vous a déjà affronté il y a moins de ${remainingTime} minute(s).` 
-      };
+    
+    // Vérifier dans la base de données persistante
+    const result = await pool.query(`
+      SELECT * FROM recent_matches 
+      WHERE (player1_number = $1 AND player2_number = $2)
+         OR (player1_number = $2 AND player2_number = $1)
+         AND match_timestamp > NOW() - INTERVAL '${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
+      LIMIT 1
+    `, [player1Number, player2Number]);
+    
+    if (result.rows.length > 0) {
+      const match = result.rows[0];
+      const matchTime = new Date(match.match_timestamp);
+      const now = new Date();
+      const timeSinceMatch = now - matchTime;
+      const remainingTimeMs = MATCHMAKING_CONFIG.min_rematch_delay - timeSinceMatch;
+      
+      if (remainingTimeMs > 0) {
+        const remainingMinutes = Math.ceil(remainingTimeMs / 60000);
+        return { 
+          canMatch: false, 
+          reason: `Vous avez déjà joué contre ce joueur il y a moins de ${remainingMinutes} minute(s)`
+        };
+      }
     }
+    
+    // Nettoyer les anciens matchs automatiquement
+    await pool.query(`
+      DELETE FROM recent_matches 
+      WHERE match_timestamp < NOW() - INTERVAL '${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
+    `);
+    
+    return { canMatch: true, reason: "Match autorisé" };
+  } catch (error) {
+    console.error('Erreur vérification match rapide:', error);
+    return { canMatch: true, reason: "Erreur vérification, autorisation par défaut" };
   }
-  
-  return { canMatch: true, reason: "Match autorisé" };
 }
 
-// ENREGISTRER UN MATCH
-function recordMatch(player1Number, player2Number) {
-  LAST_MATCHES.set(player1Number, { opponent: player2Number, timestamp: Date.now() });
-  LAST_MATCHES.set(player2Number, { opponent: player1Number, timestamp: Date.now() });
-  
-  const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-  for (const [player, match] of LAST_MATCHES.entries()) {
-    if (match.timestamp < twentyFourHoursAgo) {
-      LAST_MATCHES.delete(player);
-    }
+// ENREGISTRER UN MATCH DANS LA BASE PERSISTANTE
+async function recordMatch(player1Number, player2Number) {
+  try {
+    await pool.query(`
+      INSERT INTO recent_matches (player1_number, player2_number, match_timestamp) 
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (player1_number, player2_number) 
+      DO UPDATE SET match_timestamp = NOW()
+    `, [player1Number, player2Number]);
+    
+    console.log(`📝 Match enregistré dans DB: ${player1Number} vs ${player2Number}`);
+  } catch (error) {
+    console.error('Erreur enregistrement match:', error);
   }
 }
 
@@ -1122,123 +1154,7 @@ const db = {
   }
 };
 
-async function initializeDatabase() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username VARCHAR(50) UNIQUE NOT NULL,
-        password VARCHAR(100) NOT NULL,
-        number VARCHAR(20) UNIQUE NOT NULL,
-        age INTEGER NOT NULL,
-        score INTEGER DEFAULT 0,
-        online BOOLEAN DEFAULT FALSE,
-        token VARCHAR(100),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS trusted_devices (
-        id SERIAL PRIMARY KEY,
-        device_key VARCHAR(200) UNIQUE NOT NULL,
-        user_number VARCHAR(20) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS bot_profiles (
-        id VARCHAR(50) PRIMARY KEY,
-        username VARCHAR(50) NOT NULL,
-        gender VARCHAR(1) NOT NULL,
-        base_score INTEGER DEFAULT 100,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS bot_scores (
-        id SERIAL PRIMARY KEY,
-        bot_id VARCHAR(50) UNIQUE NOT NULL,
-        score INTEGER DEFAULT 0,
-        last_played TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_auto_increment TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (bot_id) REFERENCES bot_profiles(id) ON DELETE CASCADE
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS sponsorships (
-        id SERIAL PRIMARY KEY,
-        sponsor_number VARCHAR(20) NOT NULL,
-        sponsored_number VARCHAR(20) UNIQUE NOT NULL,
-        is_validated BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        validated_at TIMESTAMP,
-        FOREIGN KEY (sponsor_number) REFERENCES users(number) ON DELETE CASCADE,
-        FOREIGN KEY (sponsored_number) REFERENCES users(number) ON DELETE CASCADE
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS sponsorship_stats (
-        id SERIAL PRIMARY KEY,
-        player_number VARCHAR(20) UNIQUE NOT NULL,
-        total_sponsored INTEGER DEFAULT 0,
-        validated_sponsored INTEGER DEFAULT 0,
-        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (player_number) REFERENCES users(number) ON DELETE CASCADE
-      )
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS sponsorship_validated_history (
-        id SERIAL PRIMARY KEY,
-        sponsor_number VARCHAR(20) NOT NULL,
-        sponsored_number VARCHAR(20) UNIQUE NOT NULL,
-        validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (sponsor_number) REFERENCES users(number) ON DELETE CASCADE,
-        FOREIGN KEY (sponsored_number) REFERENCES users(number) ON DELETE CASCADE
-      )
-    `);
-
-    for (const bot of BOTS) {
-      await pool.query(`
-        INSERT INTO bot_profiles (id, username, gender, base_score) 
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (id) DO UPDATE SET
-          username = EXCLUDED.username,
-          gender = EXCLUDED.gender,
-          base_score = EXCLUDED.base_score
-      `, [bot.id, bot.username, bot.gender, bot.baseScore]);
-      
-      await pool.query(`
-        INSERT INTO bot_scores (bot_id, score) 
-        VALUES ($1, $2)
-        ON CONFLICT (bot_id) DO NOTHING
-      `, [bot.id, bot.baseScore]);
-    }
-
-  } catch (error) {
-    console.error('Erreur init DB:', error);
-    throw error;
-  }
-}
-
-async function loadTrustedDevices() {
-  try {
-    const result = await pool.query('SELECT * FROM trusted_devices');
-    result.rows.forEach(row => {
-      TRUSTED_DEVICES.set(row.device_key, row.user_number);
-    });
-  } catch (error) {
-    console.error('Erreur chargement devices:', error);
-  }
-}
-
-// CLASSE GAME AVEC GESTION AMÉLIORÉE DES LOBBIES
+// CLASSE GAME
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
@@ -1248,8 +1164,8 @@ class Game {
       preparationTime: 20, turnTime: 30, selectionsThisManche: 0, maxSelections: 3, timerInterval: null,
       lobbyTimeout: null,
       created_at: Date.now(),
-      status: 'lobby', // 'lobby', 'active', 'cancelled', 'finished'
-      autoMoveUsed: { player1: false, player2: false } // Pour suivre les coups automatiques par joueur par manche
+      status: 'lobby',
+      autoMoveUsed: { player1: false, player2: false }
     });
     
     [p1, p2].forEach((p, i) => {
@@ -1261,13 +1177,13 @@ class Game {
     ACTIVE_GAMES.set(id, this);
     PENDING_LOBBIES.set(id, this);
     
+    // Enregistrer le match dans la base persistante
     recordMatch(p1.number, p2.number);
     
     console.log(`🎮 Nouveau lobby créé: ${this.id}`);
     console.log(`   Joueurs: ${p1.username} vs ${p2.username}`);
     console.log(`   Lobbys actifs: ${PENDING_LOBBIES.size}, Parties actives: ${ACTIVE_GAMES.size}`);
     
-    // Timeout pour annuler le lobby si pas démarré
     this.lobbyTimeout = setTimeout(() => {
       if (this.phase === 'waiting' && this.status === 'lobby') {
         console.log(`⏱️ Timeout lobby ${this.id} - Annulation automatique`);
@@ -1278,14 +1194,12 @@ class Game {
     setTimeout(() => this.checkAndStartGame(), 1000);
   }
 
-  // ANNULER UN LOBBY PROPREMENT
   cancelLobby(reason) {
     if (this.status === 'cancelled') return;
     
     console.log(`❌ Annulation lobby ${this.id}: ${reason}`);
     this.status = 'cancelled';
     
-    // Notifier tous les joueurs
     this.players.forEach(p => {
       if (p.ws?.readyState === WebSocket.OPEN) {
         p.ws.send(JSON.stringify({
@@ -1295,19 +1209,15 @@ class Game {
         }));
       }
       
-      // Retirer du jeu mais pas de la file (ils peuvent re-rechercher)
       PLAYER_TO_GAME.delete(p.number);
       
-      // Si déconnecté, on le remet dans la file
       if (!p.ws || p.ws.readyState !== WebSocket.OPEN) {
         PLAYER_QUEUE.add(p.number);
       }
     });
     
-    // Nettoyer
     this.cleanup();
     
-    // Retirer des structures
     PENDING_LOBBIES.delete(this.id);
     ACTIVE_GAMES.delete(this.id);
   }
@@ -1332,7 +1242,6 @@ class Game {
   }
 
   checkAndStartGame() {
-    // Vérifier que les deux joueurs sont encore connectés
     const connectedPlayers = this.players.filter(p => p.ws?.readyState === WebSocket.OPEN);
     
     if (connectedPlayers.length < 2) {
@@ -1396,13 +1305,10 @@ class Game {
           return;
         }
         
-        // Vérifier si le joueur a déjà utilisé son coup automatique cette manche
         if (!this.autoMoveUsed[this.turn]) {
-          // Premier coup automatique de la manche pour ce joueur
           console.log(`⏰ Timeout tour ${this.turn} - Premier coup automatique`);
           this.makeSingleAutomaticMove(currentPlayer);
         } else {
-          // Si déjà utilisé un coup automatique cette manche → joueur a quitté
           console.log(`⏰ Timeout tour ${this.turn} - Coup automatique déjà utilisé → JOUEUR A QUITTÉ`);
           this.handlePlayerDisconnect(currentPlayer);
         }
@@ -1412,7 +1318,6 @@ class Game {
     }, 1000);
   }
 
-  // NOUVELLE MÉTHODE: Un seul coup automatique par joueur par manche
   makeSingleAutomaticMove(player) {
     const slots = this.availableSlots[player.role];
     if (slots.length === 0) { 
@@ -1421,14 +1326,12 @@ class Game {
       return false; 
     }
     
-    // Marquer que ce joueur a utilisé son coup automatique cette manche
     this.autoMoveUsed[player.role] = true;
     console.log(`🤖 Coup automatique unique pour ${player.role} (manche ${this.manche})`);
     
     const randomSlot = slots[Math.floor(Math.random() * slots.length)];
     const success = this.makeMove(player, randomSlot, 0, null);
     
-    // Notifier les joueurs
     this.broadcast({
       type: 'auto_move_notification',
       player: player.role,
@@ -1512,7 +1415,6 @@ class Game {
     const remainingPlayer = this.players.find(p => p.number !== disconnectedPlayer.number);
     
     if (this.phase === 'waiting' && this.status === 'lobby') {
-      // Annuler le lobby si déconnexion avant début
       this.cancelLobby('Un joueur s\'est déconnecté');
       return;
     }
@@ -1524,7 +1426,6 @@ class Game {
         type: 'opponent_left', 
         message: 'Adversaire a quitté la partie' 
       }));
-      // Appliquer immédiatement les pénalités et fin du match
       await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
       this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
       this.cleanup();
@@ -1542,7 +1443,6 @@ class Game {
         const disconnectedScore = this.scores[disconnectedPlayer.role];
         const remainingScore = this.scores[remainingPlayer.role];
         
-        // MODIFICATION: +200 points bonus pour le joueur restant
         const newDisconnectedScore = Math.max(0, disconnectedUser.score - (disconnectedScore > 15 ? disconnectedScore : 15));
         const newRemainingScore = remainingUser.score + (remainingScore < 15 ? 15 : remainingScore) + AUTO_MOVE_BONUS;
         
@@ -1569,7 +1469,6 @@ class Game {
   endManche() {
     if (this.timerInterval) clearInterval(this.timerInterval);
     
-    // Réinitialiser les coups automatiques pour la nouvelle manche
     this.autoMoveUsed = { player1: false, player2: false };
     console.log(`🔄 Fin manche ${this.manche} - Réinitialisation coups automatiques`);
     
@@ -1653,6 +1552,279 @@ class Game {
   }
 }
 
+// FONCTION DE MATCHMAKING AMÉLIORÉE AVEC VÉRIFICATION DE DOUBLON
+async function findBestMatchFromQueue() {
+  if (PLAYER_QUEUE.size < 2) {
+    console.log(`📊 File d'attente: ${PLAYER_QUEUE.size} joueur(s) - Pas assez pour un match`);
+    return null;
+  }
+  
+  const players = Array.from(PLAYER_QUEUE);
+  console.log(`📊 Analyse file d'attente: ${players.length} joueurs`);
+  
+  // FILTRE CRITIQUE: Éliminer les joueurs déjà dans un jeu/lobby
+  const availablePlayers = players.filter(playerNumber => !PLAYER_TO_GAME.has(playerNumber));
+  
+  if (availablePlayers.length !== players.length) {
+    const alreadyInGame = players.length - availablePlayers.length;
+    console.log(`⚠️ ${alreadyInGame} joueur(s) déjà dans un jeu/lobby, ignorés de la file`);
+    
+    // Nettoyer la file d'attente des joueurs déjà dans un jeu
+    players.forEach(playerNumber => {
+      if (PLAYER_TO_GAME.has(playerNumber)) {
+        PLAYER_QUEUE.delete(playerNumber);
+        console.log(`🧹 Suppression de la file: ${playerNumber} (déjà dans un jeu)`);
+      }
+    });
+  }
+  
+  if (availablePlayers.length < 2) {
+    console.log(`❌ Pas assez de joueurs disponibles pour un match (${availablePlayers.length} disponible(s))`);
+    return null;
+  }
+  
+  // Récupérer les scores de tous les joueurs disponibles
+  const playersWithScores = [];
+  for (const playerNumber of availablePlayers) {
+    const user = await db.getUserByNumber(playerNumber);
+    if (user) {
+      playersWithScores.push({
+        number: playerNumber,
+        score: user.score,
+        username: user.username
+      });
+    }
+  }
+  
+  // Trouver TOUTES les paires possibles
+  const possiblePairs = [];
+  
+  for (let i = 0; i < playersWithScores.length - 1; i++) {
+    for (let j = i + 1; j < playersWithScores.length; j++) {
+      const player1 = playersWithScores[i];
+      const player2 = playersWithScores[j];
+      
+      // VÉRIFICATION: Pas déjà dans un jeu (double vérification)
+      if (PLAYER_TO_GAME.has(player1.number) || PLAYER_TO_GAME.has(player2.number)) {
+        console.log(`⛔ Double vérification échouée: ${player1.number} ou ${player2.number} déjà dans un jeu`);
+        continue;
+      }
+      
+      // Vérifier l'écart de score
+      const scoreGapBlocked = (player1.score >= HIGH_SCORE_THRESHOLD && player2.score < LOW_SCORE_THRESHOLD) ||
+                              (player2.score >= HIGH_SCORE_THRESHOLD && player1.score < LOW_SCORE_THRESHOLD);
+      
+      if (scoreGapBlocked) {
+        console.log(`⛔ Bloqué écart score: ${player1.username} (${player1.score}) vs ${player2.username} (${player2.score})`);
+        continue;
+      }
+      
+      // Vérifier match récent
+      const matchCheck = await canMatchPlayers(player1.number, player2.number);
+      
+      if (matchCheck.canMatch) {
+        possiblePairs.push({
+          player1: player1.number,
+          player2: player2.number,
+          player1Score: player1.score,
+          player2Score: player2.score,
+          scoreDiff: Math.abs(player1.score - player2.score),
+          player1Name: player1.username,
+          player2Name: player2.username
+        });
+        console.log(`✅ Match possible: ${player1.username} (${player1.score}) vs ${player2.username} (${player2.score})`);
+      } else {
+        console.log(`⏳ Match bloqué: ${player1.username} vs ${player2.username} - ${matchCheck.reason}`);
+      }
+    }
+  }
+  
+  // Si aucune paire possible
+  if (possiblePairs.length === 0) {
+    console.log(`❌ Aucune paire possible trouvée parmi ${playersWithScores.length} joueurs disponibles`);
+    return null;
+  }
+  
+  // Choisir la meilleure paire (la plus petite différence de score)
+  possiblePairs.sort((a, b) => a.scoreDiff - b.scoreDiff);
+  const bestPair = possiblePairs[0];
+  
+  // TRIPLE VÉRIFICATION: S'assurer que les joueurs ne sont toujours pas dans un jeu
+  if (PLAYER_TO_GAME.has(bestPair.player1) || PLAYER_TO_GAME.has(bestPair.player2)) {
+    console.log(`🚨 ALERTE: ${bestPair.player1Name} ou ${bestPair.player2Name} a rejoint un jeu entre-temps!`);
+    console.log(`   Annulation du match pour éviter les doublons`);
+    
+    // Retirer ces joueurs de la file s'ils sont dans un jeu
+    if (PLAYER_TO_GAME.has(bestPair.player1)) {
+      PLAYER_QUEUE.delete(bestPair.player1);
+      console.log(`   ${bestPair.player1Name} retiré de la file (déjà dans jeu)`);
+    }
+    if (PLAYER_TO_GAME.has(bestPair.player2)) {
+      PLAYER_QUEUE.delete(bestPair.player2);
+      console.log(`   ${bestPair.player2Name} retiré de la file (déjà dans jeu)`);
+    }
+    
+    return null;
+  }
+  
+  console.log(`🎯 Meilleur match sélectionné: ${bestPair.player1Name} vs ${bestPair.player2Name}`);
+  console.log(`   Différence de score: ${bestPair.scoreDiff}`);
+  console.log(`   Joueurs disponibles confirmés`);
+  
+  return [bestPair.player1, bestPair.player2];
+}
+
+// INITIALISATION DE LA BASE DE DONNÉES
+async function initializeDatabase() {
+  try {
+    // Table users
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password VARCHAR(100) NOT NULL,
+        number VARCHAR(20) UNIQUE NOT NULL,
+        age INTEGER NOT NULL,
+        score INTEGER DEFAULT 0,
+        online BOOLEAN DEFAULT FALSE,
+        token VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Table trusted_devices
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trusted_devices (
+        id SERIAL PRIMARY KEY,
+        device_key VARCHAR(200) UNIQUE NOT NULL,
+        user_number VARCHAR(20) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Table recent_matches (PERSISTANTE pour anti-match rapide)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS recent_matches (
+        id SERIAL PRIMARY KEY,
+        player1_number VARCHAR(20) NOT NULL,
+        player2_number VARCHAR(20) NOT NULL,
+        match_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(player1_number, player2_number)
+      )
+    `);
+
+    // Table bot_profiles
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_profiles (
+        id VARCHAR(50) PRIMARY KEY,
+        username VARCHAR(50) NOT NULL,
+        gender VARCHAR(1) NOT NULL,
+        base_score INTEGER DEFAULT 100,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Table bot_scores
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_scores (
+        id SERIAL PRIMARY KEY,
+        bot_id VARCHAR(50) UNIQUE NOT NULL,
+        score INTEGER DEFAULT 0,
+        last_played TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_auto_increment TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (bot_id) REFERENCES bot_profiles(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Table sponsorships
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sponsorships (
+        id SERIAL PRIMARY KEY,
+        sponsor_number VARCHAR(20) NOT NULL,
+        sponsored_number VARCHAR(20) UNIQUE NOT NULL,
+        is_validated BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        validated_at TIMESTAMP,
+        FOREIGN KEY (sponsor_number) REFERENCES users(number) ON DELETE CASCADE,
+        FOREIGN KEY (sponsored_number) REFERENCES users(number) ON DELETE CASCADE
+      )
+    `);
+
+    // Table sponsorship_stats
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sponsorship_stats (
+        id SERIAL PRIMARY KEY,
+        player_number VARCHAR(20) UNIQUE NOT NULL,
+        total_sponsored INTEGER DEFAULT 0,
+        validated_sponsored INTEGER DEFAULT 0,
+        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (player_number) REFERENCES users(number) ON DELETE CASCADE
+      )
+    `);
+
+    // Table sponsorship_validated_history
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sponsorship_validated_history (
+        id SERIAL PRIMARY KEY,
+        sponsor_number VARCHAR(20) NOT NULL,
+        sponsored_number VARCHAR(20) UNIQUE NOT NULL,
+        validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (sponsor_number) REFERENCES users(number) ON DELETE CASCADE,
+        FOREIGN KEY (sponsored_number) REFERENCES users(number) ON DELETE CASCADE
+      )
+    `);
+
+    // Créer un index pour les recherches rapides dans recent_matches
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_recent_matches_timestamp 
+      ON recent_matches(match_timestamp)
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_recent_matches_players 
+      ON recent_matches(player1_number, player2_number)
+    `);
+
+    // Insérer les bots
+    for (const bot of BOTS) {
+      await pool.query(`
+        INSERT INTO bot_profiles (id, username, gender, base_score) 
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (id) DO UPDATE SET
+          username = EXCLUDED.username,
+          gender = EXCLUDED.gender,
+          base_score = EXCLUDED.base_score
+      `, [bot.id, bot.username, bot.gender, bot.baseScore]);
+      
+      await pool.query(`
+        INSERT INTO bot_scores (bot_id, score) 
+        VALUES ($1, $2)
+        ON CONFLICT (bot_id) DO NOTHING
+      `, [bot.id, bot.baseScore]);
+    }
+
+    console.log('✅ Base de données initialisée avec système anti-match persistant');
+
+  } catch (error) {
+    console.error('Erreur init DB:', error);
+    throw error;
+  }
+}
+
+async function loadTrustedDevices() {
+  try {
+    const result = await pool.query('SELECT * FROM trusted_devices');
+    result.rows.forEach(row => {
+      TRUSTED_DEVICES.set(row.device_key, row.user_number);
+    });
+  } catch (error) {
+    console.error('Erreur chargement devices:', error);
+  }
+}
+
+// WEBSOCKET CONNECTION
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   let deviceId = "unknown";
@@ -1690,7 +1862,6 @@ wss.on('connection', (ws, req) => {
     if (isAdminConnection && adminId) {
       ADMIN_CONNECTIONS.delete(adminId);
     } else {
-      // Gestion IMMÉDIATE de la déconnexion
       const deviceKey = generateDeviceKey(ip, deviceId);
       const disconnectedNumber = TRUSTED_DEVICES.get(deviceKey);
       
@@ -1719,6 +1890,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// HANDLERS ADMIN
 async function handleAdminMessage(ws, message, adminId) {
   
   const handlers = {
@@ -1948,10 +2120,12 @@ async function handleAdminMessage(ws, message, adminId) {
         
         if (anti_quick_rematch !== undefined) {
           MATCHMAKING_CONFIG.anti_quick_rematch = anti_quick_rematch;
+          console.log(`⚙️ Anti-match rapide: ${anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
         }
         
         if (min_rematch_delay_minutes) {
           MATCHMAKING_CONFIG.min_rematch_delay = min_rematch_delay_minutes * 60 * 1000;
+          console.log(`⏱️ Délai anti-match configuré: ${min_rematch_delay_minutes} minutes`);
         }
         
         ws.send(JSON.stringify({
@@ -1983,7 +2157,7 @@ async function handleAdminMessage(ws, message, adminId) {
           type: 'admin_matchmaking_config',
           success: true,
           config: MATCHMAKING_CONFIG,
-          last_matches_count: LAST_MATCHES.size
+          message: 'Configuration actuelle'
         }));
       } catch (error) {
         console.error('Erreur get config matchmaking admin:', error);
@@ -2117,6 +2291,12 @@ async function handleAdminMessage(ws, message, adminId) {
           }));
         }
 
+        // Compter les matchs récents dans la base
+        const recentMatchesResult = await pool.query(`
+          SELECT COUNT(*) as count FROM recent_matches 
+          WHERE match_timestamp > NOW() - INTERVAL '${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
+        `);
+        
         ws.send(JSON.stringify({
           type: 'admin_server_stats',
           success: true,
@@ -2127,9 +2307,10 @@ async function handleAdminMessage(ws, message, adminId) {
             pending_lobbies: PENDING_LOBBIES.size,
             player_to_game: PLAYER_TO_GAME.size,
             bot_deposits: BOT_DEPOSITS.size,
-            last_matches: LAST_MATCHES.size,
+            recent_matches_in_db: parseInt(recentMatchesResult.rows[0].count),
             trusted_devices: TRUSTED_DEVICES.size
           },
+          matchmaking_config: MATCHMAKING_CONFIG,
           message: 'Statistiques serveur'
         }));
       } catch (error) {
@@ -2153,6 +2334,7 @@ async function handleAdminMessage(ws, message, adminId) {
   }
 }
 
+// HANDLERS CLIENT
 async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
@@ -2160,10 +2342,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   const handlers = {
     check_update: async () => {
       console.log('📱 Vérification MAJ demandée');
-      console.log('📱 Configuration MAJ:', UPDATE_CONFIG);
       
       if (UPDATE_CONFIG.force_update) {
-        console.log('⚠️ MAJ FORCÉE activée - Envoi réponse MAJ requise');
         ws.send(JSON.stringify({
           type: 'check_update_response',
           needs_update: true,
@@ -2173,7 +2353,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
           update_url: UPDATE_CONFIG.update_url
         }));
       } else {
-        console.log('✅ Pas de MAJ requise - Version à jour');
         ws.send(JSON.stringify({
           type: 'check_update_response',
           needs_update: false,
@@ -2334,7 +2513,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       ws.send(JSON.stringify({ type: 'leaderboard', leaderboard: leaderboard }));
     },
     
-    join_queue: () => {
+    join_queue: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
       if (PLAYER_TO_GAME.has(playerNumber)) return ws.send(JSON.stringify({ type: 'error', message: 'Déjà dans une partie' }));
@@ -2342,27 +2521,22 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       PLAYER_QUEUE.add(playerNumber);
       ws.send(JSON.stringify({ type: 'queue_joined', message: 'En attente adversaire' }));
       
+      console.log(`🎯 Joueur ${playerNumber} a rejoint la file d'attente`);
+      console.log(`📊 Taille file: ${PLAYER_QUEUE.size} joueur(s)`);
+      
+      // Lancer la recherche de match si assez de joueurs
       if (PLAYER_QUEUE.size >= 2) {
-        const players = Array.from(PLAYER_QUEUE);
+        const bestMatch = await findBestMatchFromQueue();
         
-        for (let i = 0; i < players.length - 1; i++) {
-          for (let j = i + 1; j < players.length; j++) {
-            const checkResult = canMatchPlayers(players[i], players[j]);
-            if (checkResult.canMatch) {
-              const selectedPlayers = [players[i], players[j]];
-              selectedPlayers.forEach(p => PLAYER_QUEUE.delete(p));
-              createGameLobby(selectedPlayers);
-              return;
-            } else {
-              console.log(`⏳ Match bloqué entre ${players[i]} et ${players[j]}: ${checkResult.reason}`);
-            }
-          }
+        if (bestMatch) {
+          // Retirer les joueurs de la file
+          bestMatch.forEach(player => PLAYER_QUEUE.delete(player));
+          
+          // Créer le lobby
+          createGameLobby(bestMatch);
+        } else {
+          console.log(`⏳ Aucun match possible pour le moment dans la file (${PLAYER_QUEUE.size} joueurs)`);
         }
-        
-        ws.send(JSON.stringify({ 
-          type: 'queue_waiting', 
-          message: 'En attente d’un adversaire disponible' 
-        }));
       }
     },
     
@@ -2371,6 +2545,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       if (playerNumber && PLAYER_QUEUE.has(playerNumber)) {
         PLAYER_QUEUE.delete(playerNumber);
         ws.send(JSON.stringify({ type: 'queue_left', message: 'Recherche annulée' }));
+        console.log(`🚪 Joueur ${playerNumber} a quitté la file d'attente`);
       }
     },
 
@@ -2384,7 +2559,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       const game = ACTIVE_GAMES.get(gameId);
       if (!game) return ws.send(JSON.stringify({ type: 'error', message: 'Match introuvable' }));
       
-      // Seulement annuler si le jeu n'a pas encore commencé
       if (game.phase !== 'waiting' || game.status !== 'lobby') {
         return ws.send(JSON.stringify({ 
           type: 'error', 
@@ -2518,43 +2692,67 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   }
 }
 
+// CRÉATION DU LOBBY AVEC VÉRIFICATION DE DOUBLON
 async function createGameLobby(playerNumbers) {
-  const p1 = await db.getUserByNumber(playerNumbers[0]);
-  const p2 = await db.getUserByNumber(playerNumbers[1]);
-  if (!p1 || !p2) return;
+  if (!playerNumbers || playerNumbers.length !== 2) {
+    console.log(`❌ Données invalides pour créer un lobby`);
+    return;
+  }
   
-  // Vérifier que les deux joueurs sont encore connectés
+  const [player1Number, player2Number] = playerNumbers;
+  
+  // VÉRIFICATION FINALE AVANT CRÉATION
+  if (PLAYER_TO_GAME.has(player1Number)) {
+    console.log(`🚨 ERREUR CRITIQUE: ${player1Number} déjà dans un jeu! Annulation création lobby`);
+    PLAYER_QUEUE.delete(player1Number);
+    return;
+  }
+  
+  if (PLAYER_TO_GAME.has(player2Number)) {
+    console.log(`🚨 ERREUR CRITIQUE: ${player2Number} déjà dans un jeu! Annulation création lobby`);
+    PLAYER_QUEUE.delete(player2Number);
+    return;
+  }
+  
+  const p1 = await db.getUserByNumber(player1Number);
+  const p2 = await db.getUserByNumber(player2Number);
+  if (!p1 || !p2) {
+    console.log(`❌ Un des joueurs non trouvé en base`);
+    return;
+  }
+  
   const ws1 = PLAYER_CONNECTIONS.get(p1.number);
   const ws2 = PLAYER_CONNECTIONS.get(p2.number);
   
   if (!ws1 || ws1.readyState !== WebSocket.OPEN || !ws2 || ws2.readyState !== WebSocket.OPEN) {
     console.log(`❌ Impossible de créer lobby: un joueur déconnecté`);
-    // Remettre dans la file
-    playerNumbers.forEach(num => {
-      if (PLAYER_CONNECTIONS.get(num)?.readyState === WebSocket.OPEN) {
-        PLAYER_QUEUE.add(num);
-      }
-    });
+    // Remettre dans la file seulement si pas déjà dans un jeu
+    if (!PLAYER_TO_GAME.has(player1Number)) PLAYER_QUEUE.add(player1Number);
+    if (!PLAYER_TO_GAME.has(player2Number)) PLAYER_QUEUE.add(player2Number);
     return;
   }
   
   const gameId = generateId();
+  console.log(`🎮 Création lobby ${gameId}: ${p1.username} vs ${p2.username}`);
+  
   new Game(gameId, p1, p2);
   
   playerNumbers.forEach((num, idx) => {
     const ws = PLAYER_CONNECTIONS.get(num);
     const opponent = idx === 0 ? p2 : p1;
-    ws?.send(JSON.stringify({
-      type: 'match_found',
-      matchId: gameId,
-      opponent: { 
-        username: opponent.username, 
-        score: opponent.score, 
-        number: opponent.number 
-      },
-      isPlayer1: idx === 0,
-      can_cancel: true
-    }));
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'match_found',
+        matchId: gameId,
+        opponent: { 
+          username: opponent.username, 
+          score: opponent.score, 
+          number: opponent.number 
+        },
+        isPlayer1: idx === 0,
+        can_cancel: true
+      }));
+    }
   });
 }
 
@@ -2718,7 +2916,11 @@ app.get('/matchmaking-config', (req, res) => {
   res.json({
     success: true,
     config: MATCHMAKING_CONFIG,
-    last_matches_count: LAST_MATCHES.size
+    thresholds: {
+      high_score: HIGH_SCORE_THRESHOLD,
+      low_score: LOW_SCORE_THRESHOLD,
+      description: `Joueurs ≥${HIGH_SCORE_THRESHOLD} ne peuvent pas rencontrer joueurs <${LOW_SCORE_THRESHOLD}`
+    }
   });
 });
 
@@ -2743,7 +2945,7 @@ app.post('/matchmaking-config/update', express.json(), (req, res) => {
     res.json({
       success: true,
       config: MATCHMAKING_CONFIG,
-      message: 'Configuration matchmaking mise à jour'
+      message: 'Configuration matchmaking mise à jour (n\'affecte pas les timers en cours)'
     });
   } catch (error) {
     console.error('Erreur update config matchmaking:', error);
@@ -2903,20 +3105,36 @@ app.get('/admin/permanent-validations', async (req, res) => {
   }
 });
 
-app.get('/server-stats', (req, res) => {
-  res.json({
-    success: true,
-    stats: {
-      connected_players: PLAYER_CONNECTIONS.size,
-      in_queue: PLAYER_QUEUE.size,
-      active_games: ACTIVE_GAMES.size,
-      pending_lobbies: PENDING_LOBBIES.size,
-      player_to_game: PLAYER_TO_GAME.size,
-      bot_deposits: BOT_DEPOSITS.size,
-      last_matches: LAST_MATCHES.size
-    },
-    timestamp: new Date().toISOString()
-  });
+app.get('/server-stats', async (req, res) => {
+  try {
+    const recentMatchesResult = await pool.query(`
+      SELECT COUNT(*) as count FROM recent_matches 
+      WHERE match_timestamp > NOW() - INTERVAL '${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
+    `);
+    
+    res.json({
+      success: true,
+      stats: {
+        connected_players: PLAYER_CONNECTIONS.size,
+        in_queue: PLAYER_QUEUE.size,
+        active_games: ACTIVE_GAMES.size,
+        pending_lobbies: PENDING_LOBBIES.size,
+        player_to_game: PLAYER_TO_GAME.size,
+        bot_deposits: BOT_DEPOSITS.size,
+        recent_matches_in_db: parseInt(recentMatchesResult.rows[0].count)
+      },
+      matchmaking: {
+        config: MATCHMAKING_CONFIG,
+        thresholds: {
+          high_score: HIGH_SCORE_THRESHOLD,
+          low_score: LOW_SCORE_THRESHOLD
+        }
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
 });
 
 app.get('/health', (req, res) => {
@@ -2927,9 +3145,11 @@ app.get('/health', (req, res) => {
     bot_deposit: BOT_DEPOSIT,
     active_deposits: BOT_DEPOSITS.size,
     matchmaking_config: MATCHMAKING_CONFIG,
-    last_matches_tracked: LAST_MATCHES.size,
-    sponsorship_min_score: SPONSOR_MIN_SCORE,
-    sponsorship_scan_interval: SPONSORSHIP_SCAN_INTERVAL,
+    score_thresholds: {
+      high: HIGH_SCORE_THRESHOLD,
+      low: LOW_SCORE_THRESHOLD,
+      rule: `≥${HIGH_SCORE_THRESHOLD} vs <${LOW_SCORE_THRESHOLD} = bloqué`
+    },
     pending_lobbies: PENDING_LOBBIES.size,
     lobby_timeout: LOBBY_TIMEOUT,
     auto_move_bonus: AUTO_MOVE_BONUS,
@@ -2955,6 +3175,7 @@ app.get('/update-config', (req, res) => {
   });
 });
 
+// DÉMARRAGE DU SERVEUR
 async function startServer() {
   try {
     await initializeDatabase();
@@ -2978,23 +3199,24 @@ async function startServer() {
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
-      console.log(`⚙️  Système anti-match rapide: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
+      console.log(`⚙️  SYSTÈME ANTI-MATCH RAPIDE PERSISTANT`);
+      console.log(`   • Activé: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'OUI' : 'NON'}`);
+      console.log(`   • Délai: ${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes`);
+      console.log(`   • Persistance: PostgreSQL (survive aux redémarrages)`);
+      console.log(`   • Nettoyage auto des matchs expirés`);
+      console.log(`📊 RESTRICTIONS DE SCORE`);
+      console.log(`   • ≥${HIGH_SCORE_THRESHOLD} points → ne rencontre pas <${LOW_SCORE_THRESHOLD} points`);
+      console.log(`   • <${HIGH_SCORE_THRESHOLD} points → pas de restriction`);
+      console.log(`🎮 SYSTÈME DE MATCHMAKING INTELLIGENT`);
+      console.log(`   • Analyse TOUTES les combinaisons possibles`);
+      console.log(`   • Priorise les matchs avec différence de score minimale`);
+      console.log(`   • Vérification silencieuse (pas de messages aux joueurs)`);
       console.log(`🎮 SYSTÈME DE JEU AMÉLIORÉ`);
       console.log(`   • 1 coup automatique unique par joueur par manche`);
-      console.log(`   • Si timeout après 1 coup auto → joueur a quitté → match terminé`);
       console.log(`   • Bonus +${AUTO_MOVE_BONUS} points pour victoire par déconnexion`);
-      console.log(`   • Réinitialisation coups auto à chaque nouvelle manche`);
-      console.log(`🎮 SYSTÈME LOBBY AVEC ANNULATION`);
-      console.log(`   • Timeout lobby: ${LOBBY_TIMEOUT/1000} secondes`);
-      console.log(`   • Commande annulation: cancel_match`);
-      console.log(`   • Nettoyage automatique des lobbys abandonnés`);
-      console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ (ANTI-REVALIDATION)`);
-      console.log(`   • Score minimum pour validation: ${SPONSOR_MIN_SCORE} points`);
-      console.log(`   • Historique des validations: JAMAIS réinitialisé`);
-      console.log(`   • Scanner automatique: toutes les ${SPONSORSHIP_SCAN_INTERVAL/60000} minutes`);
-      console.log(`🌐 Nouvelles commandes WebSocket:`);
-      console.log(`   • cancel_match - Annuler un lobby trouvé`);
-      console.log(`   • choose_sponsor, get_sponsor_info, get_sponsorship_stats`);
+      console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ`);
+      console.log(`   • Scan automatique toutes les ${SPONSORSHIP_SCAN_INTERVAL/60000} minutes`);
+      console.log(`   • Historique permanent des validations`);
       console.log(`=========================================`);
     });
   } catch (error) {
