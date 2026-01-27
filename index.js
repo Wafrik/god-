@@ -2813,13 +2813,16 @@ async function handleAdminMessage(ws, message, adminId) {
   };
   
   if (handlers[message.type]) {
-    await handlers[message.type]();
-  } else {
-    ws.send(JSON.stringify({ 
-      type: 'error', 
-      message: 'Commande admin inconnue' 
-    }));
-  }
+  console.log(`🔄 Exécution du handler: ${message.type}`);
+  await handlers[message.type]();
+  console.log(`✅ Handler ${message.type} terminé`);
+} else {
+  console.log(`❌ Handler NON TROUVÉ pour: ${message.type}`);
+  console.log(`   Handlers disponibles:`, Object.keys(handlers));
+  ws.send(JSON.stringify({ 
+    type: 'error', 
+    message: 'Commande admin inconnue: ' + message.type 
+  }));
 }
 
 // HANDLERS CLIENT
@@ -3787,3 +3790,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
