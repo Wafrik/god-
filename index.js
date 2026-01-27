@@ -418,6 +418,13 @@ const db = {
 
   async createUser(userData) {
     const { username, password, number, age } = userData;
+    
+    // Vérifier si le numéro est sur liste noire
+    const blacklisted = await this.isNumberBlacklisted(number);
+    if (blacklisted) {
+      throw new Error('Ce numéro a été banni et ne peut pas être réutilisé');
+    }
+    
     const token = generateId() + generateId();
     const result = await pool.query(
       `INSERT INTO users (username, password, number, age, score, online, token) 
@@ -1171,6 +1178,218 @@ const db = {
       console.error('Erreur récupération historique validations:', error);
       return [];
     }
+  },
+
+  // NOUVELLE FONCTION: Supprimer un compte
+  async deleteUserAccount(playerNumber, adminKey) {
+    try {
+      if (!adminKey || adminKey !== ADMIN_KEY) {
+        return { success: false, message: "Clé admin invalide" };
+      }
+      
+      const user = await this.getUserByNumber(playerNumber);
+      if (!user) {
+        return { success: false, message: "Joueur non trouvé" };
+      }
+      
+      // 1. Mettre le numéro sur liste noire
+      await pool.query(`
+        INSERT INTO blacklisted_numbers (number, banned_at, reason, original_username) 
+        VALUES ($1, CURRENT_TIMESTAMP, $2, $3)
+        ON CONFLICT (number) DO UPDATE SET 
+          banned_at = CURRENT_TIMESTAMP,
+          reason = EXCLUDED.reason
+      `, [playerNumber, 'Suppression admin', user.username]);
+      
+      console.log(`🚫 Numéro ${playerNumber} (${user.username}) ajouté à la liste noire`);
+      
+      // 2. Supprimer le joueur de toutes les connexions actives
+      PLAYER_CONNECTIONS.delete(playerNumber);
+      PLAYER_QUEUE.delete(playerNumber);
+      
+      // 3. Vérifier si le joueur est dans un jeu actif
+      const gameId = PLAYER_TO_GAME.get(playerNumber);
+      if (gameId) {
+        const game = ACTIVE_GAMES.get(gameId);
+        if (game) {
+          const player = game.getPlayerByNumber(playerNumber);
+          if (player) {
+            await game.handlePlayerDisconnect(player);
+          }
+        }
+        PLAYER_TO_GAME.delete(playerNumber);
+      }
+      
+      // 4. Supprimer les devices trustés
+      await pool.query('DELETE FROM trusted_devices WHERE user_number = $1', [playerNumber]);
+      
+      // 5. Supprimer les parrainages liés
+      await pool.query('DELETE FROM sponsorships WHERE sponsor_number = $1 OR sponsored_number = $1', [playerNumber]);
+      await pool.query('DELETE FROM sponsorship_validated_history WHERE sponsor_number = $1 OR sponsored_number = $1', [playerNumber]);
+      await pool.query('DELETE FROM sponsorship_stats WHERE player_number = $1', [playerNumber]);
+      
+      // 6. Supprimer les matchs récents
+      await pool.query('DELETE FROM recent_matches WHERE player1_number = $1 OR player2_number = $1', [playerNumber]);
+      
+      // 7. Supprimer l'utilisateur
+      await pool.query('DELETE FROM users WHERE number = $1', [playerNumber]);
+      
+      console.log(`🗑️ Compte ${playerNumber} (${user.username}) supprimé avec succès`);
+      
+      return { 
+        success: true, 
+        message: `Compte ${user.username} (${playerNumber}) supprimé avec succès`,
+        username: user.username,
+        number: playerNumber,
+        score: user.score,
+        blacklisted: true
+      };
+    } catch (error) {
+      console.error('Erreur suppression compte:', error);
+      return { success: false, message: "Erreur serveur lors de la suppression" };
+    }
+  },
+
+  // NOUVELLE FONCTION: Vérifier si un numéro est sur liste noire
+  async isNumberBlacklisted(number) {
+    try {
+      const result = await pool.query(
+        'SELECT * FROM blacklisted_numbers WHERE number = $1',
+        [number]
+      );
+      return result.rows.length > 0;
+    } catch (error) {
+      console.error('Erreur vérification liste noire:', error);
+      return false;
+    }
+  },
+
+  // NOUVELLE FONCTION: Obtenir la liste des numéros blacklistés
+  async getBlacklistedNumbers() {
+    try {
+      const result = await pool.query(`
+        SELECT number, original_username, reason, banned_at 
+        FROM blacklisted_numbers 
+        ORDER BY banned_at DESC
+      `);
+      return result.rows;
+    } catch (error) {
+      console.error('Erreur récupération liste noire:', error);
+      return [];
+    }
+  },
+
+  // NOUVELLE FONCTION: Retirer un numéro de la liste noire
+  async unblacklistNumber(number, adminKey) {
+    try {
+      if (!adminKey || adminKey !== ADMIN_KEY) {
+        return { success: false, message: "Clé admin invalide" };
+      }
+      
+      const result = await pool.query(
+        'DELETE FROM blacklisted_numbers WHERE number = $1 RETURNING *',
+        [number]
+      );
+      
+      if (result.rows.length === 0) {
+        return { success: false, message: "Numéro non trouvé dans la liste noire" };
+      }
+      
+      return { 
+        success: true, 
+        message: `Numéro ${number} retiré de la liste noire`,
+        number: number
+      };
+    } catch (error) {
+      console.error('Erreur retrait liste noire:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  // NOUVELLE FONCTION: Ajuster manuellement le compteur de parrainage
+  async manuallyAdjustSponsorshipCounter(playerNumber, adjustment, adminKey) {
+    try {
+      if (!adminKey || adminKey !== ADMIN_KEY) {
+        return { success: false, message: "Clé admin invalide" };
+      }
+      
+      if (!playerNumber || adjustment === undefined) {
+        return { success: false, message: "Données manquantes" };
+      }
+      
+      const user = await this.getUserByNumber(playerNumber);
+      if (!user) {
+        return { success: false, message: "Joueur non trouvé" };
+      }
+      
+      // Vérifier si le joueur a déjà des stats
+      const statsResult = await pool.query(
+        'SELECT * FROM sponsorship_stats WHERE player_number = $1',
+        [playerNumber]
+      );
+      
+      let currentValidated = 0;
+      
+      if (statsResult.rows.length > 0) {
+        currentValidated = statsResult.rows[0].validated_sponsored;
+      }
+      
+      const newValidated = Math.max(0, currentValidated + adjustment);
+      
+      await pool.query(`
+        INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored, last_updated) 
+        VALUES ($1, GREATEST($2, 0), $3, CURRENT_TIMESTAMP)
+        ON CONFLICT (player_number) 
+        DO UPDATE SET 
+          validated_sponsored = $3,
+          total_sponsored = GREATEST(sponsorship_stats.total_sponsored + ($2), 0),
+          last_updated = CURRENT_TIMESTAMP
+      `, [playerNumber, adjustment, newValidated]);
+      
+      console.log(`📊 Compteur parrainage ajusté pour ${playerNumber} (${user.username}): ${currentValidated} → ${newValidated} (ajustement: ${adjustment})`);
+      
+      // Enregistrer l'ajustement manuel dans l'historique
+      await pool.query(`
+        INSERT INTO admin_sponsorship_adjustments (admin_key, player_number, adjustment, old_value, new_value, reason) 
+        VALUES ($1, $2, $3, $4, $5, $6)
+      `, [adminKey, playerNumber, adjustment, currentValidated, newValidated, 'Ajustement manuel admin']);
+      
+      return { 
+        success: true, 
+        message: `Compteur parrainage ajusté: ${currentValidated} → ${newValidated}`,
+        player_number: playerNumber,
+        username: user.username,
+        old_value: currentValidated,
+        new_value: newValidated,
+        adjustment: adjustment
+      };
+    } catch (error) {
+      console.error('Erreur ajustement compteur parrainage:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  // NOUVELLE FONCTION: Obtenir l'historique des ajustements de parrainage
+  async getSponsorshipAdjustmentHistory(adminKey) {
+    try {
+      if (!adminKey || adminKey !== ADMIN_KEY) {
+        return { success: false, message: "Clé admin invalide" };
+      }
+      
+      const result = await pool.query(`
+        SELECT 
+          a.*,
+          u.username as player_username
+        FROM admin_sponsorship_adjustments a
+        LEFT JOIN users u ON a.player_number = u.number
+        ORDER BY a.adjusted_at DESC
+      `);
+      
+      return result.rows;
+    } catch (error) {
+      console.error('Erreur récupération historique ajustements:', error);
+      return [];
+    }
   }
 };
 
@@ -1751,7 +1970,7 @@ async function initializeDatabase() {
       )
     `);
 
-    // NOUVELLE TABLE: admin_resets
+    // Table admin_resets
     await pool.query(`
       CREATE TABLE IF NOT EXISTS admin_resets (
         id SERIAL PRIMARY KEY,
@@ -1822,6 +2041,31 @@ async function initializeDatabase() {
       )
     `);
 
+    // NOUVELLE TABLE: blacklisted_numbers (liste noire)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS blacklisted_numbers (
+        id SERIAL PRIMARY KEY,
+        number VARCHAR(20) UNIQUE NOT NULL,
+        original_username VARCHAR(50),
+        reason TEXT,
+        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // NOUVELLE TABLE: admin_sponsorship_adjustments (historique ajustements)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_sponsorship_adjustments (
+        id SERIAL PRIMARY KEY,
+        admin_key VARCHAR(100) NOT NULL,
+        player_number VARCHAR(20) NOT NULL,
+        adjustment INTEGER NOT NULL,
+        old_value INTEGER NOT NULL,
+        new_value INTEGER NOT NULL,
+        reason TEXT,
+        adjusted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Créer des index
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_recent_matches_timestamp 
@@ -1860,7 +2104,7 @@ async function initializeDatabase() {
       `);
     }
 
-    console.log('✅ Base de données initialisée avec système de pénalités PVP');
+    console.log('✅ Base de données initialisée avec système de suppression et liste noire');
 
   } catch (error) {
     console.error('Erreur init DB:', error);
@@ -2383,6 +2627,189 @@ async function handleAdminMessage(ws, message, adminId) {
           message: 'Erreur stats' 
         }));
       }
+    },
+
+    // NOUVEAU HANDLER: Supprimer un compte
+    admin_delete_user: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const { player_number } = message;
+        
+        if (!player_number) {
+          return ws.send(JSON.stringify({
+            type: 'admin_delete_user',
+            success: false,
+            message: 'Numéro joueur manquant'
+          }));
+        }
+
+        const result = await db.deleteUserAccount(player_number, message.admin_key);
+        
+        ws.send(JSON.stringify({
+          type: 'admin_delete_user',
+          success: result.success,
+          message: result.message,
+          player_number: result.number,
+          username: result.username,
+          score: result.score,
+          blacklisted: result.blacklisted
+        }));
+      } catch (error) {
+        console.error('Erreur suppression compte admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_delete_user', 
+          success: false, 
+          message: 'Erreur suppression' 
+        }));
+      }
+    },
+
+    // NOUVEAU HANDLER: Obtenir la liste noire
+    admin_get_blacklist: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const blacklist = await db.getBlacklistedNumbers();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_blacklist',
+          success: true,
+          blacklist: blacklist,
+          count: blacklist.length,
+          message: `Liste noire: ${blacklist.length} numéro(s)`
+        }));
+      } catch (error) {
+        console.error('Erreur récupération liste noire admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_blacklist', 
+          success: false, 
+          message: 'Erreur récupération' 
+        }));
+      }
+    },
+
+    // NOUVEAU HANDLER: Retirer un numéro de la liste noire
+    admin_unblacklist_number: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const { number } = message;
+        
+        if (!number) {
+          return ws.send(JSON.stringify({
+            type: 'admin_unblacklist',
+            success: false,
+            message: 'Numéro manquant'
+          }));
+        }
+
+        const result = await db.unblacklistNumber(number, message.admin_key);
+        
+        ws.send(JSON.stringify({
+          type: 'admin_unblacklist',
+          success: result.success,
+          message: result.message,
+          number: result.number
+        }));
+      } catch (error) {
+        console.error('Erreur retrait liste noire admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_unblacklist', 
+          success: false, 
+          message: 'Erreur retrait' 
+        }));
+      }
+    },
+
+    // NOUVEAU HANDLER: Ajuster manuellement le compteur de parrainage
+    admin_adjust_sponsorship_counter: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const { player_number, adjustment } = message;
+        
+        if (!player_number || adjustment === undefined) {
+          return ws.send(JSON.stringify({
+            type: 'admin_adjust_sponsorship',
+            success: false,
+            message: 'Données manquantes'
+          }));
+        }
+
+        const result = await db.manuallyAdjustSponsorshipCounter(
+          player_number, 
+          parseInt(adjustment), 
+          message.admin_key
+        );
+        
+        ws.send(JSON.stringify({
+          type: 'admin_adjust_sponsorship',
+          success: result.success,
+          message: result.message,
+          player_number: result.player_number,
+          username: result.username,
+          old_value: result.old_value,
+          new_value: result.new_value,
+          adjustment: result.adjustment
+        }));
+      } catch (error) {
+        console.error('Erreur ajustement parrainage admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_adjust_sponsorship', 
+          success: false, 
+          message: 'Erreur ajustement' 
+        }));
+      }
+    },
+
+    // NOUVEAU HANDLER: Obtenir l'historique des ajustements
+    admin_get_sponsorship_adjustment_history: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const history = await db.getSponsorshipAdjustmentHistory(message.admin_key);
+        
+        ws.send(JSON.stringify({
+          type: 'admin_sponsorship_adjustment_history',
+          success: true,
+          history: history,
+          count: history.length,
+          message: `Historique des ${history.length} ajustements`
+        }));
+      } catch (error) {
+        console.error('Erreur récupération historique ajustements admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_sponsorship_adjustment_history', 
+          success: false, 
+          message: 'Erreur récupération' 
+        }));
+      }
     }
   };
   
@@ -2458,24 +2885,35 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         ws.send(JSON.stringify({ type: 'register_failed', message: "Mots de passe différents" }));
       } else if (await db.getUserByUsername(username)) {
         ws.send(JSON.stringify({ type: 'register_failed', message: "Pseudo déjà utilisé" }));
-      } else if (await db.getUserByNumber(number)) {
-        ws.send(JSON.stringify({ type: 'register_failed', message: "Numéro déjà utilisé" }));
       } else {
-        const newUser = await db.createUser({ username, password, number, age: parseInt(age) });
-        
-        TRUSTED_DEVICES.set(deviceKey, number);
-        await db.createTrustedDevice(deviceKey, number);
-        
-        PLAYER_CONNECTIONS.set(number, ws);
-        
-        ws.send(JSON.stringify({ 
-          type: 'register_success', 
-          message: "Inscription réussie", 
-          username, 
-          score: 0, 
-          number,
-          token: newUser.token
-        }));
+        try {
+          const newUser = await db.createUser({ username, password, number, age: parseInt(age) });
+          
+          TRUSTED_DEVICES.set(deviceKey, number);
+          await db.createTrustedDevice(deviceKey, number);
+          
+          PLAYER_CONNECTIONS.set(number, ws);
+          
+          ws.send(JSON.stringify({ 
+            type: 'register_success', 
+            message: "Inscription réussie", 
+            username, 
+            score: 0, 
+            number,
+            token: newUser.token
+          }));
+        } catch (error) {
+          if (error.message.includes('banni')) {
+            ws.send(JSON.stringify({ 
+              type: 'register_failed', 
+              message: "Ce numéro a été banni et ne peut pas être réutilisé" 
+            }));
+          } else if (await db.getUserByNumber(number)) {
+            ws.send(JSON.stringify({ type: 'register_failed', message: "Numéro déjà utilisé" }));
+          } else {
+            ws.send(JSON.stringify({ type: 'register_failed', message: "Erreur lors de l'inscription" }));
+          }
+        }
       }
     },
 
@@ -3195,6 +3633,130 @@ app.get('/server-stats', async (req, res) => {
   }
 });
 
+// NOUVELLE ROUTE: Ajuster manuellement le compteur de parrainage
+app.post('/admin/adjust-sponsorship-counter', express.json(), async (req, res) => {
+  try {
+    const { admin_key, player_number, adjustment } = req.body;
+    
+    if (!admin_key || admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    if (!player_number || adjustment === undefined) {
+      return res.status(400).json({ success: false, message: "Données manquantes" });
+    }
+    
+    const result = await db.manuallyAdjustSponsorshipCounter(player_number, parseInt(adjustment), admin_key);
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    console.error('Erreur ajustement compteur parrainage:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// NOUVELLE ROUTE: Obtenir l'historique des ajustements
+app.get('/admin/sponsorship-adjustment-history', async (req, res) => {
+  try {
+    const { admin_key } = req.query;
+    
+    if (!admin_key || admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    const history = await db.getSponsorshipAdjustmentHistory(admin_key);
+    
+    res.json({
+      success: true,
+      history: history,
+      count: history.length,
+      message: `Historique des ${history.length} ajustements`
+    });
+  } catch (error) {
+    console.error('Erreur récupération historique ajustements:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// NOUVELLE ROUTE: Supprimer un compte
+app.post('/admin/delete-user', express.json(), async (req, res) => {
+  try {
+    const { admin_key, player_number } = req.body;
+    
+    if (!admin_key || admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    if (!player_number) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const result = await db.deleteUserAccount(player_number, admin_key);
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    console.error('Erreur suppression compte:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// NOUVELLE ROUTE: Obtenir la liste noire
+app.get('/admin/blacklist', async (req, res) => {
+  try {
+    const { admin_key } = req.query;
+    
+    if (!admin_key || admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    const blacklist = await db.getBlacklistedNumbers();
+    
+    res.json({
+      success: true,
+      blacklist: blacklist,
+      count: blacklist.length,
+      message: `Liste noire: ${blacklist.length} numéro(s)`
+    });
+  } catch (error) {
+    console.error('Erreur récupération liste noire:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+// NOUVELLE ROUTE: Retirer un numéro de la liste noire
+app.post('/admin/unblacklist', express.json(), async (req, res) => {
+  try {
+    const { admin_key, number } = req.body;
+    
+    if (!admin_key || admin_key !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: "Clé admin invalide" });
+    }
+    
+    if (!number) {
+      return res.status(400).json({ success: false, message: "Numéro manquant" });
+    }
+    
+    const result = await db.unblacklistNumber(number, admin_key);
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    console.error('Erreur retrait liste noire:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
@@ -3268,6 +3830,10 @@ async function startServer() {
       console.log(`   • Délai: ${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes`);
       console.log(`📊 RESTRICTIONS DE SCORE`);
       console.log(`   • ≥${HIGH_SCORE_THRESHOLD} points → ne rencontre pas <${LOW_SCORE_THRESHOLD} points`);
+      console.log(`🔒 NOUVELLES FONCTIONNALITÉS ADMIN`);
+      console.log(`   • Suppression compte avec liste noire`);
+      console.log(`   • Ajustement manuel compteur parrainage`);
+      console.log(`   • Gestion liste noire complète`);
       console.log(`=========================================`);
     });
   } catch (error) {
@@ -3293,4 +3859,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
