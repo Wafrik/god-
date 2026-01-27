@@ -181,6 +181,7 @@ function handleGameAction(ws, message, deviceKey, TRUSTED_DEVICES, PLAYER_TO_GAM
   actions[message.type]?.();
 }
 
+// Configuration des routes
 routes.configureRoutes(app, db, pool, constants, PLAYER_CONNECTIONS, PLAYER_QUEUE, ACTIVE_GAMES, PLAYER_TO_GAME, BOT_DEPOSITS, BOT_SCORES, PENDING_LOBBIES, constants.MATCHMAKING_CONFIG, incrementBotScoresAutomatically, scanAndValidateAllSponsorships, getRandomBot, updateBotScore, constants.BOTS);
 
 // Initialisation base de données
@@ -464,4 +465,3 @@ module.exports = {
   BOT_DEPOSITS,
   PENDING_LOBBIES
 };
-
