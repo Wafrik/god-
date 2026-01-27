@@ -788,111 +788,148 @@ const db = {
     }
   },
 
-  async getFullListWithBots() {
-    try {
-      const playersResult = await pool.query(`
-        SELECT 
-          u.number as id, 
-          u.username, 
-          u.score, 
-          u.age, 
-          u.number, 
-          u.password,
-          u.created_at, 
-          u.online, 
-          false as is_bot,
-          RANK() OVER (ORDER BY u.score DESC) as rank,
-          sp.sponsor_number,
-          sp_user.username as sponsor_username,
-          sp.is_validated,
-          COALESCE(ss.total_sponsored, 0) as total_sponsored,
-          COALESCE(ss.validated_sponsored, 0) as validated_sponsored
-        FROM users u 
-        LEFT JOIN sponsorships sp ON u.number = sp.sponsored_number
-        LEFT JOIN users sp_user ON sp.sponsor_number = sp_user.number
-        LEFT JOIN sponsorship_stats ss ON u.number = ss.player_number
-        WHERE u.score >= 0 
-      `);
-      
-      const botsResult = await pool.query(`
-        SELECT 
-          bs.bot_id as id, 
-          COALESCE(b.username, bp.username) as username, 
-          bs.score, 
-          'adv' as number, 
-          0 as age, 
-          '' as password,
-          COALESCE(bp.created_at, NOW()) as created_at, 
-          false as online, 
-          true as is_bot,
-          RANK() OVER (ORDER BY bs.score DESC) as rank,
-          NULL as sponsor_number,
-          NULL as sponsor_username,
-          NULL as is_validated,
-          0 as total_sponsored,
-          0 as validated_sponsored
-        FROM bot_scores bs 
-        LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
-        LEFT JOIN bot_profiles b ON bs.bot_id = b.id
-      `).catch(() => ({ rows: [] }));
-      
-      const combinedList = [];
-      
-      playersResult.rows.forEach(player => {
-        combinedList.push({
-          id: player.id,
-          username: player.username,
-          score: player.score,
-          rank: player.rank,
-          age: player.age,
-          number: player.number,
-          password: player.password,
-          created_at: player.created_at,
-          online: player.online,
-          is_bot: false,
-          has_sponsor: !!player.sponsor_number,
-          sponsor_username: player.sponsor_username || "",
-          sponsor_number: player.sponsor_number || "",
-          is_sponsorship_validated: player.is_validated || false,
-          total_sponsored: player.total_sponsored || 0,
-          validated_sponsored: player.validated_sponsored || 0
-        });
+  // ===== MODIFICATION DE LA FONCTION getFullListWithBots =====
+async getFullListWithBots() {
+  try {
+    const playersResult = await pool.query(`
+      SELECT 
+        u.number as id, 
+        u.username, 
+        u.score, 
+        u.age, 
+        u.number, 
+        u.password,
+        u.created_at, 
+        u.online, 
+        false as is_bot,
+        RANK() OVER (ORDER BY u.score DESC) as rank,
+        sp.sponsor_number,
+        sp_user.username as sponsor_username,
+        sp.is_validated,
+        -- TOTAL GLOBAL (F) = toutes les validations depuis le début
+        COALESCE(ss.validated_sponsored, 0) as total_sponsored,
+        -- FV = validations DEPUIS LE DERNIER RESET
+        (
+          SELECT COALESCE(COUNT(*), 0)
+          FROM sponsorship_validated_history vh
+          LEFT JOIN (
+            SELECT MAX(reset_date) as last_reset 
+            FROM admin_resets 
+            WHERE reset_type = 'sponsorship_counters'
+          ) r ON 1=1
+          WHERE vh.sponsor_number = u.number
+          AND (r.last_reset IS NULL OR vh.validated_at >= r.last_reset)
+        ) as validated_sponsored
+      FROM users u 
+      LEFT JOIN sponsorships sp ON u.number = sp.sponsored_number
+      LEFT JOIN users sp_user ON sp.sponsor_number = sp_user.number
+      LEFT JOIN sponsorship_stats ss ON u.number = ss.player_number
+      WHERE u.score >= 0 
+    `);
+    
+    const botsResult = await pool.query(`
+      SELECT 
+        bs.bot_id as id, 
+        COALESCE(b.username, bp.username) as username, 
+        bs.score, 
+        'adv' as number, 
+        0 as age, 
+        '' as password,
+        COALESCE(bp.created_at, NOW()) as created_at, 
+        false as online, 
+        true as is_bot,
+        RANK() OVER (ORDER BY bs.score DESC) as rank,
+        NULL as sponsor_number,
+        NULL as sponsor_username,
+        NULL as is_validated,
+        0 as total_sponsored,
+        0 as validated_sponsored
+      FROM bot_scores bs 
+      LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
+      LEFT JOIN bot_profiles b ON bs.bot_id = b.id
+    `).catch(() => ({ rows: [] }));
+    
+    const combinedList = [];
+    
+    playersResult.rows.forEach(player => {
+      combinedList.push({
+        id: player.id,
+        username: player.username,
+        score: player.score,
+        rank: player.rank,
+        age: player.age,
+        number: player.number,
+        password: player.password,
+        created_at: player.created_at,
+        online: player.online,
+        is_bot: false,
+        has_sponsor: !!player.sponsor_number,
+        sponsor_username: player.sponsor_username || "",
+        sponsor_number: player.sponsor_number || "",
+        is_sponsorship_validated: player.is_validated || false,
+        total_sponsored: player.total_sponsored || 0,      // F = Total global
+        validated_sponsored: player.validated_sponsored || 0  // FV = Depuis dernier reset
       });
-      
-      botsResult.rows.forEach(bot => {
-        combinedList.push({
-          id: bot.id,
-          username: bot.username,
-          score: bot.score,
-          rank: bot.rank,
-          age: bot.age,
-          number: bot.number,
-          password: bot.password,
-          created_at: bot.created_at,
-          online: bot.online,
-          is_bot: true,
-          has_sponsor: false,
-          sponsor_username: "",
-          sponsor_number: "",
-          is_sponsorship_validated: false,
-          total_sponsored: 0,
-          validated_sponsored: 0
-        });
+    });
+    
+    botsResult.rows.forEach(bot => {
+      combinedList.push({
+        id: bot.id,
+        username: bot.username,
+        score: bot.score,
+        rank: bot.rank,
+        age: bot.age,
+        number: bot.number,
+        password: bot.password,
+        created_at: bot.created_at,
+        online: bot.online,
+        is_bot: true,
+        has_sponsor: false,
+        sponsor_username: "",
+        sponsor_number: "",
+        is_sponsorship_validated: false,
+        total_sponsored: 0,
+        validated_sponsored: 0
       });
-      
-      combinedList.sort((a, b) => b.score - a.score);
-      
-      combinedList.forEach((item, index) => {
-        item.rank = index + 1;
-      });
-      
-      return combinedList;
-    } catch (error) {
-      console.error('Erreur liste complète avec adversaires et parrainage:', error);
-      return [];
-    }
-  },
-
+    });
+    
+    combinedList.sort((a, b) => b.score - a.score);
+    
+    combinedList.forEach((item, index) => {
+      item.rank = index + 1;
+    });
+    
+    return combinedList;
+  } catch (error) {
+    console.error('Erreur liste complète avec adversaires et parrainage:', error);
+    return [];
+  }
+},
+  
+// ===== NOUVELLE FONCTION : Réinitialiser les compteurs parrainage =====
+async resetSponsorshipCounters() {
+  try {
+    // Enregistrer la date du reset des parrainages
+    await pool.query(`
+      INSERT INTO admin_resets (reset_date, reset_type, notes) 
+      VALUES (CURRENT_TIMESTAMP, 'sponsorship_counters', 'Reset hebdomadaire des compteurs parrainage')
+      ON CONFLICT DO NOTHING
+    `);
+    
+    console.log(`🔄 Reset des compteurs parrainage effectué à ${new Date().toISOString()}`);
+    
+    return { 
+      success: true, 
+      message: "Compteurs de parrainage réinitialisés",
+      reset_date: new Date().toISOString(),
+      notes: "Les compteurs FV afficheront maintenant seulement les validations après cette date"
+    };
+  } catch (error) {
+    console.error('Erreur reset compteurs parrainage:', error);
+    return { success: false, message: "Erreur serveur" };
+  }
+},
+  
   async updateBotScoreById(botId, points, operation) {
     try {
       if (!botId) return { success: false, message: "ID adversaire manquant" };
@@ -1061,30 +1098,76 @@ const db = {
     }
   },
 
-  async getSponsorshipStats(playerNumber) {
+  // ===== MODIFICATION DE LA FONCTION getSponsorshipStats =====
+async getSponsorshipStats(playerNumber) {
   try {
-    // SIMPLIFICATION : Retourner directement le compteur de la table sponsorship_stats
-    // sans tenir compte du reset
+    // 1. Récupérer la date du dernier reset des compteurs parrainage
+    const lastResetResult = await pool.query(`
+      SELECT reset_date 
+      FROM admin_resets 
+      WHERE reset_type = 'sponsorship_counters' 
+      ORDER BY reset_date DESC 
+      LIMIT 1
+    `);
     
-    const result = await pool.query(
-      'SELECT validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
-      [playerNumber]
-    );
+    const lastResetDate = lastResetResult.rows[0]?.reset_date;
     
-    let validatedCount = 0;
-    
-    if (result.rows.length > 0) {
-      validatedCount = result.rows[0].validated_sponsored || 0;
+    // 2. Si pas de reset, compter tout (situation initiale)
+    if (!lastResetDate) {
+      const result = await pool.query(
+        'SELECT validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
+        [playerNumber]
+      );
+      
+      const validatedCount = result.rows.length > 0 ? result.rows[0].validated_sponsored : 0;
+      
+      console.log(`📊 Stats parrainage pour ${playerNumber}: ${validatedCount} filleul(s) validé(s) (aucun reset)`);
+      
+      return { 
+        success: true, 
+        validated_sponsored: validatedCount,
+        last_reset_date: null,
+        message: validatedCount > 0 ? 
+          `${validatedCount} filleul(s) validé(s)` : 
+          "Aucun filleul validé pour le moment"
+      };
     }
     
-    console.log(`📊 Stats parrainage pour ${playerNumber}: ${validatedCount} filleul(s) validé(s)`);
+    // 3. Compter seulement les validations après le dernier reset
+    const countResult = await pool.query(`
+      SELECT COUNT(*) as count 
+      FROM sponsorship_validated_history 
+      WHERE sponsor_number = $1 
+      AND validated_at >= $2
+    `, [playerNumber, lastResetDate]);
+    
+    const validatedCount = parseInt(countResult.rows[0]?.count || 0);
+    
+    // 4. Vérifier aussi les ajustements manuels admin après le reset
+    const adjustmentResult = await pool.query(`
+      SELECT COALESCE(SUM(adjustment), 0) as total_adjustment
+      FROM admin_sponsorship_adjustments 
+      WHERE player_number = $1 
+      AND adjusted_at >= $2
+    `, [playerNumber, lastResetDate]);
+    
+    const totalAdjustment = parseInt(adjustmentResult.rows[0]?.total_adjustment || 0);
+    
+    // 5. Total = validations naturelles + ajustements admin
+    const totalValidated = Math.max(0, validatedCount + totalAdjustment);
+    
+    console.log(`📊 Stats parrainage pour ${playerNumber}:`);
+    console.log(`   Validations naturelles après reset: ${validatedCount}`);
+    console.log(`   Ajustements admin après reset: ${totalAdjustment}`);
+    console.log(`   TOTAL (ce que client voit): ${totalValidated}`);
     
     return { 
       success: true, 
-      validated_sponsored: validatedCount,
-      message: validatedCount > 0 ? 
-        `${validatedCount} filleul(s) validé(s)` : 
-        "Aucun filleul validé pour le moment"
+      validated_sponsored: totalValidated,
+      last_reset_date: lastResetDate,
+      message: totalValidated > 0 ? 
+        `${totalValidated} filleul(s) validé(s) cette semaine` : 
+        "Aucun filleul validé cette semaine"
     };
   } catch (error) {
     console.error('Erreur récupération stats parrainage:', error);
@@ -1289,69 +1372,121 @@ const db = {
     }
   },
 
-  // NOUVELLE FONCTION: Ajuster manuellement le compteur de parrainage
-  async manuallyAdjustSponsorshipCounter(playerNumber, adjustment, adminKey) {
-    try {
-      if (!adminKey || adminKey !== ADMIN_KEY) {
-        return { success: false, message: "Clé admin invalide" };
-      }
+  // ===== MODIFICATION DE LA FONCTION manuallyAdjustSponsorshipCounter =====
+async manuallyAdjustSponsorshipCounter(playerNumber, adjustment, adminKey) {
+  try {
+    if (!adminKey || adminKey !== ADMIN_KEY) {
+      return { success: false, message: "Clé admin invalide" };
+    }
+    
+    if (!playerNumber || adjustment === undefined) {
+      return { success: false, message: "Données manquantes" };
+    }
+    
+    const user = await this.getUserByNumber(playerNumber);
+    if (!user) {
+      return { success: false, message: "Joueur non trouvé" };
+    }
+    
+    // 1. Récupérer la date du dernier reset
+    const lastResetResult = await pool.query(`
+      SELECT reset_date 
+      FROM admin_resets 
+      WHERE reset_type = 'sponsorship_counters' 
+      ORDER BY reset_date DESC 
+      LIMIT 1
+    `);
+    
+    const lastResetDate = lastResetResult.rows[0]?.reset_date;
+    
+    if (!lastResetDate) {
+      return { success: false, message: "Aucun reset trouvé, veuillez d'abord effectuer un reset des compteurs" };
+    }
+    
+    // 2. Calculer les validations après le dernier reset
+    let currentValidated = 0;
+    if (lastResetDate) {
+      const countResult = await pool.query(`
+        SELECT COUNT(*) as count 
+        FROM sponsorship_validated_history 
+        WHERE sponsor_number = $1 
+        AND validated_at >= $2
+      `, [playerNumber, lastResetDate]);
       
-      if (!playerNumber || adjustment === undefined) {
-        return { success: false, message: "Données manquantes" };
-      }
-      
-      const user = await this.getUserByNumber(playerNumber);
-      if (!user) {
-        return { success: false, message: "Joueur non trouvé" };
-      }
-      
-      // Vérifier si le joueur a déjà des stats
-      const statsResult = await pool.query(
-        'SELECT * FROM sponsorship_stats WHERE player_number = $1',
-        [playerNumber]
-      );
-      
-      let currentValidated = 0;
-      
-      if (statsResult.rows.length > 0) {
-        currentValidated = statsResult.rows[0].validated_sponsored;
-      }
-      
-      const newValidated = Math.max(0, currentValidated + adjustment);
-      
+      currentValidated = parseInt(countResult.rows[0]?.count || 0);
+    }
+    
+    // 3. Calculer les ajustements précédents après le dernier reset
+    const previousAdjustmentsResult = await pool.query(`
+      SELECT COALESCE(SUM(adjustment), 0) as total_adjustment
+      FROM admin_sponsorship_adjustments 
+      WHERE player_number = $1 
+      AND adjusted_at >= $2
+    `, [playerNumber, lastResetDate]);
+    
+    const previousAdjustments = parseInt(previousAdjustmentsResult.rows[0]?.total_adjustment || 0);
+    
+    // 4. Total actuel (avant nouveau ajustement)
+    const totalBefore = Math.max(0, currentValidated + previousAdjustments);
+    
+    // 5. Nouveau total
+    const totalAfter = Math.max(0, totalBefore + adjustment);
+    
+    // 6. Mettre à jour les stats globales (pour F dans admin)
+    const globalStatsResult = await pool.query(
+      'SELECT total_sponsored, validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
+      [playerNumber]
+    );
+    
+    if (globalStatsResult.rows.length > 0) {
+      // Mettre à jour le validated_sponsored global (F)
+      const newGlobalValidated = globalStatsResult.rows[0].validated_sponsored + adjustment;
+      await pool.query(`
+        UPDATE sponsorship_stats 
+        SET validated_sponsored = $1,
+            total_sponsored = GREATEST(validated_sponsored, total_sponsored),
+            last_updated = CURRENT_TIMESTAMP
+        WHERE player_number = $2
+      `, [Math.max(0, newGlobalValidated), playerNumber]);
+    } else {
+      // Créer l'entrée si elle n'existe pas
       await pool.query(`
         INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored, last_updated) 
-        VALUES ($1, GREATEST($2, 0), $3, CURRENT_TIMESTAMP)
-        ON CONFLICT (player_number) 
-        DO UPDATE SET 
-          validated_sponsored = $3,
-          total_sponsored = GREATEST(sponsorship_stats.total_sponsored + ($2), 0),
-          last_updated = CURRENT_TIMESTAMP
-      `, [playerNumber, adjustment, newValidated]);
-      
-      console.log(`📊 Compteur parrainage ajusté pour ${playerNumber} (${user.username}): ${currentValidated} → ${newValidated} (ajustement: ${adjustment})`);
-      
-      // Enregistrer l'ajustement manuel dans l'historique
-      await pool.query(`
-        INSERT INTO admin_sponsorship_adjustments (admin_key, player_number, adjustment, old_value, new_value, reason) 
-        VALUES ($1, $2, $3, $4, $5, $6)
-      `, [adminKey, playerNumber, adjustment, currentValidated, newValidated, 'Ajustement manuel admin']);
-      
-      return { 
-        success: true, 
-        message: `Compteur parrainage ajusté: ${currentValidated} → ${newValidated}`,
-        player_number: playerNumber,
-        username: user.username,
-        old_value: currentValidated,
-        new_value: newValidated,
-        adjustment: adjustment
-      };
-    } catch (error) {
-      console.error('Erreur ajustement compteur parrainage:', error);
-      return { success: false, message: "Erreur serveur" };
+        VALUES ($1, GREATEST($2, 0), GREATEST($2, 0), CURRENT_TIMESTAMP)
+      `, [playerNumber, Math.max(0, adjustment)]);
     }
-  },
-
+    
+    console.log(`📊 Ajustement parrainage pour ${playerNumber} (${user.username}):`);
+    console.log(`   Validations naturelles après reset: ${currentValidated}`);
+    console.log(`   Ajustements précédents: ${previousAdjustments}`);
+    console.log(`   Total avant ajustement (ce que client voit): ${totalBefore}`);
+    console.log(`   Ajustement demandé: ${adjustment}`);
+    console.log(`   Total après ajustement (ce que client verra): ${totalAfter}`);
+    
+    // 7. Enregistrer l'ajustement dans l'historique
+    await pool.query(`
+      INSERT INTO admin_sponsorship_adjustments (admin_key, player_number, adjustment, old_value, new_value, reason) 
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [adminKey, playerNumber, adjustment, totalBefore, totalAfter, 'Ajustement manuel admin après reset']);
+    
+    return { 
+      success: true, 
+      message: `Compteur parrainage ajusté: ${totalBefore} → ${totalAfter}`,
+      player_number: playerNumber,
+      username: user.username,
+      old_value: totalBefore,
+      new_value: totalAfter,
+      adjustment: adjustment,
+      natural_validations: currentValidated,
+      previous_adjustments: previousAdjustments,
+      is_post_reset: true
+    };
+  } catch (error) {
+    console.error('Erreur ajustement compteur parrainage:', error);
+    return { success: false, message: "Erreur serveur" };
+  }
+},
+ 
   // NOUVELLE FONCTION: Obtenir l'historique des ajustements de parrainage
   async getSponsorshipAdjustmentHistory(adminKey) {
     try {
@@ -3842,4 +3977,5 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
