@@ -2271,31 +2271,31 @@ async function handleAdminMessage(ws, message, adminId) {
     },
 
     admin_get_full_list: async () => {
-  try {
-    if (message.admin_key !== ADMIN_KEY) {
-      return ws.send(JSON.stringify({ 
-        type: 'error', 
-        message: 'Clé admin invalide' 
-      }));
-    }
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
 
-    const fullList = await db.getFullListWithBots();
-    
-    ws.send(JSON.stringify({
-      type: 'admin_full_list',
-      success: true,
-      data: fullList,
-      count: fullList.length
-    }));
-  } catch (error) {
-    console.error('Erreur liste complète admin:', error);
-    ws.send(JSON.stringify({ 
-      type: 'admin_full_list', 
-      success: false, 
-      message: 'Erreur liste complète' 
-    }));
-  }
-},
+        const fullList = await db.getFullListWithBots();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_full_list',
+          success: true,
+          data: fullList,
+          count: fullList.length
+        }));
+      } catch (error) {
+        console.error('Erreur liste complète admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_full_list', 
+          success: false, 
+          message: 'Erreur liste complète' 
+        }));
+      }
+    },
 
     admin_reset_scores: async () => {
       try {
@@ -2511,8 +2511,7 @@ async function handleAdminMessage(ws, message, adminId) {
         ws.send(JSON.stringify({
           type: 'admin_reset_sponsorship_counters',
           success: result.success,
-          message: result.message,
-          reset_date: result.reset_date
+          message: result.message
         }));
       } catch (error) {
         console.error('Erreur reset compteurs parrainage admin:', error);
@@ -2610,6 +2609,7 @@ async function handleAdminMessage(ws, message, adminId) {
             active_games: ACTIVE_GAMES.size,
             pending_lobbies: PENDING_LOBBIES.size,
             player_to_game: PLAYER_TO_GAME.size,
+            bot_deposits: BOT_DEPOSITS.size,
             recent_matches_in_db: parseInt(recentMatchesResult.rows[0].count),
             trusted_devices: TRUSTED_DEVICES.size
           },
@@ -2628,7 +2628,7 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // Supprimer un compte
+    // NOUVEAU HANDLER: Supprimer un compte
     admin_delete_user: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -2669,7 +2669,7 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // Obtenir la liste noire
+    // NOUVEAU HANDLER: Obtenir la liste noire
     admin_get_blacklist: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -2698,7 +2698,7 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // Retirer un numéro de la liste noire
+    // NOUVEAU HANDLER: Retirer un numéro de la liste noire
     admin_unblacklist_number: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -2736,7 +2736,7 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // Ajuster manuellement le compteur de parrainage
+    // NOUVEAU HANDLER: Ajuster manuellement le compteur de parrainage
     admin_adjust_sponsorship_counter: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -2782,7 +2782,7 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // Obtenir l'historique des ajustements
+    // NOUVEAU HANDLER: Obtenir l'historique des ajustements
     admin_get_sponsorship_adjustment_history: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -2821,6 +2821,7 @@ async function handleAdminMessage(ws, message, adminId) {
     }));
   }
 }
+
 
 // HANDLERS CLIENT
 async function handleClientMessage(ws, message, ip, deviceId) {
@@ -3787,4 +3788,5 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
