@@ -1062,52 +1062,35 @@ const db = {
   },
 
   async getSponsorshipStats(playerNumber) {
-    try {
-      // D'abord, récupérer la date du dernier reset admin
-      const lastResetResult = await pool.query(`
-        SELECT reset_date FROM admin_resets 
-        WHERE reset_type = 'weekly_scores' 
-        ORDER BY reset_date DESC 
-        LIMIT 1
-      `);
-      
-      let validatedSinceReset = 0;
-      
-      if (lastResetResult.rows.length > 0) {
-        const lastResetDate = lastResetResult.rows[0].reset_date;
-        
-        // Compter les parrainages validés APRÈS le dernier reset
-        const result = await pool.query(
-          `SELECT COUNT(*) as count 
-           FROM sponsorship_validated_history 
-           WHERE sponsor_number = $1 
-           AND validated_at >= $2`,
-          [playerNumber, lastResetDate]
-        );
-        
-        validatedSinceReset = parseInt(result.rows[0].count);
-      } else {
-        // Si pas de reset, compter tous les parrainages validés
-        const result = await pool.query(
-          'SELECT validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
-          [playerNumber]
-        );
-        
-        if (result.rows.length > 0) {
-          validatedSinceReset = result.rows[0].validated_sponsored;
-        }
-      }
-      
-      return { 
-        success: true, 
-        validated_sponsored: validatedSinceReset,
-        last_reset_date: lastResetResult.rows[0]?.reset_date || null
-      };
-    } catch (error) {
-      console.error('Erreur récupération stats parrainage:', error);
-      return { success: false, message: "Erreur serveur" };
+  try {
+    // SIMPLIFICATION : Retourner directement le compteur de la table sponsorship_stats
+    // sans tenir compte du reset
+    
+    const result = await pool.query(
+      'SELECT validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
+      [playerNumber]
+    );
+    
+    let validatedCount = 0;
+    
+    if (result.rows.length > 0) {
+      validatedCount = result.rows[0].validated_sponsored || 0;
     }
-  },
+    
+    console.log(`📊 Stats parrainage pour ${playerNumber}: ${validatedCount} filleul(s) validé(s)`);
+    
+    return { 
+      success: true, 
+      validated_sponsored: validatedCount,
+      message: validatedCount > 0 ? 
+        `${validatedCount} filleul(s) validé(s)` : 
+        "Aucun filleul validé pour le moment"
+    };
+  } catch (error) {
+    console.error('Erreur récupération stats parrainage:', error);
+    return { success: false, message: "Erreur serveur" };
+  }
+},
 
   async getAllSponsorships() {
     try {
@@ -3859,3 +3842,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
