@@ -2813,12 +2813,13 @@ async function handleAdminMessage(ws, message, adminId) {
   };
   
   if (handlers[message.type]) {
-  await handlers[message.type]();
-} else {
-  ws.send(JSON.stringify({ 
-    type: 'error', 
-    message: 'Commande admin inconnue' 
-  }));
+    await handlers[message.type]();
+  } else {
+    ws.send(JSON.stringify({ 
+      type: 'error', 
+      message: 'Commande admin inconnue' 
+    }));
+  }
 }
 
 // HANDLERS CLIENT
@@ -3786,5 +3787,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-
