@@ -2617,30 +2617,31 @@ async function handleAdminMessage(ws, message, adminId) {
     },
 
     admin_reset_sponsorship_counters: async () => {
-      try {
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
+  try {
+    if (message.admin_key !== ADMIN_KEY) {
+      return ws.send(JSON.stringify({ 
+        type: 'error', 
+        message: 'Clé admin invalide' 
+      }));
+    }
 
-        const result = await db.resetSponsorshipCounters();
-        
-        ws.send(JSON.stringify({
-          type: 'admin_reset_sponsorship_counters',
-          success: result.success,
-          message: result.message
-        }));
-      } catch (error) {
-        console.error('Erreur reset compteurs parrainage admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_reset_sponsorship_counters', 
-          success: false, 
-          message: 'Erreur réinitialisation' 
-        }));
-      }
-    },
+    const result = await db.resetSponsorshipCounters();
+    
+    ws.send(JSON.stringify({
+      type: 'admin_reset_sponsorship_counters',
+      success: result.success,
+      message: result.message,
+      reset_date: result.reset_date
+    }));
+  } catch (error) {
+    console.error('Erreur reset compteurs parrainage admin:', error);
+    ws.send(JSON.stringify({ 
+      type: 'admin_reset_sponsorship_counters', 
+      success: false, 
+      message: 'Erreur réinitialisation' 
+    }));
+  }
+},
 
     admin_force_sponsorship_scan: async () => {
       try {
@@ -3977,5 +3978,6 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
 
 
