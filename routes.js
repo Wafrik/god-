@@ -7,7 +7,7 @@ function configureRoutes(app, db, pool, constants, PLAYER_CONNECTIONS, PLAYER_QU
   // Route pour obtenir un bot aléatoire
   router.get('/get-bot', async (req, res) => {
     try {
-      const bot = getRandomBot(constants.BOTS, BOT_SCORES);
+      const bot = getRandomBot(BOTS, BOT_SCORES);
       
       const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
       const userAgent = req.headers['user-agent'] || 'unknown';
@@ -49,7 +49,7 @@ function configureRoutes(app, db, pool, constants, PLAYER_CONNECTIONS, PLAYER_QU
       
       if (!isDraw) {
         const botResult = await pool.query('SELECT score FROM bot_scores WHERE bot_id = $1', [botId]);
-        const currentBotScore = botResult.rows[0]?.score || constants.BOTS.find(b => b.id === botId)?.baseScore || 100;
+        const currentBotScore = botResult.rows[0]?.score || BOTS.find(b => b.id === botId)?.baseScore || 100;
         
         const botUpdateSuccess = await updateBotScore(botId, currentBotScore, isBotWin, botScore, pool, BOT_SCORES, constants);
         
@@ -149,7 +149,7 @@ function configureRoutes(app, db, pool, constants, PLAYER_CONNECTIONS, PLAYER_QU
   router.get('/matchmaking-config', (req, res) => {
     res.json({
       success: true,
-      config: constants.MATCHMAKING_CONFIG,
+      config: MATCHMAKING_CONFIG,
       thresholds: {
         high_score: constants.HIGH_SCORE_THRESHOLD,
         low_score: constants.LOW_SCORE_THRESHOLD,
@@ -352,7 +352,7 @@ function configureRoutes(app, db, pool, constants, PLAYER_CONNECTIONS, PLAYER_QU
     try {
       const recentMatchesResult = await pool.query(`
         SELECT COUNT(*) as count FROM recent_matches 
-        WHERE match_timestamp > NOW() - INTERVAL '${constants.MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
+        WHERE match_timestamp > NOW() - INTERVAL '${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
       `);
       
       res.json({
@@ -367,7 +367,7 @@ function configureRoutes(app, db, pool, constants, PLAYER_CONNECTIONS, PLAYER_QU
           recent_matches_in_db: parseInt(recentMatchesResult.rows[0].count)
         },
         matchmaking: {
-          config: constants.MATCHMAKING_CONFIG,
+          config: MATCHMAKING_CONFIG,
           thresholds: {
             high_score: constants.HIGH_SCORE_THRESHOLD,
             low_score: constants.LOW_SCORE_THRESHOLD
@@ -510,11 +510,11 @@ function configureRoutes(app, db, pool, constants, PLAYER_CONNECTIONS, PLAYER_QU
     res.status(200).json({ 
       status: 'OK', 
       database: 'PostgreSQL', 
-      total_bots: constants.BOTS.length,
+      total_bots: BOTS.length,
       bot_deposit: constants.BOT_DEPOSIT,
       pvp_quit_penalty: constants.PVP_QUIT_PENALTY,
       active_deposits: BOT_DEPOSITS.size,
-      matchmaking_config: constants.MATCHMAKING_CONFIG,
+      matchmaking_config: MATCHMAKING_CONFIG,
       score_thresholds: {
         high: constants.HIGH_SCORE_THRESHOLD,
         low: constants.LOW_SCORE_THRESHOLD,
