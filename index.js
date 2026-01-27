@@ -2270,8 +2270,11 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
+    // ⭐⭐ HANDLER MANQUANT AJOUTÉ ICI ⭐⭐
     admin_get_full_list: async () => {
       try {
+        console.log("🎯 admin_get_full_list appelé");
+        
         if (message.admin_key !== ADMIN_KEY) {
           return ws.send(JSON.stringify({ 
             type: 'error', 
@@ -2287,12 +2290,15 @@ async function handleAdminMessage(ws, message, adminId) {
           data: fullList,
           count: fullList.length
         }));
+        
+        console.log(`✅ admin_full_list envoyé: ${fullList.length} éléments`);
+        
       } catch (error) {
-        console.error('Erreur liste complète admin:', error);
+        console.error('❌ Erreur admin_get_full_list:', error);
         ws.send(JSON.stringify({ 
           type: 'admin_full_list', 
           success: false, 
-          message: 'Erreur liste complète' 
+          message: 'Erreur serveur' 
         }));
       }
     },
@@ -2813,11 +2819,15 @@ async function handleAdminMessage(ws, message, adminId) {
   };
   
   if (handlers[message.type]) {
+    console.log(`🔄 Exécution du handler: ${message.type}`);
     await handlers[message.type]();
+    console.log(`✅ Handler ${message.type} terminé`);
   } else {
+    console.log(`❌ Handler NON TROUVÉ pour: ${message.type}`);
+    console.log(`   Handlers disponibles:`, Object.keys(handlers));
     ws.send(JSON.stringify({ 
       type: 'error', 
-      message: 'Commande admin inconnue' 
+      message: 'Commande admin inconnue: ' + message.type 
     }));
   }
 }
@@ -3762,6 +3772,7 @@ async function startServer() {
       console.log(`   • Suppression compte avec liste noire`);
       console.log(`   • Ajustement manuel compteur parrainage`);
       console.log(`   • Gestion liste noire complète`);
+      console.log(`⭐ HANDLER admin_get_full_list AJOUTÉ !`);
       console.log(`=========================================`);
     });
   } catch (error) {
