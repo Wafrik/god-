@@ -2271,31 +2271,31 @@ async function handleAdminMessage(ws, message, adminId) {
     },
 
     admin_get_full_list: async () => {
-      try {
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
+  try {
+    if (message.admin_key !== ADMIN_KEY) {
+      return ws.send(JSON.stringify({ 
+        type: 'error', 
+        message: 'Clé admin invalide' 
+      }));
+    }
 
-        const fullList = await db.getFullListWithBots();
-        
-        ws.send(JSON.stringify({
-          type: 'admin_full_list',
-          success: true,
-          data: fullList,
-          count: fullList.length
-        }));
-      } catch (error) {
-        console.error('Erreur liste complète admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_full_list', 
-          success: false, 
-          message: 'Erreur liste complète' 
-        }));
-      }
-    },
+    const fullList = await db.getFullListWithBots();
+    
+    ws.send(JSON.stringify({
+      type: 'admin_full_list',
+      success: true,
+      data: fullList,
+      count: fullList.length
+    }));
+  } catch (error) {
+    console.error('Erreur liste complète admin:', error);
+    ws.send(JSON.stringify({ 
+      type: 'admin_full_list', 
+      success: false, 
+      message: 'Erreur liste complète' 
+    }));
+  }
+},
 
     admin_reset_scores: async () => {
       try {
@@ -3787,3 +3787,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
