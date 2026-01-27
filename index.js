@@ -703,119 +703,85 @@ const db = {
   },
 
   async getFullListWithBots() {
-    try {
-      const playersResult = await pool.query(`
-        SELECT 
-          u.number as id, 
-          u.username, 
-          u.score, 
-          u.age, 
-          u.number, 
-          u.password,
-          u.created_at, 
-          u.online, 
-          false as is_bot,
-          RANK() OVER (ORDER BY u.score DESC) as rank,
-          sp.sponsor_number,
-          sp_user.username as sponsor_username,
-          sp.is_validated,
-          COALESCE(ss.validated_sponsored, 0) as total_sponsored,
-          (
-            SELECT COALESCE(COUNT(*), 0)
-            FROM sponsorship_validated_history vh
-            LEFT JOIN (
-              SELECT MAX(reset_date) as last_reset 
-              FROM admin_resets 
-              WHERE reset_type = 'sponsorship_counters'
-            ) r ON 1=1
-            WHERE vh.sponsor_number = u.number
-            AND (r.last_reset IS NULL OR vh.validated_at >= r.last_reset)
-          ) as validated_sponsored
-        FROM users u 
-        LEFT JOIN sponsorships sp ON u.number = sp.sponsored_number
-        LEFT JOIN users sp_user ON sp.sponsor_number = sp_user.number
-        LEFT JOIN sponsorship_stats ss ON u.number = ss.player_number
-        WHERE u.score >= 0 
-      `);
-      
-      const botsResult = await pool.query(`
-        SELECT 
-          bs.bot_id as id, 
-          COALESCE(b.username, bp.username) as username, 
-          bs.score, 
-          'adv' as number, 
-          0 as age, 
-          '' as password,
-          COALESCE(bp.created_at, NOW()) as created_at, 
-          false as online, 
-          true as is_bot,
-          RANK() OVER (ORDER BY bs.score DESC) as rank,
-          NULL as sponsor_number,
-          NULL as sponsor_username,
-          NULL as is_validated,
-          0 as total_sponsored,
-          0 as validated_sponsored
-        FROM bot_scores bs 
-        LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
-        LEFT JOIN bot_profiles b ON bs.bot_id = b.id
-      `).catch(() => ({ rows: [] }));
-      
-      const combinedList = [];
-      
-      playersResult.rows.forEach(player => {
-        combinedList.push({
-          id: player.id,
-          username: player.username,
-          score: player.score,
-          rank: player.rank,
-          age: player.age,
-          number: player.number,
-          password: player.password,
-          created_at: player.created_at,
-          online: player.online,
-          is_bot: false,
-          has_sponsor: !!player.sponsor_number,
-          sponsor_username: player.sponsor_username || "",
-          sponsor_number: player.sponsor_number || "",
-          is_sponsorship_validated: player.is_validated || false,
-          total_sponsored: player.total_sponsored || 0,
-          validated_sponsored: player.validated_sponsored || 0
-        });
+  try {
+    // 1. Récupérer les joueurs SIMPLES
+    const playersResult = await pool.query(`
+      SELECT 
+        number as id, 
+        username, 
+        score, 
+        age, 
+        number, 
+        password,
+        created_at, 
+        online, 
+        false as is_bot
+      FROM users 
+      WHERE score >= 0 
+      ORDER BY score DESC
+    `);
+    
+    // 2. Récupérer les bots SIMPLES
+    const botsResult = await pool.query(`
+      SELECT 
+        bs.bot_id as id,
+        COALESCE(bp.username, bs.bot_id) as username,
+        bs.score,
+        'adv' as number,
+        0 as age,
+        '' as password,
+        NOW() as created_at,
+        false as online,
+        true as is_bot
+      FROM bot_scores bs
+      LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
+      ORDER BY bs.score DESC
+    `).catch(() => ({ rows: [] }));
+    
+    // 3. Combiner
+    let combinedList = [];
+    
+    // Joueurs avec rank
+    playersResult.rows.forEach((player, index) => {
+      combinedList.push({
+        ...player,
+        rank: index + 1,
+        sponsor_username: "",
+        sponsor_number: "",
+        is_sponsorship_validated: false,
+        total_sponsored: 0,
+        validated_sponsored: 0
       });
-      
-      botsResult.rows.forEach(bot => {
-        combinedList.push({
-          id: bot.id,
-          username: bot.username,
-          score: bot.score,
-          rank: bot.rank,
-          age: bot.age,
-          number: bot.number,
-          password: bot.password,
-          created_at: bot.created_at,
-          online: bot.online,
-          is_bot: true,
-          has_sponsor: false,
-          sponsor_username: "",
-          sponsor_number: "",
-          is_sponsorship_validated: false,
-          total_sponsored: 0,
-          validated_sponsored: 0
-        });
+    });
+    
+    // Bots avec rank continu
+    botsResult.rows.forEach((bot, index) => {
+      combinedList.push({
+        ...bot,
+        rank: playersResult.rows.length + index + 1,
+        sponsor_username: "",
+        sponsor_number: "",
+        is_sponsorship_validated: false,
+        total_sponsored: 0,
+        validated_sponsored: 0
       });
-      
-      combinedList.sort((a, b) => b.score - a.score);
-      
-      combinedList.forEach((item, index) => {
-        item.rank = index + 1;
-      });
-      
-      return combinedList;
-    } catch (error) {
-      console.error('Erreur liste complète avec adversaires et parrainage:', error);
-      return [];
-    }
-  },
+    });
+    
+    // 4. Trier par score (au cas où)
+    combinedList.sort((a, b) => b.score - a.score);
+    
+    // 5. Recalculer les ranks
+    combinedList.forEach((item, index) => {
+      item.rank = index + 1;
+    });
+    
+    return combinedList;
+    
+  } catch (error) {
+    console.error('❌ Erreur getFullListWithBots:', error);
+    return [];
+  }
+}
   
   async resetSponsorshipCounters() {
     try {
@@ -3787,3 +3753,4 @@ process.on('SIGINT', () => {
 });
 
 startServer();
+
