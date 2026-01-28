@@ -722,12 +722,27 @@ const db = {
   async getPlayersList() {
     try {
       const result = await pool.query(`
-        SELECT number as id, username, score, age, number, password,
-               created_at, online, 
-               RANK() OVER (ORDER BY score DESC) as rank
-        FROM users 
-        WHERE score >= 0 
-        ORDER BY score DESC
+        SELECT 
+          u.number as id, 
+          u.username, 
+          u.score, 
+          u.age, 
+          u.number, 
+          u.password,
+          u.created_at, 
+          u.online, 
+          RANK() OVER (ORDER BY u.score DESC) as rank,
+          sp.sponsor_number,
+          sp_user.username as sponsor_username,
+          sp.is_validated,
+          COALESCE(ss.total_sponsored, 0) as total_sponsored,
+          COALESCE(ss.validated_sponsored, 0) as validated_sponsored
+        FROM users u 
+        LEFT JOIN sponsorships sp ON u.number = sp.sponsored_number
+        LEFT JOIN users sp_user ON sp.sponsor_number = sp_user.number
+        LEFT JOIN sponsorship_stats ss ON u.number = ss.player_number
+        WHERE u.score >= 0 
+        ORDER BY u.score DESC
       `);
       
       return result.rows.map(player => ({
@@ -739,7 +754,14 @@ const db = {
         number: player.number,
         password: player.password,
         created_at: player.created_at,
-        online: player.online
+        online: player.online,
+        is_bot: false,
+        has_sponsor: !!player.sponsor_number,
+        sponsor_username: player.sponsor_username || "",
+        sponsor_number: player.sponsor_number || "",
+        is_sponsorship_validated: player.is_validated || false,
+        total_sponsored: player.total_sponsored || 0,
+        validated_sponsored: player.validated_sponsored || 0
       }));
     } catch (error) {
       console.error('Erreur liste joueurs:', error);
@@ -1203,6 +1225,59 @@ const db = {
     } catch (error) {
       console.error('Erreur récupération historique validations:', error);
       return [];
+    }
+  },
+
+  async adjustSponsorshipCounter(playerNumber, adjustment) {
+    try {
+      const player = await this.getUserByNumber(playerNumber);
+      if (!player) {
+        return { success: false, message: "Joueur non trouvé" };
+      }
+      
+      const statsResult = await pool.query(
+        'SELECT total_sponsored, validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
+        [playerNumber]
+      );
+      
+      let oldTotal = 0;
+      let oldValidated = 0;
+      
+      if (statsResult.rows.length > 0) {
+        oldTotal = statsResult.rows[0].total_sponsored;
+        oldValidated = statsResult.rows[0].validated_sponsored;
+      }
+      
+      const newValidated = Math.max(0, oldValidated + adjustment);
+      
+      if (statsResult.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
+           VALUES ($1, $2, $3)`,
+          [playerNumber, Math.max(oldTotal, newValidated), newValidated]
+        );
+      } else {
+        await pool.query(
+          `UPDATE sponsorship_stats 
+           SET validated_sponsored = $1,
+               total_sponsored = GREATEST(total_sponsored, $1),
+               last_updated = CURRENT_TIMESTAMP
+           WHERE player_number = $2`,
+          [newValidated, playerNumber]
+        );
+      }
+      
+      return {
+        success: true,
+        player_number: playerNumber,
+        username: player.username,
+        old_value: oldValidated,
+        new_value: newValidated,
+        adjustment: adjustment
+      };
+    } catch (error) {
+      console.error('Erreur ajustement compteur parrainage:', error);
+      return { success: false, message: "Erreur serveur" };
     }
   }
 };
@@ -2135,6 +2210,47 @@ async function handleAdminMessage(ws, message, adminId) {
           type: 'admin_update_bot_score', 
           success: false, 
           message: 'Erreur mise à jour score adversaire' 
+        }));
+      }
+    },
+
+    admin_adjust_sponsorship_counter: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const { player_number, adjustment } = message;
+        
+        if (!player_number || adjustment === undefined) {
+          return ws.send(JSON.stringify({
+            type: 'admin_adjust_sponsorship',
+            success: false,
+            message: 'Données manquantes'
+          }));
+        }
+
+        const result = await db.adjustSponsorshipCounter(player_number, parseInt(adjustment));
+        
+        ws.send(JSON.stringify({
+          type: 'admin_adjust_sponsorship',
+          success: result.success,
+          message: result.message || 'Compteur parrainage mis à jour',
+          player_number: result.player_number,
+          username: result.username,
+          old_value: result.old_value,
+          new_value: result.new_value,
+          adjustment: result.adjustment
+        }));
+      } catch (error) {
+        console.error('Erreur ajustement parrainage admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_adjust_sponsorship', 
+          success: false, 
+          message: 'Erreur ajustement parrainage' 
         }));
       }
     },
