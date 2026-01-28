@@ -28,11 +28,12 @@ const SPONSOR_MIN_SCORE = 2000;
 const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000;
 const LOBBY_TIMEOUT = 30000;
 const AUTO_MOVE_BONUS = 200;
+const SPONSORSHIP_FILTER_DATE = '2026-01-26'; // Date de filtre pour les parrainages
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
   anti_quick_rematch: true,
-  min_rematch_delay: 50 * 60 * 1000, // 50 minutes par défaut
+  min_rematch_delay: 50 * 60 * 1000,
 };
 
 const UPDATE_CONFIG = {
@@ -107,7 +108,6 @@ const generateDeviceKey = (ip, deviceId) => {
   return `${ip}_${deviceId}`;
 };
 
-// FONCTIONS PERSISTANTES POUR ANTI-MATCH RAPIDE
 async function canMatchPlayers(player1Number, player2Number) {
   if (!MATCHMAKING_CONFIG.anti_quick_rematch) {
     return { canMatch: true, reason: "Anti-quick-rematch désactivé" };
@@ -173,8 +173,6 @@ async function recordMatch(player1Number, player2Number) {
       ON CONFLICT (player1_number, player2_number) 
       DO UPDATE SET match_timestamp = NOW()
     `, [player1Number, player2Number]);
-    
-    console.log(`📝 Match enregistré dans DB: ${player1Number} vs ${player2Number}`);
   } catch (error) {
     console.error('Erreur enregistrement match:', error);
   }
@@ -247,13 +245,12 @@ async function loadBotScores() {
       BOT_SCORES.set(row.bot_id, row.score);
     });
   } catch (error) {
-    // Ignorer si table non existante
   }
 }
 
 async function scanAndValidateAllSponsorships() {
   try {
-    console.log('🔍 Démarrage scan global des parrainages (anti-revalidation)...');
+    console.log('🔍 Démarrage scan global des parrainages...');
     
     const result = await pool.query(`
       SELECT 
@@ -311,7 +308,6 @@ async function scanAndValidateAllSponsorships() {
       );
       
       console.log(`✅ Parrainage validé par scan: ${sponsorUsername} → ${sponsoredUsername}`);
-      console.log(`   Score: ${sponsoredScore} points | +1 ajouté au compteur | Ajouté à l'historique`);
       
       validatedCount++;
       
@@ -378,7 +374,6 @@ async function validateSponsorshipsWhenScoreReached(playerNumber, newScore) {
         );
         
         console.log(`✅ NOUVEAU parrainage validé: ${sponsorship.sponsor_number} → ${sponsorship.sponsored_number}`);
-        console.log(`   +1 ajouté au compteur (score atteint: ${newScore}) | Ajouté à l'historique`);
         
         const sponsorWs = PLAYER_CONNECTIONS.get(sponsorship.sponsor_number);
         if (sponsorWs && sponsorWs.readyState === WebSocket.OPEN) {
@@ -424,22 +419,17 @@ const db = {
   },
 
   async updateUserScore(number, newScore) {
-    console.log(`🔄 updateUserScore(${number}, ${newScore}) appelé`);
-    
     await pool.query(
       'UPDATE users SET score = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
       [newScore, number]
     );
     
-    console.log(`   Validation parrainage pour ${number} (score: ${newScore})`);
     await validateSponsorshipsWhenScoreReached(number, newScore);
   },
 
   async applyBotDeposit(playerNumber) {
     try {
-      // VÉRIFICATION CRITIQUE : Joueur déjà dans un jeu ?
       if (PLAYER_TO_GAME.has(playerNumber)) {
-        console.log(`🚨 applyBotDeposit: ${playerNumber} déjà dans un jeu !`);
         return { success: false, message: "Déjà dans une partie" };
       }
       
@@ -457,14 +447,12 @@ const db = {
       const existingDeposit = BOT_DEPOSITS.get(playerNumber);
       if (existingDeposit) {
         console.log(`⚠️ Dépôt existant trouvé pour ${playerNumber}: ${existingDeposit.depositAmount} points`);
-        console.log(`   Le joueur perd ce dépôt car il demande un nouveau match`);
       }
       
       const newScore = player.score - depositAmount;
       await this.updateUserScore(playerNumber, newScore);
       
       console.log(`💰 Nouveau dépôt caution: ${player.username} (-${depositAmount} points)`);
-      console.log(`   Score avant: ${player.score}, Score après: ${newScore}`);
       
       return { 
         success: true, 
@@ -499,7 +487,6 @@ const db = {
       BOT_DEPOSITS.delete(playerNumber);
       
       console.log(`💰 Caution rendue: ${player.username} (+${refundAmount} points)`);
-      console.log(`   Score avant: ${player.score}, Score après: ${newScore}`);
       
       return { 
         success: true, 
@@ -549,14 +536,11 @@ const db = {
       
       if (isWin) {
         newScore = currentScore + playerGameScore + 200;
-        console.log(`🏆 [ADVERSAIRE MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
-          console.log(`🔥 [ADVERSAIRE MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
         } else {
           newScore = Math.max(0, currentScore - playerGameScore);
-          console.log(`😢 [ADVERSAIRE MATCH] Défaite (<10k) ${player.username}: ${currentScore} - ${playerGameScore} = ${newScore}`);
         }
       }
       
@@ -564,7 +548,6 @@ const db = {
       
       if (deposit) {
         BOT_DEPOSITS.delete(playerNumber);
-        console.log(`💰 Dépôt de ${depositAmount} points intégré au calcul`);
       }
       
       return true;
@@ -705,8 +688,6 @@ const db = {
 
   async updatePlayerScoreById(playerId, points, operation) {
     try {
-      console.log(`📝 updatePlayerScoreById(${playerId}, ${points}, ${operation}) appelé`);
-      
       if (!playerId) return { success: false, message: "ID joueur manquant" };
       
       const player = await pool.query('SELECT * FROM users WHERE number = $1', [playerId]);
@@ -722,8 +703,6 @@ const db = {
       } else {
         return { success: false, message: "Opération invalide" };
       }
-      
-      console.log(`   Ancien score: ${currentScore}, Nouveau score: ${newScore}`);
       
       await this.updateUserScore(playerId, newScore);
       
@@ -977,7 +956,6 @@ const db = {
         );
         
         console.log(`✅ Parrainage créé et VALIDÉ IMMÉDIATEMENT: ${sponsorNumber} → ${sponsoredNumber}`);
-        console.log(`   +1 ajouté au compteur (score actuel: ${sponsoredScore} points) | Ajouté à l'historique`);
       } else {
         await pool.query(
           `INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored) 
@@ -988,7 +966,6 @@ const db = {
         );
         
         console.log(`🤝 Parrainage créé (en attente): ${sponsorNumber} → ${sponsoredNumber}`);
-        console.log(`   Score filleul: ${sponsoredScore} points (attente ${SPONSOR_MIN_SCORE})`);
       }
       
       return { 
@@ -1064,6 +1041,41 @@ const db = {
       };
     } catch (error) {
       console.error('Erreur récupération stats parrainage:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  // NOUVELLE FONCTION : Récupérer les parrainages validés depuis une date
+  async getValidatedSponsorshipsSince(playerNumber, sinceDate = SPONSORSHIP_FILTER_DATE) {
+    try {
+      const result = await pool.query(`
+        SELECT 
+          u.username as sponsored_username,
+          u.score as sponsored_score,
+          s.validated_at,
+          sp.username as sponsor_username
+        FROM sponsorships s
+        JOIN users u ON s.sponsored_number = u.number
+        JOIN users sp ON s.sponsor_number = sp.number
+        WHERE s.sponsor_number = $1 
+          AND s.is_validated = true
+          AND s.validated_at >= $2::date
+        ORDER BY s.validated_at DESC
+      `, [playerNumber, sinceDate]);
+      
+      return {
+        success: true,
+        since_date: sinceDate,
+        count: result.rows.length,
+        sponsorships: result.rows.map(row => ({
+          sponsored_username: row.sponsored_username,
+          sponsored_score: row.sponsored_score,
+          validated_at: row.validated_at,
+          sponsor_username: row.sponsor_username
+        }))
+      };
+    } catch (error) {
+      console.error('Erreur récupération parrainages validés:', error);
       return { success: false, message: "Erreur serveur" };
     }
   },
@@ -1154,7 +1166,6 @@ const db = {
   }
 };
 
-// CLASSE GAME
 class Game {
   constructor(id, p1, p2) {
     Object.assign(this, {
@@ -1168,29 +1179,23 @@ class Game {
       autoMoveUsed: { player1: false, player2: false }
     });
     
-    // VÉRIFICATION CRITIQUE : Les joueurs ne sont pas déjà dans un autre jeu
     if (PLAYER_TO_GAME.has(p1.number) || PLAYER_TO_GAME.has(p2.number)) {
       console.log(`🚨 ERREUR CRITIQUE: Un joueur déjà dans un jeu lors de la création du lobby ${id}`);
-      console.log(`   ${p1.username} (${p1.number}) dans jeu ? ${PLAYER_TO_GAME.has(p1.number)}`);
-      console.log(`   ${p2.username} (${p2.number}) dans jeu ? ${PLAYER_TO_GAME.has(p2.number)}`);
       throw new Error('Un joueur est déjà dans un jeu');
     }
     
     [p1, p2].forEach((p, i) => {
       const player = {...p, ws: PLAYER_CONNECTIONS.get(p.number), role: i === 0 ? 'player1' : 'player2'};
       this.players.push(player);
-      PLAYER_TO_GAME.set(p.number, id); // Une seule fois ici
+      PLAYER_TO_GAME.set(p.number, id);
     });
     
     ACTIVE_GAMES.set(id, this);
     PENDING_LOBBIES.set(id, this);
     
-    // Enregistrer le match dans la base persistante
     recordMatch(p1.number, p2.number);
     
     console.log(`🎮 Nouveau lobby créé: ${this.id}`);
-    console.log(`   Joueurs: ${p1.username} vs ${p2.username}`);
-    console.log(`   Lobbys actifs: ${PENDING_LOBBIES.size}, Parties actives: ${ACTIVE_GAMES.size}`);
     
     this.lobbyTimeout = setTimeout(() => {
       if (this.phase === 'waiting' && this.status === 'lobby') {
@@ -1268,8 +1273,7 @@ class Game {
         this.lobbyTimeout = null;
       }
       
-      console.log(`🎲 Début de partie ${this.id}: ${this.players[0].username} vs ${this.players[1].username}`);
-      console.log(`   Lobbys en attente: ${PENDING_LOBBIES.size}, Parties en cours: ${ACTIVE_GAMES.size - PENDING_LOBBIES.size}`);
+      console.log(`🎲 Début de partie ${this.id}`);
       
       this.broadcast({ type: 'game_start' });
       this.broadcastGameState();
@@ -1455,8 +1459,6 @@ class Game {
         const newRemainingScore = remainingUser.score + (remainingScore < 15 ? 15 : remainingScore) + AUTO_MOVE_BONUS;
         
         console.log(`💰 Bonus +${AUTO_MOVE_BONUS} points pour ${remainingPlayer.username} (adversaire a quitté)`);
-        console.log(`   Score ${remainingPlayer.username}: ${remainingUser.score} → ${newRemainingScore}`);
-        console.log(`   Score ${disconnectedPlayer.username}: ${disconnectedUser.score} → ${newDisconnectedScore}`);
         
         await db.updateUserScore(disconnectedPlayer.number, newDisconnectedScore);
         await db.updateUserScore(remainingPlayer.number, newRemainingScore);
@@ -1521,14 +1523,11 @@ class Game {
           
           if (winner === player.role) {
             newScore = user.score + totalScore + 200;
-            console.log(`🏆 ${player.number} gagne: ${user.score} + ${totalScore} + 200 = ${newScore}`);
           } else {
             if (isHighScore) {
               newScore = Math.max(0, user.score - totalScore - 200);
-              console.log(`🔥 ${player.number} perd (≥10k): ${user.score} - ${totalScore} - 200 = ${newScore}`);
             } else {
               newScore = Math.max(0, user.score - totalScore);
-              console.log(`😢 ${player.number} perd (<10k): ${user.score} - ${totalScore} = ${newScore}`);
             }
           }
           
@@ -1552,7 +1551,6 @@ class Game {
     ACTIVE_GAMES.delete(this.id);
     
     console.log(`🗑️  Nettoyage partie ${this.id}`);
-    console.log(`   Lobbys restants: ${PENDING_LOBBIES.size}, Parties actives: ${ACTIVE_GAMES.size}`);
   }
 
   getPlayerByNumber(n) { 
@@ -1560,38 +1558,30 @@ class Game {
   }
 }
 
-// FONCTION DE MATCHMAKING AMÉLIORÉE AVEC VÉRIFICATION DE DOUBLON
 async function findBestMatchFromQueue() {
   if (PLAYER_QUEUE.size < 2) {
-    console.log(`📊 File d'attente: ${PLAYER_QUEUE.size} joueur(s) - Pas assez pour un match`);
     return null;
   }
   
   const players = Array.from(PLAYER_QUEUE);
-  console.log(`📊 Analyse file d'attente: ${players.length} joueurs`);
   
-  // FILTRE CRITIQUE: Éliminer les joueurs déjà dans un jeu/lobby
   const availablePlayers = players.filter(playerNumber => !PLAYER_TO_GAME.has(playerNumber));
   
   if (availablePlayers.length !== players.length) {
     const alreadyInGame = players.length - availablePlayers.length;
     console.log(`⚠️ ${alreadyInGame} joueur(s) déjà dans un jeu/lobby, ignorés de la file`);
     
-    // Nettoyer la file d'attente des joueurs déjà dans un jeu
     players.forEach(playerNumber => {
       if (PLAYER_TO_GAME.has(playerNumber)) {
         PLAYER_QUEUE.delete(playerNumber);
-        console.log(`🧹 Suppression de la file: ${playerNumber} (déjà dans un jeu)`);
       }
     });
   }
   
   if (availablePlayers.length < 2) {
-    console.log(`❌ Pas assez de joueurs disponibles pour un match (${availablePlayers.length} disponible(s))`);
     return null;
   }
   
-  // Récupérer les scores de tous les joueurs disponibles
   const playersWithScores = [];
   for (const playerNumber of availablePlayers) {
     const user = await db.getUserByNumber(playerNumber);
@@ -1604,7 +1594,6 @@ async function findBestMatchFromQueue() {
     }
   }
   
-  // Trouver TOUTES les paires possibles
   const possiblePairs = [];
   
   for (let i = 0; i < playersWithScores.length - 1; i++) {
@@ -1612,22 +1601,17 @@ async function findBestMatchFromQueue() {
       const player1 = playersWithScores[i];
       const player2 = playersWithScores[j];
       
-      // VÉRIFICATION: Pas déjà dans un jeu (double vérification)
       if (PLAYER_TO_GAME.has(player1.number) || PLAYER_TO_GAME.has(player2.number)) {
-        console.log(`⛔ Double vérification échouée: ${player1.number} ou ${player2.number} déjà dans un jeu`);
         continue;
       }
       
-      // Vérifier l'écart de score
       const scoreGapBlocked = (player1.score >= HIGH_SCORE_THRESHOLD && player2.score < LOW_SCORE_THRESHOLD) ||
                               (player2.score >= HIGH_SCORE_THRESHOLD && player1.score < LOW_SCORE_THRESHOLD);
       
       if (scoreGapBlocked) {
-        console.log(`⛔ Bloqué écart score: ${player1.username} (${player1.score}) vs ${player2.username} (${player2.score})`);
         continue;
       }
       
-      // Vérifier match récent
       const matchCheck = await canMatchPlayers(player1.number, player2.number);
       
       if (matchCheck.canMatch) {
@@ -1640,52 +1624,35 @@ async function findBestMatchFromQueue() {
           player1Name: player1.username,
           player2Name: player2.username
         });
-        console.log(`✅ Match possible: ${player1.username} (${player1.score}) vs ${player2.username} (${player2.score})`);
-      } else {
-        console.log(`⏳ Match bloqué: ${player1.username} vs ${player2.username} - ${matchCheck.reason}`);
       }
     }
   }
   
-  // Si aucune paire possible
   if (possiblePairs.length === 0) {
-    console.log(`❌ Aucune paire possible trouvée parmi ${playersWithScores.length} joueurs disponibles`);
     return null;
   }
   
-  // Choisir la meilleure paire (la plus petite différence de score)
   possiblePairs.sort((a, b) => a.scoreDiff - b.scoreDiff);
   const bestPair = possiblePairs[0];
   
-  // TRIPLE VÉRIFICATION: S'assurer que les joueurs ne sont toujours pas dans un jeu
   if (PLAYER_TO_GAME.has(bestPair.player1) || PLAYER_TO_GAME.has(bestPair.player2)) {
     console.log(`🚨 ALERTE: ${bestPair.player1Name} ou ${bestPair.player2Name} a rejoint un jeu entre-temps!`);
-    console.log(`   Annulation du match pour éviter les doublons`);
     
-    // Retirer ces joueurs de la file s'ils sont dans un jeu
     if (PLAYER_TO_GAME.has(bestPair.player1)) {
       PLAYER_QUEUE.delete(bestPair.player1);
-      console.log(`   ${bestPair.player1Name} retiré de la file (déjà dans jeu)`);
     }
     if (PLAYER_TO_GAME.has(bestPair.player2)) {
       PLAYER_QUEUE.delete(bestPair.player2);
-      console.log(`   ${bestPair.player2Name} retiré de la file (déjà dans jeu)`);
     }
     
     return null;
   }
-  
-  console.log(`🎯 Meilleur match sélectionné: ${bestPair.player1Name} vs ${bestPair.player2Name}`);
-  console.log(`   Différence de score: ${bestPair.scoreDiff}`);
-  console.log(`   Joueurs disponibles confirmés`);
   
   return [bestPair.player1, bestPair.player2];
 }
 
-// INITIALISATION DE LA BASE DE DONNÉES
 async function initializeDatabase() {
   try {
-    // Table users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -1701,7 +1668,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table trusted_devices
     await pool.query(`
       CREATE TABLE IF NOT EXISTS trusted_devices (
         id SERIAL PRIMARY KEY,
@@ -1711,7 +1677,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table recent_matches (PERSISTANTE pour anti-match rapide)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS recent_matches (
         id SERIAL PRIMARY KEY,
@@ -1723,7 +1688,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table bot_profiles
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profiles (
         id VARCHAR(50) PRIMARY KEY,
@@ -1734,7 +1698,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table bot_scores
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_scores (
         id SERIAL PRIMARY KEY,
@@ -1746,7 +1709,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table sponsorships
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sponsorships (
         id SERIAL PRIMARY KEY,
@@ -1760,7 +1722,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table sponsorship_stats
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sponsorship_stats (
         id SERIAL PRIMARY KEY,
@@ -1772,7 +1733,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table sponsorship_validated_history
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sponsorship_validated_history (
         id SERIAL PRIMARY KEY,
@@ -1784,7 +1744,6 @@ async function initializeDatabase() {
       )
     `);
 
-    // Créer un index pour les recherches rapides dans recent_matches
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_recent_matches_timestamp 
       ON recent_matches(match_timestamp)
@@ -1795,7 +1754,6 @@ async function initializeDatabase() {
       ON recent_matches(player1_number, player2_number)
     `);
 
-    // Insérer les bots
     for (const bot of BOTS) {
       await pool.query(`
         INSERT INTO bot_profiles (id, username, gender, base_score) 
@@ -1813,7 +1771,7 @@ async function initializeDatabase() {
       `, [bot.id, bot.baseScore]);
     }
 
-    console.log('✅ Base de données initialisée avec système anti-match persistant');
+    console.log('✅ Base de données initialisée');
 
   } catch (error) {
     console.error('Erreur init DB:', error);
@@ -1832,7 +1790,6 @@ async function loadTrustedDevices() {
   }
 }
 
-// WEBSOCKET CONNECTION
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   let deviceId = "unknown";
@@ -1898,7 +1855,6 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// HANDLERS ADMIN
 async function handleAdminMessage(ws, message, adminId) {
   
   const handlers = {
@@ -2299,7 +2255,6 @@ async function handleAdminMessage(ws, message, adminId) {
           }));
         }
 
-        // Compter les matchs récents dans la base
         const recentMatchesResult = await pool.query(`
           SELECT COUNT(*) as count FROM recent_matches 
           WHERE match_timestamp > NOW() - INTERVAL '${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
@@ -2342,7 +2297,6 @@ async function handleAdminMessage(ws, message, adminId) {
   }
 }
 
-// HANDLERS CLIENT
 async function handleClientMessage(ws, message, ip, deviceId) {
   const deviceKey = generateDeviceKey(ip, deviceId);
   const playerNumber = TRUSTED_DEVICES.get(deviceKey);
@@ -2525,9 +2479,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
       
-      // VÉRIFICATION CRITIQUE : Joueur déjà dans un jeu ?
       if (PLAYER_TO_GAME.has(playerNumber)) {
-        console.log(`🚨 join_queue: ${playerNumber} déjà dans un jeu !`);
         return ws.send(JSON.stringify({ 
           type: 'error', 
           message: 'Déjà dans une partie' 
@@ -2538,17 +2490,13 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       ws.send(JSON.stringify({ type: 'queue_joined', message: 'En attente adversaire' }));
       
       console.log(`🎯 Joueur ${playerNumber} a rejoint la file d'attente`);
-      console.log(`📊 Taille file: ${PLAYER_QUEUE.size} joueur(s)`);
       
-      // Lancer la recherche de match si assez de joueurs
       if (PLAYER_QUEUE.size >= 2) {
         const bestMatch = await findBestMatchFromQueue();
         
         if (bestMatch) {
-          // Retirer les joueurs de la file
           bestMatch.forEach(player => PLAYER_QUEUE.delete(player));
           
-          // Créer le lobby
           createGameLobby(bestMatch);
         } else {
           console.log(`⏳ Aucun match possible pour le moment dans la file (${PLAYER_QUEUE.size} joueurs)`);
@@ -2595,9 +2543,7 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
       
-      // VÉRIFICATION CRITIQUE : Joueur déjà dans un jeu ?
       if (PLAYER_TO_GAME.has(playerNumber)) {
-        console.log(`🚨 request_bot: ${playerNumber} déjà dans un jeu !`);
         return ws.send(JSON.stringify({ 
           type: 'error', 
           message: 'Déjà dans une partie' 
@@ -2622,7 +2568,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       });
       
       console.log(`🤖 Adversaire demandé par ${playerNumber} via WebSocket`);
-      console.log(`💰 Nouvelle caution: -${depositResult.depositAmount} points`);
       
       let depositMessage = "Caution flexible appliquée.";
       if (depositResult.depositAmount === 0) {
@@ -2702,6 +2647,32 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         message: result.message || ''
       }));
     },
+
+    // NOUVEAU HANDLER : Récupérer les parrainages validés depuis le 26/01/2026
+    get_validated_sponsorships_since: async () => {
+      const playerNumber = TRUSTED_DEVICES.get(deviceKey);
+      if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
+      
+      try {
+        const result = await db.getValidatedSponsorshipsSince(playerNumber, SPONSORSHIP_FILTER_DATE);
+        
+        ws.send(JSON.stringify({
+          type: 'validated_sponsorships_since',
+          success: result.success,
+          since_date: result.since_date,
+          count: result.count,
+          sponsorships: result.sponsorships || [],
+          message: result.message || `Parrainages validés depuis le ${SPONSORSHIP_FILTER_DATE}`
+        }));
+      } catch (error) {
+        console.error('Erreur récupération parrainages validés:', error);
+        ws.send(JSON.stringify({
+          type: 'validated_sponsorships_since',
+          success: false,
+          message: 'Erreur serveur'
+        }));
+      }
+    },
     
     player_move: () => handleGameAction(ws, message, deviceKey),
     dice_swap: () => handleGameAction(ws, message, deviceKey),
@@ -2713,7 +2684,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
   }
 }
 
-// CRÉATION DU LOBBY AVEC VÉRIFICATION DE DOUBLON
 async function createGameLobby(playerNumbers) {
   if (!playerNumbers || playerNumbers.length !== 2) {
     console.log(`❌ Données invalides pour créer un lobby`);
@@ -2722,7 +2692,6 @@ async function createGameLobby(playerNumbers) {
   
   const [player1Number, player2Number] = playerNumbers;
   
-  // VÉRIFICATION FINALE AVANT CRÉATION
   if (PLAYER_TO_GAME.has(player1Number)) {
     console.log(`🚨 ERREUR CRITIQUE: ${player1Number} déjà dans un jeu! Annulation création lobby`);
     PLAYER_QUEUE.delete(player1Number);
@@ -2747,7 +2716,6 @@ async function createGameLobby(playerNumbers) {
   
   if (!ws1 || ws1.readyState !== WebSocket.OPEN || !ws2 || ws2.readyState !== WebSocket.OPEN) {
     console.log(`❌ Impossible de créer lobby: un joueur déconnecté`);
-    // Remettre dans la file seulement si pas déjà dans un jeu
     if (!PLAYER_TO_GAME.has(player1Number)) PLAYER_QUEUE.add(player1Number);
     if (!PLAYER_TO_GAME.has(player2Number)) PLAYER_QUEUE.add(player2Number);
     return;
@@ -2803,7 +2771,6 @@ function handleGameAction(ws, message, deviceKey) {
   actions[message.type]?.();
 }
 
-// ROUTES API
 app.get('/get-bot', async (req, res) => {
   try {
     const bot = getRandomBot();
@@ -3023,6 +2990,29 @@ app.get('/sponsorship-stats/:playerNumber', async (req, res) => {
   }
 });
 
+// NOUVEAU ENDPOINT : Parrainages validés depuis le 26/01/2026
+app.get('/validated-sponsorships-since/:playerNumber', async (req, res) => {
+  try {
+    const playerNumber = req.params.playerNumber;
+    const sinceDate = req.query.since || SPONSORSHIP_FILTER_DATE;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    const result = await db.getValidatedSponsorshipsSince(playerNumber, sinceDate);
+    
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(404).json(result);
+    }
+  } catch (error) {
+    console.error('Erreur récupération parrainages validés:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
 app.post('/choose-sponsor', express.json(), async (req, res) => {
   try {
     const { playerNumber, sponsorNumber } = req.body;
@@ -3181,6 +3171,7 @@ app.get('/health', (req, res) => {
     pending_lobbies: PENDING_LOBBIES.size,
     lobby_timeout: LOBBY_TIMEOUT,
     auto_move_bonus: AUTO_MOVE_BONUS,
+    sponsorship_filter_date: SPONSORSHIP_FILTER_DATE,
     timestamp: new Date().toISOString() 
   });
 });
@@ -3203,7 +3194,6 @@ app.get('/update-config', (req, res) => {
   });
 });
 
-// DÉMARRAGE DU SERVEUR
 async function startServer() {
   try {
     await initializeDatabase();
@@ -3228,24 +3218,15 @@ async function startServer() {
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
       console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
       console.log(`⚙️  SYSTÈME ANTI-DOUBLON ACTIVÉ (1 joueur = 1 jeu max)`);
-      console.log(`   • Vérifications multiples avant création lobby`);
-      console.log(`   • Blocage si joueur déjà dans un jeu`);
-      console.log(`   • Triple vérification dans matchmaking`);
       console.log(`⚙️  SYSTÈME ANTI-MATCH RAPIDE PERSISTANT`);
-      console.log(`   • Activé: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'OUI' : 'NON'}`);
-      console.log(`   • Délai: ${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes`);
       console.log(`📊 RESTRICTIONS DE SCORE`);
       console.log(`   • ≥${HIGH_SCORE_THRESHOLD} points → ne rencontre pas <${LOW_SCORE_THRESHOLD} points`);
-      console.log(`   • <${HIGH_SCORE_THRESHOLD} points → pas de restriction`);
       console.log(`🎮 SYSTÈME DE MATCHMAKING INTELLIGENT`);
-      console.log(`   • Analyse TOUTES les combinaisons possibles`);
-      console.log(`   • Priorise les matchs avec différence de score minimale`);
       console.log(`🎮 SYSTÈME DE JEU AMÉLIORÉ`);
-      console.log(`   • 1 coup automatique unique par joueur par manche`);
-      console.log(`   • Bonus +${AUTO_MOVE_BONUS} points pour victoire par déconnexion`);
       console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ`);
       console.log(`   • Scan automatique toutes les ${SPONSORSHIP_SCAN_INTERVAL/60000} minutes`);
       console.log(`   • Historique permanent des validations`);
+      console.log(`   • Filtre parrainages validés depuis le ${SPONSORSHIP_FILTER_DATE}`);
       console.log(`=========================================`);
     });
   } catch (error) {
