@@ -23,18 +23,16 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "SECRET_ADMIN_KEY_12345";
 const HIGH_SCORE_THRESHOLD = 10000;
 const LOW_SCORE_THRESHOLD = 3000;
 const BOT_INCREMENT_INTERVAL = 3 * 60 * 60 * 1000;
+const BOT_DEPOSIT = 250;
 const SPONSOR_MIN_SCORE = 2000;
 const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000;
 const LOBBY_TIMEOUT = 30000;
 const AUTO_MOVE_BONUS = 200;
 
-// Pénalité abandon 1v1
-const PVP_QUIT_PENALTY = 250;
-
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
   anti_quick_rematch: true,
-  min_rematch_delay: 50 * 60 * 1000,
+  min_rematch_delay: 50 * 60 * 1000, // 50 minutes par défaut
 };
 
 const UPDATE_CONFIG = {
@@ -51,6 +49,7 @@ const PLAYER_QUEUE = new Set();
 const ACTIVE_GAMES = new Map();
 const PLAYER_TO_GAME = new Map();
 const BOT_SCORES = new Map();
+const BOT_DEPOSITS = new Map();
 const PENDING_LOBBIES = new Map();
 
 const BOTS = [
@@ -166,7 +165,6 @@ async function canMatchPlayers(player1Number, player2Number) {
   }
 }
 
-// ENREGISTRER UN MATCH DANS LA BASE PERSISTANTE
 async function recordMatch(player1Number, player2Number) {
   try {
     await pool.query(`
@@ -416,13 +414,6 @@ const db = {
 
   async createUser(userData) {
     const { username, password, number, age } = userData;
-    
-    // Vérifier si le numéro est sur liste noire
-    const blacklisted = await this.isNumberBlacklisted(number);
-    if (blacklisted) {
-      throw new Error('Ce numéro a été banni et ne peut pas être réutilisé');
-    }
-    
     const token = generateId() + generateId();
     const result = await pool.query(
       `INSERT INTO users (username, password, number, age, score, online, token) 
@@ -444,6 +435,83 @@ const db = {
     await validateSponsorshipsWhenScoreReached(number, newScore);
   },
 
+  async applyBotDeposit(playerNumber) {
+    try {
+      // VÉRIFICATION CRITIQUE : Joueur déjà dans un jeu ?
+      if (PLAYER_TO_GAME.has(playerNumber)) {
+        console.log(`🚨 applyBotDeposit: ${playerNumber} déjà dans un jeu !`);
+        return { success: false, message: "Déjà dans une partie" };
+      }
+      
+      const player = await this.getUserByNumber(playerNumber);
+      if (!player) {
+        return { success: false, message: "Joueur non trouvé" };
+      }
+      
+      let depositAmount = Math.min(player.score, BOT_DEPOSIT);
+      
+      if (player.score === 0) {
+        depositAmount = 0;
+      }
+      
+      const existingDeposit = BOT_DEPOSITS.get(playerNumber);
+      if (existingDeposit) {
+        console.log(`⚠️ Dépôt existant trouvé pour ${playerNumber}: ${existingDeposit.depositAmount} points`);
+        console.log(`   Le joueur perd ce dépôt car il demande un nouveau match`);
+      }
+      
+      const newScore = player.score - depositAmount;
+      await this.updateUserScore(playerNumber, newScore);
+      
+      console.log(`💰 Nouveau dépôt caution: ${player.username} (-${depositAmount} points)`);
+      console.log(`   Score avant: ${player.score}, Score après: ${newScore}`);
+      
+      return { 
+        success: true, 
+        newScore: newScore,
+        depositAmount: depositAmount,
+        hadEnough: depositAmount > 0,
+        hadPreviousDeposit: !!existingDeposit
+      };
+    } catch (error) {
+      console.error('Erreur dépôt caution:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
+  async refundBotDeposit(playerNumber) {
+    try {
+      const deposit = BOT_DEPOSITS.get(playerNumber);
+      if (!deposit) {
+        return { success: false, message: "Aucun dépôt trouvé" };
+      }
+      
+      const player = await this.getUserByNumber(playerNumber);
+      if (!player) {
+        return { success: false, message: "Joueur non trouvé" };
+      }
+      
+      const refundAmount = deposit.depositAmount;
+      const newScore = player.score + refundAmount;
+      
+      await this.updateUserScore(playerNumber, newScore);
+      
+      BOT_DEPOSITS.delete(playerNumber);
+      
+      console.log(`💰 Caution rendue: ${player.username} (+${refundAmount} points)`);
+      console.log(`   Score avant: ${player.score}, Score après: ${newScore}`);
+      
+      return { 
+        success: true, 
+        refundAmount: refundAmount,
+        newScore: newScore
+      };
+    } catch (error) {
+      console.error('Erreur remboursement caution:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
   async setUserOnlineStatus(number, online) {
     await pool.query(
       'UPDATE users SET online = $1, updated_at = CURRENT_TIMESTAMP WHERE number = $2',
@@ -458,68 +526,50 @@ const db = {
     );
   },
 
-  // IMPORTANT: Fonction pour matchs contre BOTS (système simplifié)
   async updateUserScoreAfterBotMatch(playerNumber, playerGameScore, isWin, isDraw = false) {
     try {
       const player = await this.getUserByNumber(playerNumber);
       if (!player) return false;
       
-      const currentScore = player.score;
+      const deposit = BOT_DEPOSITS.get(playerNumber);
+      const depositAmount = deposit ? deposit.depositAmount : 0;
+      
+      const currentScore = player.score + depositAmount;
       const isHighScore = currentScore >= HIGH_SCORE_THRESHOLD;
       
       let newScore = currentScore;
       
       if (isDraw) {
-        console.log(`🤝 Match nul - ${player.username} garde son score`);
+        if (depositAmount > 0) {
+          await this.refundBotDeposit(playerNumber);
+        }
+        console.log(`🤝 Match nul - ${player.username} récupère sa caution (${depositAmount} points)`);
         return true;
       }
       
       if (isWin) {
         newScore = currentScore + playerGameScore + 200;
-        console.log(`🏆 [BOT MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
+        console.log(`🏆 [ADVERSAIRE MATCH] Victoire ${player.username}: ${currentScore} + ${playerGameScore} + 200 = ${newScore}`);
       } else {
         if (isHighScore) {
           newScore = Math.max(0, currentScore - playerGameScore - 200);
-          console.log(`🔥 [BOT MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
+          console.log(`🔥 [ADVERSAIRE MATCH] Défaite (≥10k) ${player.username}: ${currentScore} - ${playerGameScore} - 200 = ${newScore}`);
         } else {
           newScore = Math.max(0, currentScore - playerGameScore);
-          console.log(`😢 [BOT MATCH] Défaite (<10k) ${player.username}: ${currentScore} - ${playerGameScore} = ${newScore}`);
+          console.log(`😢 [ADVERSAIRE MATCH] Défaite (<10k) ${player.username}: ${currentScore} - ${playerGameScore} = ${newScore}`);
         }
       }
       
       await this.updateUserScore(playerNumber, newScore);
       
-      return true;
-    } catch (error) {
-      console.error('Erreur mise à jour score bot match:', error);
-      return false;
-    }
-  },
-
-  // Pénalité abandon en match PVP (1v1)
-  async applyPvPQuitPenalty(quitterNumber, remainingPlayerNumber) {
-    try {
-      const quitter = await this.getUserByNumber(quitterNumber);
-      const remaining = await this.getUserByNumber(remainingPlayerNumber);
-      
-      if (!quitter || !remaining) return false;
-      
-      // Pénalité pour celui qui quitte: TOUJOURS -250 points
-      const newQuitterScore = Math.max(0, quitter.score - PVP_QUIT_PENALTY);
-      
-      // Bonus pour celui qui reste: +200 points
-      const newRemainingScore = remaining.score + AUTO_MOVE_BONUS;
-      
-      console.log(`🎮 [PVP ABANDON] ${quitter.username} quitte le match`);
-      console.log(`   ${quitter.username}: ${quitter.score} - ${PVP_QUIT_PENALTY} = ${newQuitterScore} (TOUJOURS -${PVP_QUIT_PENALTY} points)`);
-      console.log(`   ${remaining.username}: ${remaining.score} + ${AUTO_MOVE_BONUS} = ${newRemainingScore} (bonus abandon)`);
-      
-      await this.updateUserScore(quitterNumber, newQuitterScore);
-      await this.updateUserScore(remainingPlayerNumber, newRemainingScore);
+      if (deposit) {
+        BOT_DEPOSITS.delete(playerNumber);
+        console.log(`💰 Dépôt de ${depositAmount} points intégré au calcul`);
+      }
       
       return true;
     } catch (error) {
-      console.error('Erreur pénalité PVP abandon:', error);
+      console.error('Erreur mise à jour score adversaire match:', error);
       return false;
     }
   },
@@ -620,11 +670,27 @@ const db = {
         BOT_SCORES.set(bot.id, bot.baseScore);
       }
       
-      // Enregistrer la date du reset dans la base
+      BOT_DEPOSITS.clear();
+      
       await pool.query(`
-        INSERT INTO admin_resets (reset_date, reset_type) 
-        VALUES (CURRENT_TIMESTAMP, 'weekly_scores')
-        ON CONFLICT DO NOTHING
+        UPDATE sponsorships s 
+        SET is_validated = false, validated_at = NULL 
+        FROM sponsorship_validated_history h 
+        WHERE s.sponsored_number = h.sponsored_number
+        AND h.sponsored_number IS NULL
+      `);
+      
+      await pool.query(`
+        UPDATE sponsorship_stats ss
+        SET validated_sponsored = 0
+        FROM (
+          SELECT s.sponsor_number
+          FROM sponsorships s
+          LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
+          WHERE h.sponsored_number IS NULL
+          GROUP BY s.sponsor_number
+        ) AS to_reset
+        WHERE ss.player_number = to_reset.sponsor_number
       `);
       
       return { 
@@ -719,18 +785,8 @@ const db = {
           sp.sponsor_number,
           sp_user.username as sponsor_username,
           sp.is_validated,
-          COALESCE(ss.validated_sponsored, 0) as total_sponsored,
-          (
-            SELECT COALESCE(COUNT(*), 0)
-            FROM sponsorship_validated_history vh
-            LEFT JOIN (
-              SELECT MAX(reset_date) as last_reset 
-              FROM admin_resets 
-              WHERE reset_type = 'sponsorship_counters'
-            ) r ON 1=1
-            WHERE vh.sponsor_number = u.number
-            AND (r.last_reset IS NULL OR vh.validated_at >= r.last_reset)
-          ) as validated_sponsored
+          COALESCE(ss.total_sponsored, 0) as total_sponsored,
+          COALESCE(ss.validated_sponsored, 0) as validated_sponsored
         FROM users u 
         LEFT JOIN sponsorships sp ON u.number = sp.sponsored_number
         LEFT JOIN users sp_user ON sp.sponsor_number = sp_user.number
@@ -816,30 +872,7 @@ const db = {
       return [];
     }
   },
-  
-  async resetSponsorshipCounters() {
-    try {
-      // Enregistrer la date du reset des parrainages
-      await pool.query(`
-        INSERT INTO admin_resets (reset_date, reset_type, notes) 
-        VALUES (CURRENT_TIMESTAMP, 'sponsorship_counters', 'Reset hebdomadaire des compteurs parrainage')
-        ON CONFLICT DO NOTHING
-      `);
-      
-      console.log(`🔄 Reset des compteurs parrainage effectué à ${new Date().toISOString()}`);
-      
-      return { 
-        success: true, 
-        message: "Compteurs de parrainage réinitialisés",
-        reset_date: new Date().toISOString(),
-        notes: "Les compteurs FV afficheront maintenant seulement les validations après cette date"
-      };
-    } catch (error) {
-      console.error('Erreur reset compteurs parrainage:', error);
-      return { success: false, message: "Erreur serveur" };
-    }
-  },
-  
+
   async updateBotScoreById(botId, points, operation) {
     try {
       if (!botId) return { success: false, message: "ID adversaire manquant" };
@@ -1010,73 +1043,24 @@ const db = {
 
   async getSponsorshipStats(playerNumber) {
     try {
-      // 1. Récupérer la date du dernier reset des compteurs parrainage
-      const lastResetResult = await pool.query(`
-        SELECT reset_date 
-        FROM admin_resets 
-        WHERE reset_type = 'sponsorship_counters' 
-        ORDER BY reset_date DESC 
-        LIMIT 1
-      `);
+      const result = await pool.query(
+        'SELECT total_sponsored, validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
+        [playerNumber]
+      );
       
-      const lastResetDate = lastResetResult.rows[0]?.reset_date;
-      
-      // 2. Si pas de reset, compter tout (situation initiale)
-      if (!lastResetDate) {
-        const result = await pool.query(
-          'SELECT validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
-          [playerNumber]
-        );
-        
-        const validatedCount = result.rows.length > 0 ? result.rows[0].validated_sponsored : 0;
-        
-        console.log(`📊 Stats parrainage pour ${playerNumber}: ${validatedCount} filleul(s) validé(s) (aucun reset)`);
-        
+      if (result.rows.length === 0) {
         return { 
           success: true, 
-          validated_sponsored: validatedCount,
-          last_reset_date: null,
-          message: validatedCount > 0 ? 
-            `${validatedCount} filleul(s) validé(s)` : 
-            "Aucun filleul validé pour le moment"
+          total_sponsored: 0, 
+          validated_sponsored: 0 
         };
       }
       
-      // 3. Compter seulement les validations après le dernier reset
-      const countResult = await pool.query(`
-        SELECT COUNT(*) as count 
-        FROM sponsorship_validated_history 
-        WHERE sponsor_number = $1 
-        AND validated_at >= $2
-      `, [playerNumber, lastResetDate]);
-      
-      const validatedCount = parseInt(countResult.rows[0]?.count || 0);
-      
-      // 4. Vérifier aussi les ajustements manuels admin après le reset
-      const adjustmentResult = await pool.query(`
-        SELECT COALESCE(SUM(adjustment), 0) as total_adjustment
-        FROM admin_sponsorship_adjustments 
-        WHERE player_number = $1 
-        AND adjusted_at >= $2
-      `, [playerNumber, lastResetDate]);
-      
-      const totalAdjustment = parseInt(adjustmentResult.rows[0]?.total_adjustment || 0);
-      
-      // 5. Total = validations naturelles + ajustements admin
-      const totalValidated = Math.max(0, validatedCount + totalAdjustment);
-      
-      console.log(`📊 Stats parrainage pour ${playerNumber}:`);
-      console.log(`   Validations naturelles après reset: ${validatedCount}`);
-      console.log(`   Ajustements admin après reset: ${totalAdjustment}`);
-      console.log(`   TOTAL (ce que client voit): ${totalValidated}`);
-      
-      return { 
-        success: true, 
-        validated_sponsored: totalValidated,
-        last_reset_date: lastResetDate,
-        message: totalValidated > 0 ? 
-          `${totalValidated} filleul(s) validé(s) cette semaine` : 
-          "Aucun filleul validé cette semaine"
+      const stats = result.rows[0];
+      return {
+        success: true,
+        total_sponsored: stats.total_sponsored,
+        validated_sponsored: stats.validated_sponsored
       };
     } catch (error) {
       console.error('Erreur récupération stats parrainage:', error);
@@ -1112,6 +1096,40 @@ const db = {
     }
   },
 
+  async resetSponsorshipCounters() {
+    try {
+      await pool.query(`
+        UPDATE sponsorships s 
+        SET is_validated = false, validated_at = NULL 
+        WHERE NOT EXISTS (
+          SELECT 1 FROM sponsorship_validated_history h 
+          WHERE h.sponsored_number = s.sponsored_number
+        )
+      `);
+      
+      await pool.query(`
+        UPDATE sponsorship_stats ss
+        SET validated_sponsored = 0
+        FROM (
+          SELECT s.sponsor_number
+          FROM sponsorships s
+          LEFT JOIN sponsorship_validated_history h ON s.sponsored_number = h.sponsored_number
+          WHERE h.sponsored_number IS NULL
+          GROUP BY s.sponsor_number
+        ) AS to_reset
+        WHERE ss.player_number = to_reset.sponsor_number
+      `);
+      
+      return { 
+        success: true, 
+        message: "Compteurs de parrainage réinitialisés (sans affecter les validations permanentes)" 
+      };
+    } catch (error) {
+      console.error('Erreur reset compteurs parrainage:', error);
+      return { success: false, message: "Erreur serveur" };
+    }
+  },
+
   async getPermanentValidationHistory() {
     try {
       const result = await pool.query(`
@@ -1133,269 +1151,6 @@ const db = {
       console.error('Erreur récupération historique validations:', error);
       return [];
     }
-  },
-
-  // Supprimer un compte
-  async deleteUserAccount(playerNumber, adminKey) {
-    try {
-      if (!adminKey || adminKey !== ADMIN_KEY) {
-        return { success: false, message: "Clé admin invalide" };
-      }
-      
-      const user = await this.getUserByNumber(playerNumber);
-      if (!user) {
-        return { success: false, message: "Joueur non trouvé" };
-      }
-      
-      // 1. Mettre le numéro sur liste noire
-      await pool.query(`
-        INSERT INTO blacklisted_numbers (number, banned_at, reason, original_username) 
-        VALUES ($1, CURRENT_TIMESTAMP, $2, $3)
-        ON CONFLICT (number) DO UPDATE SET 
-          banned_at = CURRENT_TIMESTAMP,
-          reason = EXCLUDED.reason
-      `, [playerNumber, 'Suppression admin', user.username]);
-      
-      console.log(`🚫 Numéro ${playerNumber} (${user.username}) ajouté à la liste noire`);
-      
-      // 2. Supprimer le joueur de toutes les connexions actives
-      PLAYER_CONNECTIONS.delete(playerNumber);
-      PLAYER_QUEUE.delete(playerNumber);
-      
-      // 3. Vérifier si le joueur est dans un jeu actif
-      const gameId = PLAYER_TO_GAME.get(playerNumber);
-      if (gameId) {
-        const game = ACTIVE_GAMES.get(gameId);
-        if (game) {
-          const player = game.getPlayerByNumber(playerNumber);
-          if (player) {
-            await game.handlePlayerDisconnect(player);
-          }
-        }
-        PLAYER_TO_GAME.delete(playerNumber);
-      }
-      
-      // 4. Supprimer les devices trustés
-      await pool.query('DELETE FROM trusted_devices WHERE user_number = $1', [playerNumber]);
-      
-      // 5. Supprimer les parrainages liés
-      await pool.query('DELETE FROM sponsorships WHERE sponsor_number = $1 OR sponsored_number = $1', [playerNumber]);
-      await pool.query('DELETE FROM sponsorship_validated_history WHERE sponsor_number = $1 OR sponsored_number = $1', [playerNumber]);
-      await pool.query('DELETE FROM sponsorship_stats WHERE player_number = $1', [playerNumber]);
-      
-      // 6. Supprimer les matchs récents
-      await pool.query('DELETE FROM recent_matches WHERE player1_number = $1 OR player2_number = $1', [playerNumber]);
-      
-      // 7. Supprimer l'utilisateur
-      await pool.query('DELETE FROM users WHERE number = $1', [playerNumber]);
-      
-      console.log(`🗑️ Compte ${playerNumber} (${user.username}) supprimé avec succès`);
-      
-      return { 
-        success: true, 
-        message: `Compte ${user.username} (${playerNumber}) supprimé avec succès`,
-        username: user.username,
-        number: playerNumber,
-        score: user.score,
-        blacklisted: true
-      };
-    } catch (error) {
-      console.error('Erreur suppression compte:', error);
-      return { success: false, message: "Erreur serveur lors de la suppression" };
-    }
-  },
-
-  // Vérifier si un numéro est sur liste noire
-  async isNumberBlacklisted(number) {
-    try {
-      const result = await pool.query(
-        'SELECT * FROM blacklisted_numbers WHERE number = $1',
-        [number]
-      );
-      return result.rows.length > 0;
-    } catch (error) {
-      console.error('Erreur vérification liste noire:', error);
-      return false;
-    }
-  },
-
-  // Obtenir la liste des numéros blacklistés
-  async getBlacklistedNumbers() {
-    try {
-      const result = await pool.query(`
-        SELECT number, original_username, reason, banned_at 
-        FROM blacklisted_numbers 
-        ORDER BY banned_at DESC
-      `);
-      return result.rows;
-    } catch (error) {
-      console.error('Erreur récupération liste noire:', error);
-      return [];
-    }
-  },
-
-  // Retirer un numéro de la liste noire
-  async unblacklistNumber(number, adminKey) {
-    try {
-      if (!adminKey || adminKey !== ADMIN_KEY) {
-        return { success: false, message: "Clé admin invalide" };
-      }
-      
-      const result = await pool.query(
-        'DELETE FROM blacklisted_numbers WHERE number = $1 RETURNING *',
-        [number]
-      );
-      
-      if (result.rows.length === 0) {
-        return { success: false, message: "Numéro non trouvé dans la liste noire" };
-      }
-      
-      return { 
-        success: true, 
-        message: `Numéro ${number} retiré de la liste noire`,
-        number: number
-      };
-    } catch (error) {
-      console.error('Erreur retrait liste noire:', error);
-      return { success: false, message: "Erreur serveur" };
-    }
-  },
-
-  async manuallyAdjustSponsorshipCounter(playerNumber, adjustment, adminKey) {
-    try {
-      if (!adminKey || adminKey !== ADMIN_KEY) {
-        return { success: false, message: "Clé admin invalide" };
-      }
-      
-      if (!playerNumber || adjustment === undefined) {
-        return { success: false, message: "Données manquantes" };
-      }
-      
-      const user = await this.getUserByNumber(playerNumber);
-      if (!user) {
-        return { success: false, message: "Joueur non trouvé" };
-      }
-      
-      // 1. Récupérer la date du dernier reset
-      const lastResetResult = await pool.query(`
-        SELECT reset_date 
-        FROM admin_resets 
-        WHERE reset_type = 'sponsorship_counters' 
-        ORDER BY reset_date DESC 
-        LIMIT 1
-      `);
-      
-      const lastResetDate = lastResetResult.rows[0]?.reset_date;
-      
-      if (!lastResetDate) {
-        return { success: false, message: "Aucun reset trouvé, veuillez d'abord effectuer un reset des compteurs" };
-      }
-      
-      // 2. Calculer les validations après le dernier reset
-      let currentValidated = 0;
-      if (lastResetDate) {
-        const countResult = await pool.query(`
-          SELECT COUNT(*) as count 
-          FROM sponsorship_validated_history 
-          WHERE sponsor_number = $1 
-          AND validated_at >= $2
-        `, [playerNumber, lastResetDate]);
-        
-        currentValidated = parseInt(countResult.rows[0]?.count || 0);
-      }
-      
-      // 3. Calculer les ajustements précédents après le dernier reset
-      const previousAdjustmentsResult = await pool.query(`
-        SELECT COALESCE(SUM(adjustment), 0) as total_adjustment
-        FROM admin_sponsorship_adjustments 
-        WHERE player_number = $1 
-        AND adjusted_at >= $2
-      `, [playerNumber, lastResetDate]);
-      
-      const previousAdjustments = parseInt(previousAdjustmentsResult.rows[0]?.total_adjustment || 0);
-      
-      // 4. Total actuel (avant nouveau ajustement)
-      const totalBefore = Math.max(0, currentValidated + previousAdjustments);
-      
-      // 5. Nouveau total
-      const totalAfter = Math.max(0, totalBefore + adjustment);
-      
-      // 6. Mettre à jour les stats globales (pour F dans admin)
-      const globalStatsResult = await pool.query(
-        'SELECT total_sponsored, validated_sponsored FROM sponsorship_stats WHERE player_number = $1',
-        [playerNumber]
-      );
-      
-      if (globalStatsResult.rows.length > 0) {
-        // Mettre à jour le validated_sponsored global (F)
-        const newGlobalValidated = globalStatsResult.rows[0].validated_sponsored + adjustment;
-        await pool.query(`
-          UPDATE sponsorship_stats 
-          SET validated_sponsored = $1,
-              total_sponsored = GREATEST(validated_sponsored, total_sponsored),
-              last_updated = CURRENT_TIMESTAMP
-          WHERE player_number = $2
-        `, [Math.max(0, newGlobalValidated), playerNumber]);
-      } else {
-        // Créer l'entrée si elle n'existe pas
-        await pool.query(`
-          INSERT INTO sponsorship_stats (player_number, total_sponsored, validated_sponsored, last_updated) 
-          VALUES ($1, GREATEST($2, 0), GREATEST($2, 0), CURRENT_TIMESTAMP)
-        `, [playerNumber, Math.max(0, adjustment)]);
-      }
-      
-      console.log(`📊 Ajustement parrainage pour ${playerNumber} (${user.username}):`);
-      console.log(`   Validations naturelles après reset: ${currentValidated}`);
-      console.log(`   Ajustements précédents: ${previousAdjustments}`);
-      console.log(`   Total avant ajustement (ce que client voit): ${totalBefore}`);
-      console.log(`   Ajustement demandé: ${adjustment}`);
-      console.log(`   Total après ajustement (ce que client verra): ${totalAfter}`);
-      
-      // 7. Enregistrer l'ajustement dans l'historique
-      await pool.query(`
-        INSERT INTO admin_sponsorship_adjustments (admin_key, player_number, adjustment, old_value, new_value, reason) 
-        VALUES ($1, $2, $3, $4, $5, $6)
-      `, [adminKey, playerNumber, adjustment, totalBefore, totalAfter, 'Ajustement manuel admin après reset']);
-      
-      return { 
-        success: true, 
-        message: `Compteur parrainage ajusté: ${totalBefore} → ${totalAfter}`,
-        player_number: playerNumber,
-        username: user.username,
-        old_value: totalBefore,
-        new_value: totalAfter,
-        adjustment: adjustment,
-        natural_validations: currentValidated,
-        previous_adjustments: previousAdjustments,
-        is_post_reset: true
-      };
-    } catch (error) {
-      console.error('Erreur ajustement compteur parrainage:', error);
-      return { success: false, message: "Erreur serveur" };
-    }
-  },
- 
-  // Obtenir l'historique des ajustements de parrainage
-  async getSponsorshipAdjustmentHistory(adminKey) {
-    try {
-      if (!adminKey || adminKey !== ADMIN_KEY) {
-        return { success: false, message: "Clé admin invalide" };
-      }
-      
-      const result = await pool.query(`
-        SELECT 
-          a.*,
-          u.username as player_username
-        FROM admin_sponsorship_adjustments a
-        LEFT JOIN users u ON a.player_number = u.number
-        ORDER BY a.adjusted_at DESC
-      `);
-      
-      return result.rows;
-    } catch (error) {
-      console.error('Erreur récupération historique ajustements:', error);
-      return [];
-    }
   }
 };
 
@@ -1410,25 +1165,30 @@ class Game {
       lobbyTimeout: null,
       created_at: Date.now(),
       status: 'lobby',
-      autoMoveUsed: { player1: false, player2: false },
-      gameType: p2.is_bot ? 'bot_match' : 'pvp_match'
+      autoMoveUsed: { player1: false, player2: false }
     });
+    
+    // VÉRIFICATION CRITIQUE : Les joueurs ne sont pas déjà dans un autre jeu
+    if (PLAYER_TO_GAME.has(p1.number) || PLAYER_TO_GAME.has(p2.number)) {
+      console.log(`🚨 ERREUR CRITIQUE: Un joueur déjà dans un jeu lors de la création du lobby ${id}`);
+      console.log(`   ${p1.username} (${p1.number}) dans jeu ? ${PLAYER_TO_GAME.has(p1.number)}`);
+      console.log(`   ${p2.username} (${p2.number}) dans jeu ? ${PLAYER_TO_GAME.has(p2.number)}`);
+      throw new Error('Un joueur est déjà dans un jeu');
+    }
     
     [p1, p2].forEach((p, i) => {
       const player = {...p, ws: PLAYER_CONNECTIONS.get(p.number), role: i === 0 ? 'player1' : 'player2'};
       this.players.push(player);
-      PLAYER_TO_GAME.set(p.number, id);
+      PLAYER_TO_GAME.set(p.number, id); // Une seule fois ici
     });
     
     ACTIVE_GAMES.set(id, this);
     PENDING_LOBBIES.set(id, this);
     
-    // Enregistrer le match dans la base persistante (seulement pour PVP)
-    if (this.gameType === 'pvp_match') {
-      recordMatch(p1.number, p2.number);
-    }
+    // Enregistrer le match dans la base persistante
+    recordMatch(p1.number, p2.number);
     
-    console.log(`🎮 Nouveau lobby créé: ${this.id} (${this.gameType})`);
+    console.log(`🎮 Nouveau lobby créé: ${this.id}`);
     console.log(`   Joueurs: ${p1.username} vs ${p2.username}`);
     console.log(`   Lobbys actifs: ${PENDING_LOBBIES.size}, Parties actives: ${ACTIVE_GAMES.size}`);
     
@@ -1508,7 +1268,7 @@ class Game {
         this.lobbyTimeout = null;
       }
       
-      console.log(`🎲 Début de partie ${this.id} (${this.gameType}): ${this.players[0].username} vs ${this.players[1].username}`);
+      console.log(`🎲 Début de partie ${this.id}: ${this.players[0].username} vs ${this.players[1].username}`);
       console.log(`   Lobbys en attente: ${PENDING_LOBBIES.size}, Parties en cours: ${ACTIVE_GAMES.size - PENDING_LOBBIES.size}`);
       
       this.broadcast({ type: 'game_start' });
@@ -1667,23 +1427,14 @@ class Game {
       return;
     }
     
-    console.log(`🔌 ${disconnectedPlayer.username} (${disconnectedPlayer.role}) a quitté la partie ${this.id} (${this.gameType})`);
+    console.log(`🔌 ${disconnectedPlayer.username} (${disconnectedPlayer.role}) a quitté la partie ${this.id}`);
     
     if (remainingPlayer?.ws?.readyState === WebSocket.OPEN) {
       remainingPlayer.ws.send(JSON.stringify({ 
         type: 'opponent_left', 
         message: 'Adversaire a quitté la partie' 
       }));
-      
-      // APPLICATION DES PÉNALITÉS DIFFÉRENTES SELON LE TYPE DE MATCH
-      if (this.gameType === 'pvp_match') {
-        // PVP: Celui qui quitte perd -250 points, l'autre gagne +200
-        await this._applyPvPDisconnectPenalties(disconnectedPlayer, remainingPlayer);
-      } else {
-        // Match contre bot: Logique simplifiée
-        await this._applyBotDisconnectPenalties(disconnectedPlayer, remainingPlayer);
-      }
-      
+      await this._applyDisconnectPenalties(disconnectedPlayer, remainingPlayer);
       this.broadcast({ type: 'game_end', data: { scores: this.scores, winner: remainingPlayer.role } });
       this.cleanup();
     } else {
@@ -1691,35 +1442,27 @@ class Game {
     }
   }
 
-  // Pénalités pour abandon PVP
-  async _applyPvPDisconnectPenalties(disconnectedPlayer, remainingPlayer) {
+  async _applyDisconnectPenalties(disconnectedPlayer, remainingPlayer) {
     try {
-      await db.applyPvPQuitPenalty(disconnectedPlayer.number, remainingPlayer.number);
-    } catch (error) {
-      console.error('Erreur pénalités déconnexion PVP:', error);
-    }
-  }
-
-  // Méthode pour matchs contre bots (simplifiée)
-  async _applyBotDisconnectPenalties(disconnectedPlayer, remainingPlayer) {
-    try {
-      // Note: Pour un match contre bot, "remainingPlayer" est le joueur humain
-      // Logique simplifiée pour le match contre bot
+      const disconnectedUser = await db.getUserByNumber(disconnectedPlayer.number);
       const remainingUser = await db.getUserByNumber(remainingPlayer.number);
       
-      if (remainingUser) {
+      if (disconnectedUser && remainingUser) {
+        const disconnectedScore = this.scores[disconnectedPlayer.role];
         const remainingScore = this.scores[remainingPlayer.role];
         
-        // Logique existante pour match contre bot
+        const newDisconnectedScore = Math.max(0, disconnectedUser.score - (disconnectedScore > 15 ? disconnectedScore : 15));
         const newRemainingScore = remainingUser.score + (remainingScore < 15 ? 15 : remainingScore) + AUTO_MOVE_BONUS;
         
         console.log(`💰 Bonus +${AUTO_MOVE_BONUS} points pour ${remainingPlayer.username} (adversaire a quitté)`);
         console.log(`   Score ${remainingPlayer.username}: ${remainingUser.score} → ${newRemainingScore}`);
+        console.log(`   Score ${disconnectedPlayer.username}: ${disconnectedUser.score} → ${newDisconnectedScore}`);
         
+        await db.updateUserScore(disconnectedPlayer.number, newDisconnectedScore);
         await db.updateUserScore(remainingPlayer.number, newRemainingScore);
       }
     } catch (error) {
-      console.error('Erreur pénalités déconnexion bot:', error);
+      console.error('Erreur pénalités déconnexion:', error);
     }
   }
 
@@ -1827,12 +1570,14 @@ async function findBestMatchFromQueue() {
   const players = Array.from(PLAYER_QUEUE);
   console.log(`📊 Analyse file d'attente: ${players.length} joueurs`);
   
+  // FILTRE CRITIQUE: Éliminer les joueurs déjà dans un jeu/lobby
   const availablePlayers = players.filter(playerNumber => !PLAYER_TO_GAME.has(playerNumber));
   
   if (availablePlayers.length !== players.length) {
     const alreadyInGame = players.length - availablePlayers.length;
     console.log(`⚠️ ${alreadyInGame} joueur(s) déjà dans un jeu/lobby, ignorés de la file`);
     
+    // Nettoyer la file d'attente des joueurs déjà dans un jeu
     players.forEach(playerNumber => {
       if (PLAYER_TO_GAME.has(playerNumber)) {
         PLAYER_QUEUE.delete(playerNumber);
@@ -1846,6 +1591,7 @@ async function findBestMatchFromQueue() {
     return null;
   }
   
+  // Récupérer les scores de tous les joueurs disponibles
   const playersWithScores = [];
   for (const playerNumber of availablePlayers) {
     const user = await db.getUserByNumber(playerNumber);
@@ -1858,6 +1604,7 @@ async function findBestMatchFromQueue() {
     }
   }
   
+  // Trouver TOUTES les paires possibles
   const possiblePairs = [];
   
   for (let i = 0; i < playersWithScores.length - 1; i++) {
@@ -1865,11 +1612,13 @@ async function findBestMatchFromQueue() {
       const player1 = playersWithScores[i];
       const player2 = playersWithScores[j];
       
+      // VÉRIFICATION: Pas déjà dans un jeu (double vérification)
       if (PLAYER_TO_GAME.has(player1.number) || PLAYER_TO_GAME.has(player2.number)) {
         console.log(`⛔ Double vérification échouée: ${player1.number} ou ${player2.number} déjà dans un jeu`);
         continue;
       }
       
+      // Vérifier l'écart de score
       const scoreGapBlocked = (player1.score >= HIGH_SCORE_THRESHOLD && player2.score < LOW_SCORE_THRESHOLD) ||
                               (player2.score >= HIGH_SCORE_THRESHOLD && player1.score < LOW_SCORE_THRESHOLD);
       
@@ -1878,6 +1627,7 @@ async function findBestMatchFromQueue() {
         continue;
       }
       
+      // Vérifier match récent
       const matchCheck = await canMatchPlayers(player1.number, player2.number);
       
       if (matchCheck.canMatch) {
@@ -1897,18 +1647,22 @@ async function findBestMatchFromQueue() {
     }
   }
   
+  // Si aucune paire possible
   if (possiblePairs.length === 0) {
     console.log(`❌ Aucune paire possible trouvée parmi ${playersWithScores.length} joueurs disponibles`);
     return null;
   }
   
+  // Choisir la meilleure paire (la plus petite différence de score)
   possiblePairs.sort((a, b) => a.scoreDiff - b.scoreDiff);
   const bestPair = possiblePairs[0];
   
+  // TRIPLE VÉRIFICATION: S'assurer que les joueurs ne sont toujours pas dans un jeu
   if (PLAYER_TO_GAME.has(bestPair.player1) || PLAYER_TO_GAME.has(bestPair.player2)) {
     console.log(`🚨 ALERTE: ${bestPair.player1Name} ou ${bestPair.player2Name} a rejoint un jeu entre-temps!`);
     console.log(`   Annulation du match pour éviter les doublons`);
     
+    // Retirer ces joueurs de la file s'ils sont dans un jeu
     if (PLAYER_TO_GAME.has(bestPair.player1)) {
       PLAYER_QUEUE.delete(bestPair.player1);
       console.log(`   ${bestPair.player1Name} retiré de la file (déjà dans jeu)`);
@@ -1957,7 +1711,7 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table recent_matches
+    // Table recent_matches (PERSISTANTE pour anti-match rapide)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS recent_matches (
         id SERIAL PRIMARY KEY,
@@ -1966,16 +1720,6 @@ async function initializeDatabase() {
         match_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(player1_number, player2_number)
-      )
-    `);
-
-    // Table admin_resets
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS admin_resets (
-        id SERIAL PRIMARY KEY,
-        reset_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        reset_type VARCHAR(50) NOT NULL,
-        notes TEXT
       )
     `);
 
@@ -2040,32 +1784,7 @@ async function initializeDatabase() {
       )
     `);
 
-    // Table blacklisted_numbers
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS blacklisted_numbers (
-        id SERIAL PRIMARY KEY,
-        number VARCHAR(20) UNIQUE NOT NULL,
-        original_username VARCHAR(50),
-        reason TEXT,
-        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // Table admin_sponsorship_adjustments
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS admin_sponsorship_adjustments (
-        id SERIAL PRIMARY KEY,
-        admin_key VARCHAR(100) NOT NULL,
-        player_number VARCHAR(20) NOT NULL,
-        adjustment INTEGER NOT NULL,
-        old_value INTEGER NOT NULL,
-        new_value INTEGER NOT NULL,
-        reason TEXT,
-        adjusted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // Créer des index
+    // Créer un index pour les recherches rapides dans recent_matches
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_recent_matches_timestamp 
       ON recent_matches(match_timestamp)
@@ -2094,16 +1813,7 @@ async function initializeDatabase() {
       `, [bot.id, bot.baseScore]);
     }
 
-    // Insérer un reset initial si aucun existe
-    const resetCheck = await pool.query('SELECT COUNT(*) FROM admin_resets');
-    if (parseInt(resetCheck.rows[0].count) === 0) {
-      await pool.query(`
-        INSERT INTO admin_resets (reset_date, reset_type, notes) 
-        VALUES (CURRENT_TIMESTAMP, 'initial', 'Reset initial système')
-      `);
-    }
-
-    console.log('✅ Base de données initialisée avec système de suppression et liste noire');
+    console.log('✅ Base de données initialisée avec système anti-match persistant');
 
   } catch (error) {
     console.error('Erreur init DB:', error);
@@ -2270,11 +1980,8 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
-    // ⭐⭐ HANDLER MANQUANT AJOUTÉ ICI ⭐⭐
     admin_get_full_list: async () => {
       try {
-        console.log("🎯 admin_get_full_list appelé");
-        
         if (message.admin_key !== ADMIN_KEY) {
           return ws.send(JSON.stringify({ 
             type: 'error', 
@@ -2290,15 +1997,12 @@ async function handleAdminMessage(ws, message, adminId) {
           data: fullList,
           count: fullList.length
         }));
-        
-        console.log(`✅ admin_full_list envoyé: ${fullList.length} éléments`);
-        
       } catch (error) {
-        console.error('❌ Erreur admin_get_full_list:', error);
+        console.error('Erreur liste complète admin:', error);
         ws.send(JSON.stringify({ 
           type: 'admin_full_list', 
           success: false, 
-          message: 'Erreur serveur' 
+          message: 'Erreur liste complète' 
         }));
       }
     },
@@ -2317,7 +2021,7 @@ async function handleAdminMessage(ws, message, adminId) {
         ws.send(JSON.stringify({
           type: 'admin_reset_scores',
           success: true,
-          message: `Scores réinitialisés`,
+          message: `Scores réinitialisés (validations permanentes conservées)`,
           players_reset: resetResult.playersReset,
           bots_reset: resetResult.botsReset
         }));
@@ -2517,8 +2221,7 @@ async function handleAdminMessage(ws, message, adminId) {
         ws.send(JSON.stringify({
           type: 'admin_reset_sponsorship_counters',
           success: result.success,
-          message: result.message,
-          reset_date: result.reset_date
+          message: result.message
         }));
       } catch (error) {
         console.error('Erreur reset compteurs parrainage admin:', error);
@@ -2596,15 +2299,10 @@ async function handleAdminMessage(ws, message, adminId) {
           }));
         }
 
+        // Compter les matchs récents dans la base
         const recentMatchesResult = await pool.query(`
           SELECT COUNT(*) as count FROM recent_matches 
           WHERE match_timestamp > NOW() - INTERVAL '${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes'
-        `);
-        
-        const lastResetResult = await pool.query(`
-          SELECT reset_date FROM admin_resets 
-          ORDER BY reset_date DESC 
-          LIMIT 1
         `);
         
         ws.send(JSON.stringify({
@@ -2616,12 +2314,11 @@ async function handleAdminMessage(ws, message, adminId) {
             active_games: ACTIVE_GAMES.size,
             pending_lobbies: PENDING_LOBBIES.size,
             player_to_game: PLAYER_TO_GAME.size,
+            bot_deposits: BOT_DEPOSITS.size,
             recent_matches_in_db: parseInt(recentMatchesResult.rows[0].count),
             trusted_devices: TRUSTED_DEVICES.size
           },
           matchmaking_config: MATCHMAKING_CONFIG,
-          last_reset_date: lastResetResult.rows[0]?.reset_date || 'Jamais',
-          pvp_quit_penalty: PVP_QUIT_PENALTY,
           message: 'Statistiques serveur'
         }));
       } catch (error) {
@@ -2632,202 +2329,15 @@ async function handleAdminMessage(ws, message, adminId) {
           message: 'Erreur stats' 
         }));
       }
-    },
-
-    // Supprimer un compte
-    admin_delete_user: async () => {
-      try {
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
-
-        const { player_number } = message;
-        
-        if (!player_number) {
-          return ws.send(JSON.stringify({
-            type: 'admin_delete_user',
-            success: false,
-            message: 'Numéro joueur manquant'
-          }));
-        }
-
-        const result = await db.deleteUserAccount(player_number, message.admin_key);
-        
-        ws.send(JSON.stringify({
-          type: 'admin_delete_user',
-          success: result.success,
-          message: result.message,
-          player_number: result.number,
-          username: result.username,
-          score: result.score,
-          blacklisted: result.blacklisted
-        }));
-      } catch (error) {
-        console.error('Erreur suppression compte admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_delete_user', 
-          success: false, 
-          message: 'Erreur suppression' 
-        }));
-      }
-    },
-
-    // Obtenir la liste noire
-    admin_get_blacklist: async () => {
-      try {
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
-
-        const blacklist = await db.getBlacklistedNumbers();
-        
-        ws.send(JSON.stringify({
-          type: 'admin_blacklist',
-          success: true,
-          blacklist: blacklist,
-          count: blacklist.length,
-          message: `Liste noire: ${blacklist.length} numéro(s)`
-        }));
-      } catch (error) {
-        console.error('Erreur récupération liste noire admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_blacklist', 
-          success: false, 
-          message: 'Erreur récupération' 
-        }));
-      }
-    },
-
-    // Retirer un numéro de la liste noire
-    admin_unblacklist_number: async () => {
-      try {
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
-
-        const { number } = message;
-        
-        if (!number) {
-          return ws.send(JSON.stringify({
-            type: 'admin_unblacklist',
-            success: false,
-            message: 'Numéro manquant'
-          }));
-        }
-
-        const result = await db.unblacklistNumber(number, message.admin_key);
-        
-        ws.send(JSON.stringify({
-          type: 'admin_unblacklist',
-          success: result.success,
-          message: result.message,
-          number: result.number
-        }));
-      } catch (error) {
-        console.error('Erreur retrait liste noire admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_unblacklist', 
-          success: false, 
-          message: 'Erreur retrait' 
-        }));
-      }
-    },
-
-    // Ajuster manuellement le compteur de parrainage
-    admin_adjust_sponsorship_counter: async () => {
-      try {
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
-
-        const { player_number, adjustment } = message;
-        
-        if (!player_number || adjustment === undefined) {
-          return ws.send(JSON.stringify({
-            type: 'admin_adjust_sponsorship',
-            success: false,
-            message: 'Données manquantes'
-          }));
-        }
-
-        const result = await db.manuallyAdjustSponsorshipCounter(
-          player_number, 
-          parseInt(adjustment), 
-          message.admin_key
-        );
-        
-        ws.send(JSON.stringify({
-          type: 'admin_adjust_sponsorship',
-          success: result.success,
-          message: result.message,
-          player_number: result.player_number,
-          username: result.username,
-          old_value: result.old_value,
-          new_value: result.new_value,
-          adjustment: result.adjustment
-        }));
-      } catch (error) {
-        console.error('Erreur ajustement parrainage admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_adjust_sponsorship', 
-          success: false, 
-          message: 'Erreur ajustement' 
-        }));
-      }
-    },
-
-    // Obtenir l'historique des ajustements
-    admin_get_sponsorship_adjustment_history: async () => {
-      try {
-        if (message.admin_key !== ADMIN_KEY) {
-          return ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Clé admin invalide' 
-          }));
-        }
-
-        const history = await db.getSponsorshipAdjustmentHistory(message.admin_key);
-        
-        ws.send(JSON.stringify({
-          type: 'admin_sponsorship_adjustment_history',
-          success: true,
-          history: history,
-          count: history.length,
-          message: `Historique des ${history.length} ajustements`
-        }));
-      } catch (error) {
-        console.error('Erreur récupération historique ajustements admin:', error);
-        ws.send(JSON.stringify({ 
-          type: 'admin_sponsorship_adjustment_history', 
-          success: false, 
-          message: 'Erreur récupération' 
-        }));
-      }
     }
   };
   
   if (handlers[message.type]) {
-    console.log(`🔄 Exécution du handler: ${message.type}`);
     await handlers[message.type]();
-    console.log(`✅ Handler ${message.type} terminé`);
   } else {
-    console.log(`❌ Handler NON TROUVÉ pour: ${message.type}`);
-    console.log(`   Handlers disponibles:`, Object.keys(handlers));
     ws.send(JSON.stringify({ 
       type: 'error', 
-      message: 'Commande admin inconnue: ' + message.type 
+      message: 'Commande admin inconnue' 
     }));
   }
 }
@@ -2894,35 +2404,24 @@ async function handleClientMessage(ws, message, ip, deviceId) {
         ws.send(JSON.stringify({ type: 'register_failed', message: "Mots de passe différents" }));
       } else if (await db.getUserByUsername(username)) {
         ws.send(JSON.stringify({ type: 'register_failed', message: "Pseudo déjà utilisé" }));
+      } else if (await db.getUserByNumber(number)) {
+        ws.send(JSON.stringify({ type: 'register_failed', message: "Numéro déjà utilisé" }));
       } else {
-        try {
-          const newUser = await db.createUser({ username, password, number, age: parseInt(age) });
-          
-          TRUSTED_DEVICES.set(deviceKey, number);
-          await db.createTrustedDevice(deviceKey, number);
-          
-          PLAYER_CONNECTIONS.set(number, ws);
-          
-          ws.send(JSON.stringify({ 
-            type: 'register_success', 
-            message: "Inscription réussie", 
-            username, 
-            score: 0, 
-            number,
-            token: newUser.token
-          }));
-        } catch (error) {
-          if (error.message.includes('banni')) {
-            ws.send(JSON.stringify({ 
-              type: 'register_failed', 
-              message: "Ce numéro a été banni et ne peut pas être réutilisé" 
-            }));
-          } else if (await db.getUserByNumber(number)) {
-            ws.send(JSON.stringify({ type: 'register_failed', message: "Numéro déjà utilisé" }));
-          } else {
-            ws.send(JSON.stringify({ type: 'register_failed', message: "Erreur lors de l'inscription" }));
-          }
-        }
+        const newUser = await db.createUser({ username, password, number, age: parseInt(age) });
+        
+        TRUSTED_DEVICES.set(deviceKey, number);
+        await db.createTrustedDevice(deviceKey, number);
+        
+        PLAYER_CONNECTIONS.set(number, ws);
+        
+        ws.send(JSON.stringify({ 
+          type: 'register_success', 
+          message: "Inscription réussie", 
+          username, 
+          score: 0, 
+          number,
+          token: newUser.token
+        }));
       }
     },
 
@@ -3025,7 +2524,15 @@ async function handleClientMessage(ws, message, ip, deviceId) {
     join_queue: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
-      if (PLAYER_TO_GAME.has(playerNumber)) return ws.send(JSON.stringify({ type: 'error', message: 'Déjà dans une partie' }));
+      
+      // VÉRIFICATION CRITIQUE : Joueur déjà dans un jeu ?
+      if (PLAYER_TO_GAME.has(playerNumber)) {
+        console.log(`🚨 join_queue: ${playerNumber} déjà dans un jeu !`);
+        return ws.send(JSON.stringify({ 
+          type: 'error', 
+          message: 'Déjà dans une partie' 
+        }));
+      }
       
       PLAYER_QUEUE.add(playerNumber);
       ws.send(JSON.stringify({ type: 'queue_joined', message: 'En attente adversaire' }));
@@ -3033,11 +2540,15 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       console.log(`🎯 Joueur ${playerNumber} a rejoint la file d'attente`);
       console.log(`📊 Taille file: ${PLAYER_QUEUE.size} joueur(s)`);
       
+      // Lancer la recherche de match si assez de joueurs
       if (PLAYER_QUEUE.size >= 2) {
         const bestMatch = await findBestMatchFromQueue();
         
         if (bestMatch) {
+          // Retirer les joueurs de la file
           bestMatch.forEach(player => PLAYER_QUEUE.delete(player));
+          
+          // Créer le lobby
           createGameLobby(bestMatch);
         } else {
           console.log(`⏳ Aucun match possible pour le moment dans la file (${PLAYER_QUEUE.size} joueurs)`);
@@ -3080,23 +2591,51 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }));
     },
 
-    // Demande un bot (simplifiée - sans caution)
     request_bot: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
       
+      // VÉRIFICATION CRITIQUE : Joueur déjà dans un jeu ?
       if (PLAYER_TO_GAME.has(playerNumber)) {
-        return ws.send(JSON.stringify({ type: 'error', message: 'Déjà dans une partie' }));
+        console.log(`🚨 request_bot: ${playerNumber} déjà dans un jeu !`);
+        return ws.send(JSON.stringify({ 
+          type: 'error', 
+          message: 'Déjà dans une partie' 
+        }));
+      }
+      
+      const depositResult = await db.applyBotDeposit(playerNumber);
+      if (!depositResult.success) {
+        return ws.send(JSON.stringify({ 
+          type: 'bot_request_failed', 
+          message: depositResult.message 
+        }));
       }
       
       const bot = getRandomBot();
+      const botId = bot.id;
+      
+      BOT_DEPOSITS.set(playerNumber, {
+        botId: botId,
+        depositAmount: depositResult.depositAmount,
+        timestamp: Date.now()
+      });
       
       console.log(`🤖 Adversaire demandé par ${playerNumber} via WebSocket`);
+      console.log(`💰 Nouvelle caution: -${depositResult.depositAmount} points`);
+      
+      let depositMessage = "Caution flexible appliquée.";
+      if (depositResult.depositAmount === 0) {
+        depositMessage = "Vous jouez avec 0 points de caution. Si vous abandonnez, vous ne perdez rien.";
+      }
       
       ws.send(JSON.stringify({
         type: 'bot_assigned',
         bot: bot,
-        message: "Adversaire assigné. Jouez directement."
+        depositApplied: depositResult.hadEnough,
+        depositAmount: depositResult.depositAmount,
+        newScore: depositResult.newScore,
+        message: depositMessage
       }));
     },
     
@@ -3158,8 +2697,8 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       ws.send(JSON.stringify({
         type: 'sponsorship_stats',
         success: result.success,
+        total_sponsored: result.total_sponsored,
         validated_sponsored: result.validated_sponsored,
-        last_reset_date: result.last_reset_date,
         message: result.message || ''
       }));
     },
@@ -3208,6 +2747,7 @@ async function createGameLobby(playerNumbers) {
   
   if (!ws1 || ws1.readyState !== WebSocket.OPEN || !ws2 || ws2.readyState !== WebSocket.OPEN) {
     console.log(`❌ Impossible de créer lobby: un joueur déconnecté`);
+    // Remettre dans la file seulement si pas déjà dans un jeu
     if (!PLAYER_TO_GAME.has(player1Number)) PLAYER_QUEUE.add(player1Number);
     if (!PLAYER_TO_GAME.has(player2Number)) PLAYER_QUEUE.add(player2Number);
     return;
@@ -3216,7 +2756,14 @@ async function createGameLobby(playerNumbers) {
   const gameId = generateId();
   console.log(`🎮 Création lobby ${gameId}: ${p1.username} vs ${p2.username}`);
   
-  new Game(gameId, p1, p2);
+  try {
+    new Game(gameId, p1, p2);
+  } catch (error) {
+    console.log(`❌ Échec création lobby: ${error.message}`);
+    if (!PLAYER_TO_GAME.has(player1Number)) PLAYER_QUEUE.add(player1Number);
+    if (!PLAYER_TO_GAME.has(player2Number)) PLAYER_QUEUE.add(player2Number);
+    return;
+  }
   
   playerNumbers.forEach((num, idx) => {
     const ws = PLAYER_CONNECTIONS.get(num);
@@ -3272,7 +2819,8 @@ app.get('/get-bot', async (req, res) => {
       success: true, 
       bot: bot,
       tempId: tempId,
-      message: "Adversaire assigné"
+      depositApplied: false,
+      message: "Adversaire assigné (utilisez WebSocket pour système caution)"
     });
   } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
@@ -3287,10 +2835,13 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
       return res.status(400).json({ success: false, message: "Données manquantes" });
     }
     
-    console.log(`[BOT MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
+    console.log(`[ADVERSAIRE MATCH] Résultats reçus pour ${playerNumber} contre ${botId}`);
     
     const isBotWin = !isPlayerWin;
     const isDraw = (playerScore === botScore);
+    
+    const deposit = BOT_DEPOSITS.get(playerNumber);
+    const depositAmount = deposit ? deposit.depositAmount : 0;
     
     const playerUpdateSuccess = await db.updateUserScoreAfterBotMatch(playerNumber, playerScore, isPlayerWin, isDraw);
     
@@ -3304,7 +2855,9 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
         res.json({ 
           success: true, 
           message: "Scores mis à jour",
-          is_draw: isDraw
+          is_draw: isDraw,
+          deposit_handled: !!deposit,
+          deposit_amount: depositAmount
         });
       } else {
         res.status(500).json({ success: false, message: "Erreur mise à jour scores" });
@@ -3312,12 +2865,48 @@ app.post('/update-bot-match', express.json(), async (req, res) => {
     } else {
       res.json({ 
         success: true, 
-        message: "Match nul",
-        is_draw: true
+        message: "Match nul - Caution rendue",
+        is_draw: true,
+        deposit_refunded: !!deposit,
+        deposit_amount: depositAmount
       });
     }
   } catch (error) {
     console.error('Erreur update adversaire match:', error);
+    res.status(500).json({ success: false, message: "Erreur serveur" });
+  }
+});
+
+app.post('/report-disconnect', express.json(), async (req, res) => {
+  try {
+    const { playerNumber, botId } = req.body;
+    
+    if (!playerNumber) {
+      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
+    }
+    
+    console.log(`[ABANDON] Joueur ${playerNumber} a abandonné contre adversaire ${botId || 'inconnu'}`);
+    
+    const deposit = BOT_DEPOSITS.get(playerNumber);
+    if (deposit) {
+      const depositAmount = deposit.depositAmount;
+      console.log(`💰 Caution NON remboursée (abandon): ${depositAmount} points perdus`);
+      BOT_DEPOSITS.delete(playerNumber);
+      
+      res.json({ 
+        success: true, 
+        message: `Abandon enregistré. Caution de ${depositAmount} points perdue.`,
+        deposit_lost: true,
+        penalty: depositAmount
+      });
+    } else {
+      res.json({ 
+        success: true, 
+        message: `Abandon enregistré.`,
+        deposit_lost: false
+      });
+    }
+  } catch (error) {
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -3559,6 +3148,7 @@ app.get('/server-stats', async (req, res) => {
         active_games: ACTIVE_GAMES.size,
         pending_lobbies: PENDING_LOBBIES.size,
         player_to_game: PLAYER_TO_GAME.size,
+        bot_deposits: BOT_DEPOSITS.size,
         recent_matches_in_db: parseInt(recentMatchesResult.rows[0].count)
       },
       matchmaking: {
@@ -3568,134 +3158,9 @@ app.get('/server-stats', async (req, res) => {
           low_score: LOW_SCORE_THRESHOLD
         }
       },
-      pvp_quit_penalty: PVP_QUIT_PENALTY,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// Ajuster manuellement le compteur de parrainage
-app.post('/admin/adjust-sponsorship-counter', express.json(), async (req, res) => {
-  try {
-    const { admin_key, player_number, adjustment } = req.body;
-    
-    if (!admin_key || admin_key !== ADMIN_KEY) {
-      return res.status(403).json({ success: false, message: "Clé admin invalide" });
-    }
-    
-    if (!player_number || adjustment === undefined) {
-      return res.status(400).json({ success: false, message: "Données manquantes" });
-    }
-    
-    const result = await db.manuallyAdjustSponsorshipCounter(player_number, parseInt(adjustment), admin_key);
-    
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    console.error('Erreur ajustement compteur parrainage:', error);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// Obtenir l'historique des ajustements
-app.get('/admin/sponsorship-adjustment-history', async (req, res) => {
-  try {
-    const { admin_key } = req.query;
-    
-    if (!admin_key || admin_key !== ADMIN_KEY) {
-      return res.status(403).json({ success: false, message: "Clé admin invalide" });
-    }
-    
-    const history = await db.getSponsorshipAdjustmentHistory(admin_key);
-    
-    res.json({
-      success: true,
-      history: history,
-      count: history.length,
-      message: `Historique des ${history.length} ajustements`
-    });
-  } catch (error) {
-    console.error('Erreur récupération historique ajustements:', error);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// Supprimer un compte
-app.post('/admin/delete-user', express.json(), async (req, res) => {
-  try {
-    const { admin_key, player_number } = req.body;
-    
-    if (!admin_key || admin_key !== ADMIN_KEY) {
-      return res.status(403).json({ success: false, message: "Clé admin invalide" });
-    }
-    
-    if (!player_number) {
-      return res.status(400).json({ success: false, message: "Numéro joueur manquant" });
-    }
-    
-    const result = await db.deleteUserAccount(player_number, admin_key);
-    
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    console.error('Erreur suppression compte:', error);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// Obtenir la liste noire
-app.get('/admin/blacklist', async (req, res) => {
-  try {
-    const { admin_key } = req.query;
-    
-    if (!admin_key || admin_key !== ADMIN_KEY) {
-      return res.status(403).json({ success: false, message: "Clé admin invalide" });
-    }
-    
-    const blacklist = await db.getBlacklistedNumbers();
-    
-    res.json({
-      success: true,
-      blacklist: blacklist,
-      count: blacklist.length,
-      message: `Liste noire: ${blacklist.length} numéro(s)`
-    });
-  } catch (error) {
-    console.error('Erreur récupération liste noire:', error);
-    res.status(500).json({ success: false, message: "Erreur serveur" });
-  }
-});
-
-// Retirer un numéro de la liste noire
-app.post('/admin/unblacklist', express.json(), async (req, res) => {
-  try {
-    const { admin_key, number } = req.body;
-    
-    if (!admin_key || admin_key !== ADMIN_KEY) {
-      return res.status(403).json({ success: false, message: "Clé admin invalide" });
-    }
-    
-    if (!number) {
-      return res.status(400).json({ success: false, message: "Numéro manquant" });
-    }
-    
-    const result = await db.unblacklistNumber(number, admin_key);
-    
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    console.error('Erreur retrait liste noire:', error);
     res.status(500).json({ success: false, message: "Erreur serveur" });
   }
 });
@@ -3705,7 +3170,8 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     database: 'PostgreSQL', 
     total_bots: BOTS.length,
-    pvp_quit_penalty: PVP_QUIT_PENALTY,
+    bot_deposit: BOT_DEPOSIT,
+    active_deposits: BOT_DEPOSITS.size,
     matchmaking_config: MATCHMAKING_CONFIG,
     score_thresholds: {
       high: HIGH_SCORE_THRESHOLD,
@@ -3760,19 +3226,26 @@ async function startServer() {
       console.log(`=========================================`);
       console.log(`✅ Serveur démarré sur port ${PORT}`);
       console.log(`🤖 ${BOTS.length} adversaires disponibles`);
-      console.log(`🎮 SYSTÈME PVP AMÉLIORÉ`);
-      console.log(`   • Abandon en 1v1: -${PVP_QUIT_PENALTY} points (TOUJOURS)`);
-      console.log(`   • Victime d'abandon: +${AUTO_MOVE_BONUS} points bonus`);
+      console.log(`💰 Système caution FLEXIBLE: max ${BOT_DEPOSIT} points`);
+      console.log(`⚙️  SYSTÈME ANTI-DOUBLON ACTIVÉ (1 joueur = 1 jeu max)`);
+      console.log(`   • Vérifications multiples avant création lobby`);
+      console.log(`   • Blocage si joueur déjà dans un jeu`);
+      console.log(`   • Triple vérification dans matchmaking`);
       console.log(`⚙️  SYSTÈME ANTI-MATCH RAPIDE PERSISTANT`);
       console.log(`   • Activé: ${MATCHMAKING_CONFIG.anti_quick_rematch ? 'OUI' : 'NON'}`);
       console.log(`   • Délai: ${MATCHMAKING_CONFIG.min_rematch_delay / 60000} minutes`);
       console.log(`📊 RESTRICTIONS DE SCORE`);
       console.log(`   • ≥${HIGH_SCORE_THRESHOLD} points → ne rencontre pas <${LOW_SCORE_THRESHOLD} points`);
-      console.log(`🔒 NOUVELLES FONCTIONNALITÉS ADMIN`);
-      console.log(`   • Suppression compte avec liste noire`);
-      console.log(`   • Ajustement manuel compteur parrainage`);
-      console.log(`   • Gestion liste noire complète`);
-      console.log(`⭐ HANDLER admin_get_full_list AJOUTÉ !`);
+      console.log(`   • <${HIGH_SCORE_THRESHOLD} points → pas de restriction`);
+      console.log(`🎮 SYSTÈME DE MATCHMAKING INTELLIGENT`);
+      console.log(`   • Analyse TOUTES les combinaisons possibles`);
+      console.log(`   • Priorise les matchs avec différence de score minimale`);
+      console.log(`🎮 SYSTÈME DE JEU AMÉLIORÉ`);
+      console.log(`   • 1 coup automatique unique par joueur par manche`);
+      console.log(`   • Bonus +${AUTO_MOVE_BONUS} points pour victoire par déconnexion`);
+      console.log(`🤝 SYSTÈME PARRAINAGE AVANCÉ`);
+      console.log(`   • Scan automatique toutes les ${SPONSORSHIP_SCAN_INTERVAL/60000} minutes`);
+      console.log(`   • Historique permanent des validations`);
       console.log(`=========================================`);
     });
   } catch (error) {
