@@ -28,7 +28,7 @@ const SPONSOR_MIN_SCORE = 2000;
 const SPONSORSHIP_SCAN_INTERVAL = 5 * 60 * 1000;
 const LOBBY_TIMEOUT = 30000;
 const AUTO_MOVE_BONUS = 200;
-const SPONSORSHIP_FILTER_DATE = '2026-01-26'; // Date de filtre pour les parrainages
+const SPONSORSHIP_FILTER_DATE = '2026-01-26';
 
 // CONFIGURATION DU MATCHMAKING
 const MATCHMAKING_CONFIG = {
@@ -37,7 +37,7 @@ const MATCHMAKING_CONFIG = {
 };
 
 const UPDATE_CONFIG = {
-  force_update: true,
+  force_update: false,
   min_version: "1.1.0",
   latest_version: "1.2.0",
   update_url: "https://play.google.com/store/apps/details?id=com.dogbale.wafrik"
@@ -852,6 +852,48 @@ const db = {
     }
   },
 
+  async getOnlyBotsList() {
+    try {
+      const botsResult = await pool.query(`
+        SELECT 
+          bs.bot_id as id, 
+          COALESCE(bp.username, bs.bot_id) as username, 
+          bs.score, 
+          'adv' as number, 
+          '' as password,
+          COALESCE(bp.gender, 'M') as gender,
+          bs.last_played,
+          RANK() OVER (ORDER BY bs.score DESC) as rank,
+          true as is_bot
+        FROM bot_scores bs 
+        LEFT JOIN bot_profiles bp ON bs.bot_id = bp.id
+        ORDER BY bs.score DESC
+      `);
+      
+      return botsResult.rows.map(bot => ({
+        id: bot.id,
+        username: bot.username,
+        score: bot.score,
+        rank: bot.rank,
+        age: 0,
+        number: bot.number,
+        password: bot.password,
+        created_at: bot.last_played,
+        online: false,
+        is_bot: true,
+        has_sponsor: false,
+        sponsor_username: "",
+        sponsor_number: "",
+        is_sponsorship_validated: false,
+        total_sponsored: 0,
+        validated_sponsored: 0
+      }));
+    } catch (error) {
+      console.error('Erreur liste bots uniquement:', error);
+      return [];
+    }
+  },
+
   async updateBotScoreById(botId, points, operation) {
     try {
       if (!botId) return { success: false, message: "ID adversaire manquant" };
@@ -1045,7 +1087,6 @@ const db = {
     }
   },
 
-  // NOUVELLE FONCTION : Récupérer les parrainages validés depuis une date
   async getValidatedSponsorshipsSince(playerNumber, sinceDate = SPONSORSHIP_FILTER_DATE) {
     try {
       const result = await pool.query(`
@@ -1963,6 +2004,33 @@ async function handleAdminMessage(ws, message, adminId) {
       }
     },
 
+    admin_get_only_bots: async () => {
+      try {
+        if (message.admin_key !== ADMIN_KEY) {
+          return ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Clé admin invalide' 
+          }));
+        }
+
+        const botsList = await db.getOnlyBotsList();
+        
+        ws.send(JSON.stringify({
+          type: 'admin_bots_list',
+          success: true,
+          data: botsList,
+          count: botsList.length
+        }));
+      } catch (error) {
+        console.error('Erreur liste bots admin:', error);
+        ws.send(JSON.stringify({ 
+          type: 'admin_bots_list', 
+          success: false, 
+          message: 'Erreur liste bots' 
+        }));
+      }
+    },
+
     admin_reset_scores: async () => {
       try {
         if (message.admin_key !== ADMIN_KEY) {
@@ -2648,7 +2716,6 @@ async function handleClientMessage(ws, message, ip, deviceId) {
       }));
     },
 
-    // NOUVEAU HANDLER : Récupérer les parrainages validés depuis le 26/01/2026
     get_validated_sponsorships_since: async () => {
       const playerNumber = TRUSTED_DEVICES.get(deviceKey);
       if (!playerNumber) return ws.send(JSON.stringify({ type: 'error', message: 'Non authentifié' }));
@@ -2990,7 +3057,6 @@ app.get('/sponsorship-stats/:playerNumber', async (req, res) => {
   }
 });
 
-// NOUVEAU ENDPOINT : Parrainages validés depuis le 26/01/2026
 app.get('/validated-sponsorships-since/:playerNumber', async (req, res) => {
   try {
     const playerNumber = req.params.playerNumber;
@@ -3252,4 +3318,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
